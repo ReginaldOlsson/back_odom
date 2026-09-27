@@ -14,8 +14,13 @@
 
 #include "back_odom/back_odom_node.hpp"
 
+#include "back_odom/imu_alignment.hpp"
+
 #include <Eigen/Geometry>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2/time.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
 
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -91,6 +96,42 @@ visualization_msgs::msg::Marker make_arrow(
   return marker;
 }
 
+sensor_msgs::msg::PointCloud2 to_pointcloud(
+  const rclcpp::Time & stamp, const std::string & frame_id,
+  const std::vector<Eigen::Vector3d> & points)
+{
+  sensor_msgs::msg::PointCloud2 cloud;
+  cloud.header.stamp = stamp;
+  cloud.header.frame_id = frame_id;
+  cloud.height = 1;
+  cloud.width = static_cast<std::uint32_t>(points.size());
+  cloud.is_dense = true;
+  cloud.is_bigendian = false;
+
+  sensor_msgs::msg::PointField field_x;
+  field_x.name = "x";
+  field_x.offset = 0;
+  field_x.datatype = sensor_msgs::msg::PointField::FLOAT32;
+  field_x.count = 1;
+  sensor_msgs::msg::PointField field_y = field_x;
+  field_y.name = "y";
+  field_y.offset = 4;
+  sensor_msgs::msg::PointField field_z = field_x;
+  field_z.name = "z";
+  field_z.offset = 8;
+  cloud.fields = {field_x, field_y, field_z};
+  cloud.point_step = 12;
+  cloud.row_step = cloud.point_step * cloud.width;
+  cloud.data.resize(static_cast<std::size_t>(cloud.row_step));
+  for (std::size_t index = 0; index < points.size(); ++index) {
+    const float values[3] = {
+      static_cast<float>(points[index].x()), static_cast<float>(points[index].y()),
+      static_cast<float>(points[index].z())};
+    std::memcpy(cloud.data.data() + index * cloud.point_step, values, sizeof(values));
+  }
+  return cloud;
+}
+
 }  // namespace
 
 BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odom_node", options)
@@ -100,7 +141,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
-  child_frame_ = this->declare_parameter<std::string>("child_frame", "pose_estimator_base_link");
+  child_frame_ = this->declare_parameter<std::string>("child_frame", "base_link");
   const int alignment_sample_count = this->declare_parameter<int>("alignment_sample_count", 100);
   const double stationary_gyro_thresh =
     this->declare_parameter<double>("stationary_gyro_thresh", 0.05);
@@ -157,7 +198,10 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("back_odom/path", rclcpp::QoS(10));
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "back_odom/markers", rclcpp::QoS(10));
+  map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("back_odom/map", rclcpp::QoS(1));
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
 
   RCLCPP_INFO(this->get_logger(), "BackOdomNode initialized.");
 }
@@ -169,13 +213,31 @@ BackOdomNode::~BackOdomNode()
 
 void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
+  if (msg->header.frame_id.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "IMU frame_id is empty, so it cannot be looked up in the TF tree.");
+    return;
+  }
+  const std::string source_frame = msg->header.frame_id;
+  Sophus::SE3d base_from_imu;
+  if (!base_from_frame(source_frame, base_from_imu)) {
+    return;
+  }
+
   const rclcpp::Time stamp(msg->header.stamp);
-  ImuSample sample;
-  sample.stamp = stamp.seconds();
-  sample.linear_acceleration =
+  ImuSample measured;
+  measured.stamp = stamp.seconds();
+  measured.linear_acceleration =
     to_vector3(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
-  sample.angular_velocity =
+  measured.angular_velocity =
     to_vector3(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+  const ImuSample sample = transform_imu_sample(
+    measured, base_from_imu, previous_angular_velocity_, previous_angular_velocity_stamp_,
+    has_previous_angular_velocity_);
+  previous_angular_velocity_ = sample.angular_velocity;
+  previous_angular_velocity_stamp_ = sample.stamp;
+  has_previous_angular_velocity_ = true;
 
   ProcessorOutput output = imu_processor_->process(sample);
 
@@ -216,13 +278,25 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
   if (!aligned_ || !imu_processor_->aligned()) {
     return;
   }
-  const LidarScan scan = scan_from_cloud(*msg);
+  LidarScan scan = scan_from_cloud(*msg);
   if (scan.points.empty()) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 5000,
       "Skipping lidar scan. Need xyz points and a timestamp field.");
     return;
   }
+  if (msg->header.frame_id.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Point cloud frame_id is empty, so it cannot be looked up in the TF tree.");
+    return;
+  }
+  const std::string source_frame = msg->header.frame_id;
+  Sophus::SE3d base_from_lidar;
+  if (!base_from_frame(source_frame, base_from_lidar)) {
+    return;
+  }
+  lidar_matcher_->set_body_from_lidar(base_from_lidar);
   const rclcpp::Time stamp(msg->header.stamp);
   const ProcessorOutput prior = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
@@ -236,12 +310,43 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
   publish_odometry(odometry_pub_, corrected, stamp);
   publish_path(corrected, stamp);
   publish_markers(corrected, stamp);
+  publish_local_map(stamp);
   if (publish_tf_) {
     publish_tf(corrected, stamp);
   }
   if (matched.first_scan) {
     RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
   }
+}
+
+bool BackOdomNode::base_from_frame(
+  const std::string & source_frame, Sophus::SE3d & target_from_source)
+{
+  const auto found = extrinsics_.find(source_frame);
+  if (found != extrinsics_.end()) {
+    target_from_source = found->second;
+    return true;
+  }
+
+  try {
+    const geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+      child_frame_, source_frame, tf2::TimePointZero, tf2::durationFromSec(0.0));
+    const Eigen::Isometry3d isometry = tf2::transformToEigen(transform);
+    target_from_source =
+      Sophus::SE3d(Sophus::SO3d(Eigen::Quaterniond(isometry.rotation())), isometry.translation());
+  } catch (const tf2::TransformException & exception) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000, "Waiting for TF %s <- %s: %s",
+      child_frame_.c_str(), source_frame.c_str(), exception.what());
+    return false;
+  }
+
+  RCLCPP_INFO(
+    this->get_logger(), "TF %s <- %s xyz=(%.3f, %.3f, %.3f)", child_frame_.c_str(),
+    source_frame.c_str(), target_from_source.translation().x(),
+    target_from_source.translation().y(), target_from_source.translation().z());
+  extrinsics_.emplace(source_frame, target_from_source);
+  return true;
 }
 
 LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cloud) const
@@ -375,6 +480,11 @@ void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time
   transform.transform.translation.z = output.position.z();
   set_quaternion(transform.transform.rotation, output.orientation);
   tf_broadcaster_->sendTransform(transform);
+}
+
+void BackOdomNode::publish_local_map(const rclcpp::Time & stamp)
+{
+  map_pub_->publish(to_pointcloud(stamp, parent_frame_, lidar_matcher_->local_map()));
 }
 
 void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp)

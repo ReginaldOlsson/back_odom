@@ -64,25 +64,32 @@ public:
   explicit LidarImuMatcher(const LidarMatchParams & params);
 
   [[nodiscard]] bool has_reference() const;
+  [[nodiscard]] std::vector<Eigen::Vector3d> local_map() const;
+
+  /// Static pose of the lidar in the integrator frame. Identity until tf_static provides it.
+  void set_body_from_lidar(const Sophus::SE3d & body_from_lidar);
 
   /// Deskew, crop, and either store the first scan or match a new scan into the map.
   [[nodiscard]] MatchResult on_scan(const LidarScan & scan, ImuProcessor & imu);
 
-  /// After `backward_match_stride` IMU samples, match the stored scan back onto the map.
+  /// IMU samples only integrate. A repeated scan cannot observe drift, so it does not move the
+  /// pose.
   [[nodiscard]] MatchResult on_imu(ImuProcessor & imu);
 
 private:
-  void apply_correction(ImuProcessor & imu, const Sophus::SE3d & corrected_pose, double stamp);
+  void apply_correction(ImuProcessor & imu, const Sophus::SE3d & error, double scan_stamp);
   void cull_map(const Sophus::SE3d & lidar_pose);
   [[nodiscard]] kiss_icp::PlaneAlignResult align(
     const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations);
 
+  Sophus::SE3d body_from_lidar_{};
   LidarMatchParams params_;
   double half_longitudinal_{37.5};
   double half_lateral_{25.0};
   kiss_icp::VoxelHashMap map_;
   kiss_icp::Registration registration_;
   std::vector<Eigen::Vector3d> stored_scan_;
+  Sophus::SE3d stored_pose_{};
   bool has_reference_{false};
   int imu_steps_{0};
   double last_correction_stamp_{0.0};

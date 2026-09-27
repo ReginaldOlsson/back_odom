@@ -42,6 +42,12 @@ public:
   [[nodiscard]] Sophus::SE3d interpolate_pose(double stamp) const;
   void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, double stamp);
 
+  /// Left-multiply `error` into the current pose. Samples from `since_stamp` to `scan_stamp` blend
+  /// it in.
+  void apply_lidar_correction(
+    const Sophus::SE3d & error, const Eigen::Vector3d & velocity_world, double scan_stamp,
+    double since_stamp);
+
 private:
   void record_pose(double stamp);
   [[nodiscard]] ProcessorOutput process_collecting(const ImuSample & sample);

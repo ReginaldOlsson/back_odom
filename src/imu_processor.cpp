@@ -16,6 +16,7 @@
 
 #include "back_odom/imu_alignment.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -172,6 +173,33 @@ void ImuProcessor::reset_state(
     trajectory_.back().pose = pose;
   } else {
     trajectory_.push_back(StampedPose{stamp, pose});
+  }
+}
+
+void ImuProcessor::apply_lidar_correction(
+  const Sophus::SE3d & error, const Eigen::Vector3d & velocity_world, const double scan_stamp,
+  const double since_stamp)
+{
+  if (!dead_reckoning_) {
+    throw std::runtime_error("imu integrator is not aligned");
+  }
+  const Sophus::SE3d::Tangent tangent = error.log();
+  const double span = scan_stamp - since_stamp;
+  if (tangent.norm() > 1e-8) {
+    for (StampedPose & sample : trajectory_) {
+      if (sample.stamp <= since_stamp) {
+        continue;
+      }
+      const double alpha = (sample.stamp < scan_stamp && span > 1e-9)
+                             ? std::clamp((sample.stamp - since_stamp) / span, 0.0, 1.0)
+                             : 1.0;
+      sample.pose = Sophus::SE3d::exp(alpha * tangent) * sample.pose;
+    }
+  }
+  const Sophus::SE3d corrected = error * pose();
+  dead_reckoning_->reset_state(corrected, velocity_world);
+  if (!trajectory_.empty() && std::abs(trajectory_.back().stamp - previous_stamp_) < 1e-6) {
+    trajectory_.back().pose = corrected;
   }
 }
 

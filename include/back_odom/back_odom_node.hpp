@@ -19,6 +19,8 @@
 #include "back_odom/lidar_imu_matcher.hpp"
 
 #include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -30,6 +32,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace back_odom
 {
@@ -47,9 +50,12 @@ private:
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
     const ProcessorOutput & output, const rclcpp::Time & stamp);
   [[nodiscard]] LidarScan scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cloud) const;
+  [[nodiscard]] bool base_from_frame(
+    const std::string & source_frame, Sophus::SE3d & target_from_source);
   void publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_tf(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp);
+  void publish_local_map(const rclcpp::Time & stamp);
 
   std::unique_ptr<ImuProcessor> imu_processor_;
   std::unique_ptr<LidarImuMatcher> lidar_matcher_;
@@ -61,7 +67,11 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::unordered_map<std::string, Sophus::SE3d> extrinsics_;
 
   nav_msgs::msg::Path path_;
   rclcpp::Time last_path_stamp_{0, 0, RCL_ROS_TIME};
@@ -70,6 +80,9 @@ private:
 
   std::string parent_frame_;
   std::string child_frame_;
+  Eigen::Vector3d previous_angular_velocity_{Eigen::Vector3d::Zero()};
+  double previous_angular_velocity_stamp_{0.0};
+  bool has_previous_angular_velocity_{false};
   std::size_t alignment_sample_count_{100};
   std::size_t path_max_poses_{1000};
   double path_min_dt_{0.1};

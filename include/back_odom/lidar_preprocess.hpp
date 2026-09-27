@@ -27,10 +27,11 @@ namespace back_odom
 [[nodiscard]] std::vector<Eigen::Vector3d> crop_lidar_box(
   const std::vector<Eigen::Vector3d> & points, double half_longitudinal, double half_lateral);
 
-/// Move each point into the lidar frame at the latest point timestamp.
+/// Put each lidar point in the integrator frame with `body_from_lidar`, then move it from its
+/// timestamp to the scan-end pose. The trajectory and the extrinsic must share that frame.
 [[nodiscard]] std::vector<Eigen::Vector3d> deskew_to_scan_end(
   const std::vector<Eigen::Vector3d> & points, const std::vector<double> & timestamps,
-  const std::vector<StampedPose> & trajectory);
+  const std::vector<StampedPose> & trajectory, const Sophus::SE3d & body_from_lidar = {});
 
 }  // namespace back_odom
 

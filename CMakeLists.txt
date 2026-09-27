@@ -5,6 +5,7 @@ find_package(autoware_cmake REQUIRED)
 autoware_package()
 
 find_package(Sophus REQUIRED)
+find_package(TBB REQUIRED)
 find_package(kiss_icp_cpp REQUIRED)
 
 ament_auto_add_library(imu_processor SHARED
@@ -18,7 +19,7 @@ ament_auto_add_library(lidar_imu_matcher SHARED
   src/lidar_preprocess.cpp
   src/lidar_imu_matcher.cpp
 )
-target_link_libraries(lidar_imu_matcher imu_processor kiss_icp_cpp::kiss_icp_cpp)
+target_link_libraries(lidar_imu_matcher imu_processor kiss_icp_cpp::kiss_icp_cpp TBB::tbb)
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/back_odom_node.cpp

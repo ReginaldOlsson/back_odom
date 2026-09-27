@@ -53,8 +53,8 @@ void ImuDeadReckoning::integrate(
   }
 
   orientation_ = orientation_ * Sophus::SO3d::exp((angular_velocity - gyro_bias_) * dt);
-  linear_acceleration_world_ =
-    orientation_ * linear_acceleration + Eigen::Vector3d(0.0, 0.0, -gravity_);
+  const Eigen::Vector3d gravity_world(0.0, 0.0, -gravity_);
+  linear_acceleration_world_ = orientation_ * linear_acceleration - gravity_world;
   velocity_ += linear_acceleration_world_ * dt;
   position_ += velocity_ * dt;
 }

@@ -65,7 +65,31 @@ Sophus::SO3d compute_initial_alignment(const std::vector<Eigen::Vector3d> & line
     throw std::invalid_argument("mean linear acceleration is too small to define an up direction");
   }
   acceleration_mean.normalize();
-  return rotation_aligning_vectors(acceleration_mean, Eigen::Vector3d::UnitZ());
+  return rotation_aligning_vectors(acceleration_mean, -Eigen::Vector3d::UnitZ());
+}
+
+ImuSample transform_imu_sample(
+  const ImuSample & sample, const Sophus::SE3d & target_from_imu,
+  const Eigen::Vector3d & previous_angular_velocity, const double previous_stamp,
+  const bool has_previous)
+{
+  const Sophus::SO3d & rotation = target_from_imu.so3();
+  const Eigen::Vector3d angular_velocity = rotation * sample.angular_velocity;
+  Eigen::Vector3d linear_acceleration = rotation * sample.linear_acceleration;
+
+  const Eigen::Vector3d imu_to_target = -target_from_imu.translation();
+  const double dt = sample.stamp - previous_stamp;
+  if (has_previous && dt > 0.0) {
+    const Eigen::Vector3d angular_acceleration =
+      (angular_velocity - previous_angular_velocity) / dt;
+    linear_acceleration += angular_acceleration.cross(imu_to_target);
+  }
+  linear_acceleration += angular_velocity.cross(angular_velocity.cross(imu_to_target));
+
+  ImuSample transformed = sample;
+  transformed.angular_velocity = angular_velocity;
+  transformed.linear_acceleration = linear_acceleration;
+  return transformed;
 }
 
 bool is_stationary(

@@ -41,15 +41,18 @@ ImuSample make_sample(
 
 }  // namespace
 
-TEST(ImuAlignment, level_acceleration_aligns_to_identity)
+TEST(ImuAlignment, level_gravity_keeps_body_z_parallel_to_map_z)
 {
-  const Sophus::SO3d orientation = compute_initial_alignment({Eigen::Vector3d(0.0, 0.0, 9.81)});
+  const Sophus::SO3d orientation = compute_initial_alignment({Eigen::Vector3d(0.0, 0.0, -9.81)});
   EXPECT_TRUE(orientation.matrix().isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  EXPECT_TRUE((orientation * Eigen::Vector3d::UnitZ()).isApprox(Eigen::Vector3d::UnitZ(), 1e-9));
+  EXPECT_TRUE((orientation * Eigen::Vector3d(0.0, 0.0, -1.0))
+                .isApprox(Eigen::Vector3d(0.0, 0.0, -1.0), 1e-9));
 }
 
-TEST(ImuAlignment, y_up_acceleration_maps_y_onto_z)
+TEST(ImuAlignment, gravity_along_body_y_points_down_in_the_map)
 {
-  std::vector<Eigen::Vector3d> accelerations(10, Eigen::Vector3d(0.0, 9.81, 0.0));
+  std::vector<Eigen::Vector3d> accelerations(10, Eigen::Vector3d(0.0, -9.81, 0.0));
   const Sophus::SO3d orientation = compute_initial_alignment(accelerations);
   const Eigen::Vector3d world_up = orientation * Eigen::Vector3d::UnitY();
   EXPECT_TRUE(world_up.isApprox(Eigen::Vector3d::UnitZ(), 1e-9));
@@ -83,16 +86,17 @@ TEST(ImuDeadReckoning, stationary_sample_keeps_velocity_near_zero)
   ImuDeadReckoning dead_reckoning(9.81);
   dead_reckoning.set_initial_orientation(Sophus::SO3d());
   dead_reckoning.set_gyro_bias(Eigen::Vector3d::Zero());
-  dead_reckoning.integrate(Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 9.81), 0.01);
+  dead_reckoning.integrate(Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, -9.81), 0.01);
   EXPECT_NEAR(dead_reckoning.velocity().norm(), 0.0, 1e-9);
   EXPECT_NEAR(dead_reckoning.position().norm(), 0.0, 1e-9);
+  EXPECT_NEAR(dead_reckoning.linear_acceleration_world().z(), 0.0, 1e-9);
 }
 
 TEST(ImuDeadReckoning, yaw_rate_integrates_about_z)
 {
   ImuDeadReckoning dead_reckoning(9.81);
   dead_reckoning.set_initial_orientation(Sophus::SO3d());
-  dead_reckoning.integrate(Eigen::Vector3d(0.0, 0.0, 0.1), Eigen::Vector3d(0.0, 0.0, 9.81), 0.1);
+  dead_reckoning.integrate(Eigen::Vector3d(0.0, 0.0, 0.1), Eigen::Vector3d(0.0, 0.0, -9.81), 0.1);
   const Eigen::Matrix3d expected =
     Eigen::AngleAxisd(0.01, Eigen::Vector3d::UnitZ()).toRotationMatrix();
   EXPECT_TRUE(dead_reckoning.orientation().matrix().isApprox(expected, 1e-8));
@@ -111,20 +115,46 @@ TEST(ImuProcessor, static_window_then_forward_accel)
   ProcessorOutput output;
   const Eigen::Vector3d gyro_bias(0.01, 0.0, 0.0);
   for (int i = 0; i < 20; ++i) {
-    output = processor.process(make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, 9.81), gyro_bias));
+    output = processor.process(make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, -9.81), gyro_bias));
   }
   EXPECT_TRUE(output.aligned);
   EXPECT_TRUE(output.orientation.matrix().isApprox(Eigen::Matrix3d::Identity(), 1e-8));
   EXPECT_NEAR(output.velocity_world.norm(), 0.0, 1e-9);
 
-  output = processor.process(make_sample(0.19, Eigen::Vector3d(0.0, 0.0, 9.81), gyro_bias));
+  output = processor.process(make_sample(0.19, Eigen::Vector3d(0.0, 0.0, -9.81), gyro_bias));
   EXPECT_TRUE(output.orientation.matrix().isApprox(Eigen::Matrix3d::Identity(), 1e-6));
 
-  output = processor.process(make_sample(0.29, Eigen::Vector3d(1.0, 0.0, 9.81), gyro_bias));
+  output = processor.process(make_sample(0.29, Eigen::Vector3d(1.0, 0.0, -9.81), gyro_bias));
   EXPECT_NEAR(output.velocity_world.x(), 0.1, 1e-6);
   EXPECT_NEAR(output.velocity_world.y(), 0.0, 1e-6);
   EXPECT_NEAR(output.velocity_world.z(), 0.0, 1e-6);
   EXPECT_NEAR(output.position.x(), 0.01, 1e-6);
+}
+
+TEST(ImuFrame, rotated_mount_keeps_up_and_turns_forward)
+{
+  constexpr double k_pi = 3.14159265358979323846;
+  const Sophus::SE3d base_from_imu(Sophus::SO3d::rotZ(k_pi), Eigen::Vector3d(0.0, 0.0, -0.25));
+  const ImuSample level =
+    make_sample(1.0, Eigen::Vector3d(0.0, 0.0, 9.81), Eigen::Vector3d::Zero());
+  const ImuSample body =
+    transform_imu_sample(level, base_from_imu, Eigen::Vector3d::Zero(), 0.0, false);
+
+  EXPECT_NEAR(body.linear_acceleration.x(), 0.0, 1e-9);
+  EXPECT_NEAR(body.linear_acceleration.y(), 0.0, 1e-9);
+  EXPECT_NEAR(body.linear_acceleration.z(), 9.81, 1e-9);
+  EXPECT_GT((base_from_imu.so3() * Eigen::Vector3d::UnitZ()).z(), 0.0);
+  EXPECT_LT((base_from_imu.so3() * Eigen::Vector3d::UnitX()).x(), 0.0);
+}
+
+TEST(ImuFrame, lever_arm_adds_centripetal_acceleration)
+{
+  const Sophus::SE3d base_from_imu(Sophus::SO3d(), Eigen::Vector3d(0.0, 0.0, -0.25));
+  const ImuSample spinning =
+    make_sample(0.1, Eigen::Vector3d(0.0, 0.0, 9.81), Eigen::Vector3d(1.0, 0.0, 0.0));
+  const ImuSample body =
+    transform_imu_sample(spinning, base_from_imu, Eigen::Vector3d(1.0, 0.0, 0.0), 0.0, true);
+  EXPECT_NEAR(body.linear_acceleration.z(), 9.81 - 0.25, 1e-9);
 }
 
 TEST(ImuProcessor, full_window_of_motion_stays_unaligned)

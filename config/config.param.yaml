@@ -2,7 +2,7 @@
   ros__parameters:
     publish_tf: true
     parent_frame: "map"
-    child_frame: "pose_estimator_base_link"
+    child_frame: "base_link"
     alignment_sample_count: 500
     stationary_gyro_thresh: 0.05
     stationary_accel_dev_thresh: 0.5

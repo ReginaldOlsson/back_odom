@@ -16,7 +16,9 @@
 
 #include "back_odom/lidar_preprocess.hpp"
 
-#include <cmath>
+#include <kiss_icp_cpp/core/VoxelUtils.hpp>
+
+#include <algorithm>
 #include <stdexcept>
 
 namespace back_odom
@@ -41,9 +43,19 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   }
 }
 
+void LidarImuMatcher::set_body_from_lidar(const Sophus::SE3d & body_from_lidar)
+{
+  body_from_lidar_ = body_from_lidar;
+}
+
 bool LidarImuMatcher::has_reference() const
 {
   return has_reference_;
+}
+
+std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
+{
+  return map_.Pointcloud();
 }
 
 MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
@@ -53,97 +65,85 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     return result;
   }
   const std::vector<Eigen::Vector3d> deskewed =
-    deskew_to_scan_end(scan.points, scan.timestamps, imu.trajectory());
+    deskew_to_scan_end(scan.points, scan.timestamps, imu.trajectory(), body_from_lidar_);
   const std::vector<Eigen::Vector3d> cropped =
     crop_lidar_box(deskewed, half_longitudinal_, half_lateral_);
-  if (cropped.empty()) {
+  // Same two-level voxelization as KissICP::Voxelize: finer cloud for the map, coarser for ICP.
+  const std::vector<Eigen::Vector3d> map_points =
+    kiss_icp::VoxelDownsample(cropped, params_.voxel_size * 0.5);
+  const std::vector<Eigen::Vector3d> source =
+    kiss_icp::VoxelDownsample(map_points, params_.voxel_size * 1.5);
+  if (source.empty()) {
     return result;
   }
 
-  const Sophus::SE3d imu_pose = imu.pose();
-  result.imu_pose = imu_pose;
+  const double scan_end = *std::max_element(scan.timestamps.cbegin(), scan.timestamps.cend());
+  const Sophus::SE3d predicted = imu.interpolate_pose(scan_end);
+  result.imu_pose = predicted;
   result.applied = true;
 
   if (!has_reference_) {
-    map_.Update(cropped, imu_pose);
-    cull_map(imu_pose);
-    stored_scan_ = cropped;
+    map_.Update(map_points, predicted);
+    cull_map(predicted);
+    stored_scan_ = source;
+    stored_pose_ = predicted;
     has_reference_ = true;
     last_correction_stamp_ = scan.stamp;
-    last_correction_position_ = imu_pose.translation();
+    last_correction_position_ = predicted.translation();
     imu_steps_ = 0;
     result.inserted_scan = true;
     result.first_scan = true;
-    result.corrected_pose = imu_pose;
+    result.corrected_pose = predicted;
     return result;
   }
 
   double iterations = 0.0;
-  const kiss_icp::PlaneAlignResult aligned = align(cropped, imu_pose, iterations);
+  const kiss_icp::PlaneAlignResult aligned = align(source, predicted, iterations);
+  const Sophus::SE3d error = aligned.pose * predicted.inverse();
+  constexpr double k_max_translation = 1.0;
+  constexpr double k_max_rotation = 0.2;
+  if (
+    iterations <= 0.0 || error.translation().norm() > k_max_translation ||
+    error.so3().log().norm() > k_max_rotation) {
+    result.applied = false;
+    return result;
+  }
+
   result.iterations = iterations;
-  result.correction = aligned.correction;
-  result.corrected_pose = aligned.pose;
+  result.correction = error;
+  result.corrected_pose = error * imu.pose();
   result.inserted_scan = true;
-  apply_correction(imu, aligned.pose, scan.stamp);
-  map_.Update(cropped, aligned.pose);
+  apply_correction(imu, error, scan_end);
+  map_.Update(map_points, aligned.pose);
   cull_map(aligned.pose);
-  stored_scan_ = cropped;
+  stored_scan_ = source;
+  stored_pose_ = aligned.pose;
   imu_steps_ = 0;
   return result;
 }
 
-MatchResult LidarImuMatcher::on_imu(ImuProcessor & imu)
+MatchResult LidarImuMatcher::on_imu(ImuProcessor & /*imu*/)
 {
-  MatchResult result;
-  if (!has_reference_ || stored_scan_.empty() || !imu.aligned()) {
-    return result;
-  }
-  ++imu_steps_;
-  if (imu_steps_ < params_.backward_match_stride) {
-    return result;
-  }
-  imu_steps_ = 0;
-
-  const Sophus::SE3d imu_pose = imu.pose();
-  double iterations = 0.0;
-  const kiss_icp::PlaneAlignResult aligned = align(stored_scan_, imu_pose, iterations);
-  result.applied = true;
-  result.inserted_scan = false;
-  result.imu_pose = imu_pose;
-  result.iterations = iterations;
-  result.correction = aligned.correction;
-  result.corrected_pose = aligned.pose;
-  apply_correction(imu, aligned.pose, imu.latest_stamp());
-  return result;
+  return {};
 }
 
 void LidarImuMatcher::apply_correction(
-  ImuProcessor & imu, const Sophus::SE3d & corrected_pose, const double stamp)
+  ImuProcessor & imu, const Sophus::SE3d & error, const double scan_stamp)
 {
-  const double dt = stamp - last_correction_stamp_;
+  const Sophus::SE3d corrected = error * imu.pose();
+  const double dt = imu.latest_stamp() - last_correction_stamp_;
   Eigen::Vector3d velocity = imu.velocity();
   if (dt > 1e-3) {
-    velocity = (corrected_pose.translation() - last_correction_position_) / dt;
+    velocity = (corrected.translation() - last_correction_position_) / dt;
   }
-  imu.reset_state(corrected_pose, velocity, stamp);
-  last_correction_stamp_ = stamp;
-  last_correction_position_ = corrected_pose.translation();
+  imu.apply_lidar_correction(error, velocity, scan_stamp, last_correction_stamp_);
+  last_correction_stamp_ = imu.latest_stamp();
+  last_correction_position_ = imu.pose().translation();
 }
 
 void LidarImuMatcher::cull_map(const Sophus::SE3d & lidar_pose)
 {
-  const std::vector<Eigen::Vector3d> world_points = map_.Pointcloud();
-  const Sophus::SE3d world_to_lidar = lidar_pose.inverse();
-  std::vector<Eigen::Vector3d> kept;
-  kept.reserve(world_points.size());
-  for (const auto & point : world_points) {
-    const Eigen::Vector3d local = world_to_lidar * point;
-    if (std::abs(local.x()) <= half_longitudinal_ && std::abs(local.y()) <= half_lateral_) {
-      kept.push_back(point);
-    }
-  }
-  map_.Clear();
-  map_.AddPoints(kept);
+  map_.RemovePointsOutsideBox(lidar_pose.inverse(), half_longitudinal_, half_lateral_);
 }
 
 kiss_icp::PlaneAlignResult LidarImuMatcher::align(
