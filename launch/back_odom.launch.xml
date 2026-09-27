@@ -1,0 +1,14 @@
+<launch>
+
+  <arg name="config_file" default="$(find-pkg-share back_odom)/config/config.param.yaml"/>
+  <arg name="use_sim_time" default="false"/>
+  <set_parameter name="use_sim_time" value="$(var use_sim_time)" />
+
+  <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen">
+    <remap from="/imu/data" to="/boreas/imu"/>
+    <remap from="/pointcloud" to="/boreas/pointcloud"/>
+
+    <param from="$(var config_file)"/>
+  </node>
+    
+</launch>

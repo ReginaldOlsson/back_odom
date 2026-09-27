@@ -1,0 +1,12 @@
+/**:
+  ros__parameters:
+    publish_tf: true
+    parent_frame: "map"
+    child_frame: "pose_estimator_base_link"
+    alignment_sample_count: 500
+    stationary_gyro_thresh: 0.05
+    stationary_accel_dev_thresh: 0.5
+    gravity: 9.81
+    max_dt: 0.1
+    path_min_dt: 0.1
+    path_max_poses: 1000
