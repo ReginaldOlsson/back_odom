@@ -16,6 +16,7 @@
 #define BACK_ODOM__IMU_DEAD_RECKONING_HPP_
 
 #include <Eigen/Core>
+#include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
 
 namespace back_odom
@@ -31,6 +32,7 @@ public:
   void integrate(
     const Eigen::Vector3d & angular_velocity, const Eigen::Vector3d & linear_acceleration,
     double dt);
+  void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world);
 
   [[nodiscard]] const Sophus::SO3d & orientation() const;
   [[nodiscard]] const Eigen::Vector3d & position() const;

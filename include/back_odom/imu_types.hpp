@@ -16,6 +16,7 @@
 #define BACK_ODOM__IMU_TYPES_HPP_
 
 #include <Eigen/Core>
+#include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
 
 #include <cstddef>
@@ -40,6 +41,12 @@ struct ProcessorParams
 };
 
 enum class ProcessorPhase { Collecting, Tracking };
+
+struct StampedPose
+{
+  double stamp{0.0};
+  Sophus::SE3d pose{};
+};
 
 struct ProcessorOutput
 {

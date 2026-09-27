@@ -18,6 +18,9 @@
 #include "back_odom/imu_dead_reckoning.hpp"
 #include "back_odom/imu_types.hpp"
 
+#include <Eigen/Core>
+#include <sophus/se3.hpp>
+
 #include <optional>
 #include <vector>
 
@@ -30,8 +33,17 @@ public:
   explicit ImuProcessor(const ProcessorParams & params);
 
   [[nodiscard]] ProcessorOutput process(const ImuSample & sample);
+  [[nodiscard]] ProcessorOutput output_at(const ImuSample & sample) const;
+  [[nodiscard]] bool aligned() const;
+  [[nodiscard]] Sophus::SE3d pose() const;
+  [[nodiscard]] Eigen::Vector3d velocity() const;
+  [[nodiscard]] double latest_stamp() const;
+  [[nodiscard]] const std::vector<StampedPose> & trajectory() const;
+  [[nodiscard]] Sophus::SE3d interpolate_pose(double stamp) const;
+  void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, double stamp);
 
 private:
+  void record_pose(double stamp);
   [[nodiscard]] ProcessorOutput process_collecting(const ImuSample & sample);
   [[nodiscard]] ProcessorOutput process_tracking(const ImuSample & sample);
   [[nodiscard]] ProcessorOutput make_tracking_output(const ImuSample & sample) const;
@@ -39,6 +51,7 @@ private:
   ProcessorParams params_;
   std::vector<ImuSample> window_;
   std::optional<ImuDeadReckoning> dead_reckoning_;
+  std::vector<StampedPose> trajectory_;
   double previous_stamp_{0.0};
   bool has_previous_stamp_{false};
 };

@@ -36,6 +36,14 @@ void ImuDeadReckoning::set_gyro_bias(const Eigen::Vector3d & gyro_bias)
   gyro_bias_ = gyro_bias;
 }
 
+void ImuDeadReckoning::reset_state(
+  const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world)
+{
+  orientation_ = pose.so3();
+  position_ = pose.translation();
+  velocity_ = velocity_world;
+}
+
 void ImuDeadReckoning::integrate(
   const Eigen::Vector3d & angular_velocity, const Eigen::Vector3d & linear_acceleration,
   const double dt)

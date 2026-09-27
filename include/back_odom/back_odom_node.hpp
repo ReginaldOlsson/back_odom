@@ -16,6 +16,7 @@
 #define BACK_ODOM__BACK_ODOM_NODE_HPP_
 
 #include "back_odom/imu_processor.hpp"
+#include "back_odom/lidar_imu_matcher.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -42,17 +43,22 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
-  void publish_odometry(const ProcessorOutput & output, const rclcpp::Time & stamp);
+  void publish_odometry(
+    const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
+    const ProcessorOutput & output, const rclcpp::Time & stamp);
+  [[nodiscard]] LidarScan scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cloud) const;
   void publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_tf(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp);
 
   std::unique_ptr<ImuProcessor> imu_processor_;
+  std::unique_ptr<LidarImuMatcher> lidar_matcher_;
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -68,6 +74,7 @@ private:
   std::size_t path_max_poses_{1000};
   double path_min_dt_{0.1};
   bool publish_tf_{true};
+  std::string time_field_;
 };
 
 }  // namespace back_odom

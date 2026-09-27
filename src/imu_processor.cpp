@@ -16,6 +16,7 @@
 
 #include "back_odom/imu_alignment.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 namespace back_odom
@@ -73,6 +74,7 @@ ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
 
   output = make_tracking_output(sample);
   output.sample_count = params_.alignment_sample_count;
+  record_pose(sample.stamp);
   return output;
 }
 
@@ -87,7 +89,99 @@ ProcessorOutput ImuProcessor::process_tracking(const ImuSample & sample)
 
   ProcessorOutput output = make_tracking_output(sample);
   output.sample_count = params_.alignment_sample_count;
+  record_pose(sample.stamp);
   return output;
+}
+
+ProcessorOutput ImuProcessor::output_at(const ImuSample & sample) const
+{
+  if (!dead_reckoning_) {
+    ProcessorOutput output;
+    output.specific_force_body = sample.linear_acceleration;
+    output.angular_velocity_body = sample.angular_velocity;
+    output.gravity = params_.gravity;
+    return output;
+  }
+  return make_tracking_output(sample);
+}
+
+bool ImuProcessor::aligned() const
+{
+  return dead_reckoning_.has_value();
+}
+
+Sophus::SE3d ImuProcessor::pose() const
+{
+  if (!dead_reckoning_) {
+    return Sophus::SE3d();
+  }
+  return {dead_reckoning_->orientation(), dead_reckoning_->position()};
+}
+
+Eigen::Vector3d ImuProcessor::velocity() const
+{
+  if (!dead_reckoning_) {
+    return Eigen::Vector3d::Zero();
+  }
+  return dead_reckoning_->velocity();
+}
+
+double ImuProcessor::latest_stamp() const
+{
+  return previous_stamp_;
+}
+
+const std::vector<StampedPose> & ImuProcessor::trajectory() const
+{
+  return trajectory_;
+}
+
+Sophus::SE3d ImuProcessor::interpolate_pose(const double stamp) const
+{
+  if (trajectory_.empty()) {
+    throw std::runtime_error("imu trajectory is empty");
+  }
+  if (stamp <= trajectory_.front().stamp) {
+    return trajectory_.front().pose;
+  }
+  if (stamp >= trajectory_.back().stamp) {
+    return trajectory_.back().pose;
+  }
+  for (std::size_t index = 1; index < trajectory_.size(); ++index) {
+    if (stamp > trajectory_[index].stamp) {
+      continue;
+    }
+    const StampedPose & before = trajectory_[index - 1];
+    const StampedPose & after = trajectory_[index];
+    const double interval = after.stamp - before.stamp;
+    const double alpha = interval > 1e-9 ? (stamp - before.stamp) / interval : 0.0;
+    const Sophus::SE3d relative = before.pose.inverse() * after.pose;
+    return before.pose * Sophus::SE3d::exp(alpha * relative.log());
+  }
+  return trajectory_.back().pose;
+}
+
+void ImuProcessor::reset_state(
+  const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, const double stamp)
+{
+  if (!dead_reckoning_) {
+    throw std::runtime_error("imu integrator is not aligned");
+  }
+  dead_reckoning_->reset_state(pose, velocity_world);
+  if (!trajectory_.empty() && std::abs(trajectory_.back().stamp - stamp) < 1e-6) {
+    trajectory_.back().pose = pose;
+  } else {
+    trajectory_.push_back(StampedPose{stamp, pose});
+  }
+}
+
+void ImuProcessor::record_pose(const double stamp)
+{
+  trajectory_.push_back(StampedPose{stamp, pose()});
+  constexpr double k_horizon_seconds = 2.0;
+  while (trajectory_.size() > 2 && stamp - trajectory_.front().stamp > k_horizon_seconds) {
+    trajectory_.erase(trajectory_.begin());
+  }
 }
 
 ProcessorOutput ImuProcessor::make_tracking_output(const ImuSample & sample) const

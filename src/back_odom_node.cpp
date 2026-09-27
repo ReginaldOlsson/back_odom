@@ -21,9 +21,15 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -104,6 +110,19 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const double max_dt = this->declare_parameter<double>("max_dt", 0.1);
   path_min_dt_ = this->declare_parameter<double>("path_min_dt", 0.1);
   const int path_max_poses = this->declare_parameter<int>("path_max_poses", 1000);
+  time_field_ = this->declare_parameter<std::string>("time_field", "time");
+  LidarMatchParams lidar_params;
+  lidar_params.voxel_size = this->declare_parameter<double>("voxel_size", 0.5);
+  lidar_params.crop_longitudinal = this->declare_parameter<double>("crop_longitudinal", 75.0);
+  lidar_params.crop_lateral = this->declare_parameter<double>("crop_lateral", 50.0);
+  lidar_params.max_correspondence_distance =
+    this->declare_parameter<double>("max_correspondence_distance", 2.0);
+  lidar_params.kernel_scale = this->declare_parameter<double>("kernel_scale", 0.5);
+  lidar_params.convergence_criterion =
+    this->declare_parameter<double>("convergence_criterion", 1.0e-4);
+  lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
+  lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
+  lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 3);
 
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
@@ -122,6 +141,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   params.gravity = gravity;
   params.max_dt = max_dt;
   imu_processor_ = std::make_unique<ImuProcessor>(params);
+  lidar_matcher_ = std::make_unique<LidarImuMatcher>(lidar_params);
 
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
     imu_topic, rclcpp::QoS(10),
@@ -133,6 +153,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     });
 
   odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom", rclcpp::QoS(10));
+  imu_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom/imu", rclcpp::QoS(10));
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("back_odom/path", rclcpp::QoS(10));
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "back_odom/markers", rclcpp::QoS(10));
@@ -156,8 +177,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   sample.angular_velocity =
     to_vector3(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
 
-  const ProcessorOutput output = imu_processor_->process(sample);
-  publish_markers(output, stamp);
+  ProcessorOutput output = imu_processor_->process(sample);
 
   if (!output.aligned && output.sample_count >= alignment_sample_count_) {
     RCLCPP_WARN_THROTTLE(
@@ -169,11 +189,23 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   }
   aligned_ = output.aligned;
   if (!output.aligned) {
+    publish_markers(output, stamp);
     return;
   }
 
-  publish_odometry(output, stamp);
+  const MatchResult backward = lidar_matcher_->on_imu(*imu_processor_);
+  if (backward.applied) {
+    publish_odometry(imu_odom_pub_, output, stamp);
+    output = imu_processor_->output_at(sample);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Backward IMU correction. translation error %.3f m",
+      backward.correction.translation().norm());
+  }
+
+  publish_odometry(odometry_pub_, output, stamp);
   publish_path(output, stamp);
+  publish_markers(output, stamp);
   if (publish_tf_) {
     publish_tf(output, stamp);
   }
@@ -181,12 +213,112 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 
 void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
-  RCLCPP_DEBUG(
-    this->get_logger(), "Received PointCloud2 data with width: %u, height: %u", msg->width,
-    msg->height);
+  if (!aligned_ || !imu_processor_->aligned()) {
+    return;
+  }
+  const LidarScan scan = scan_from_cloud(*msg);
+  if (scan.points.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Skipping lidar scan. Need xyz points and a timestamp field.");
+    return;
+  }
+  const rclcpp::Time stamp(msg->header.stamp);
+  const ProcessorOutput prior = imu_processor_->output_at(
+    ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
+  const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
+  if (!matched.applied) {
+    return;
+  }
+  publish_odometry(imu_odom_pub_, prior, stamp);
+  const ProcessorOutput corrected = imu_processor_->output_at(
+    ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
+  publish_odometry(odometry_pub_, corrected, stamp);
+  publish_path(corrected, stamp);
+  publish_markers(corrected, stamp);
+  if (publish_tf_) {
+    publish_tf(corrected, stamp);
+  }
+  if (matched.first_scan) {
+    RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
+  }
 }
 
-void BackOdomNode::publish_odometry(const ProcessorOutput & output, const rclcpp::Time & stamp)
+LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cloud) const
+{
+  LidarScan scan;
+  scan.stamp = rclcpp::Time(cloud.header.stamp).seconds();
+  const auto x_field = std::find_if(
+    cloud.fields.cbegin(), cloud.fields.cend(),
+    [](const sensor_msgs::msg::PointField & field) { return field.name == "x"; });
+  const auto y_field = std::find_if(
+    cloud.fields.cbegin(), cloud.fields.cend(),
+    [](const sensor_msgs::msg::PointField & field) { return field.name == "y"; });
+  const auto z_field = std::find_if(
+    cloud.fields.cbegin(), cloud.fields.cend(),
+    [](const sensor_msgs::msg::PointField & field) { return field.name == "z"; });
+  auto time_field = std::find_if(
+    cloud.fields.cbegin(), cloud.fields.cend(),
+    [this](const sensor_msgs::msg::PointField & field) { return field.name == time_field_; });
+  if (time_field == cloud.fields.cend()) {
+    for (const char * fallback : {"time", "t", "timestamp"}) {
+      time_field = std::find_if(
+        cloud.fields.cbegin(), cloud.fields.cend(),
+        [fallback](const sensor_msgs::msg::PointField & field) { return field.name == fallback; });
+      if (time_field != cloud.fields.cend()) {
+        break;
+      }
+    }
+  }
+  if (
+    x_field == cloud.fields.cend() || y_field == cloud.fields.cend() ||
+    z_field == cloud.fields.cend() || time_field == cloud.fields.cend()) {
+    return scan;
+  }
+
+  const auto read_float = [&cloud](
+                            const sensor_msgs::msg::PointField & field, const std::size_t index) {
+    const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
+    if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      float value = 0.0F;
+      std::memcpy(&value, pointer, sizeof(float));
+      return static_cast<double>(value);
+    }
+    if (field.datatype == sensor_msgs::msg::PointField::FLOAT64) {
+      double value = 0.0;
+      std::memcpy(&value, pointer, sizeof(double));
+      return value;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+  };
+
+  const std::size_t count = static_cast<std::size_t>(cloud.width) * cloud.height;
+  scan.points.reserve(count);
+  scan.timestamps.reserve(count);
+  double max_abs_time = 0.0;
+  for (std::size_t index = 0; index < count; ++index) {
+    const double x = read_float(*x_field, index);
+    const double y = read_float(*y_field, index);
+    const double z = read_float(*z_field, index);
+    const double time = read_float(*time_field, index);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(time)) {
+      continue;
+    }
+    scan.points.emplace_back(x, y, z);
+    scan.timestamps.push_back(time);
+    max_abs_time = std::max(max_abs_time, std::abs(time));
+  }
+  if (max_abs_time < 1000.0) {
+    for (double & time : scan.timestamps) {
+      time += scan.stamp;
+    }
+  }
+  return scan;
+}
+
+void BackOdomNode::publish_odometry(
+  const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
+  const ProcessorOutput & output, const rclcpp::Time & stamp)
 {
   nav_msgs::msg::Odometry odometry;
   odometry.header.stamp = stamp;
@@ -204,7 +336,7 @@ void BackOdomNode::publish_odometry(const ProcessorOutput & output, const rclcpp
   odometry.twist.twist.angular.x = output.angular_velocity_body.x();
   odometry.twist.twist.angular.y = output.angular_velocity_body.y();
   odometry.twist.twist.angular.z = output.angular_velocity_body.z();
-  odometry_pub_->publish(odometry);
+  publisher->publish(odometry);
 }
 
 void BackOdomNode::publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp)
