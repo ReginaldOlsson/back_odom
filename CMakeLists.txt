@@ -7,6 +7,8 @@ autoware_package()
 find_package(Sophus REQUIRED)
 find_package(TBB REQUIRED)
 find_package(kiss_icp_cpp REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common features search kdtree)
+find_package(OpenMP REQUIRED)
 
 ament_auto_add_library(imu_processor SHARED
   src/imu_alignment.cpp
@@ -18,8 +20,13 @@ target_link_libraries(imu_processor Sophus::Sophus)
 ament_auto_add_library(lidar_imu_matcher SHARED
   src/lidar_preprocess.cpp
   src/lidar_imu_matcher.cpp
+  src/fpfh_coarse_align.cpp
 )
-target_link_libraries(lidar_imu_matcher imu_processor kiss_icp_cpp::kiss_icp_cpp TBB::tbb)
+target_include_directories(lidar_imu_matcher PRIVATE ${PCL_INCLUDE_DIRS})
+target_compile_options(lidar_imu_matcher PRIVATE ${PCL_DEFINITIONS})
+target_link_libraries(
+  lidar_imu_matcher imu_processor kiss_icp_cpp::kiss_icp_cpp TBB::tbb ${PCL_LIBRARIES}
+  OpenMP::OpenMP_CXX)
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/back_odom_node.cpp
@@ -37,6 +44,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_imu_processing imu_processor)
   ament_add_gtest(test_lidar_match test/test_lidar_match.cpp)
   target_link_libraries(test_lidar_match lidar_imu_matcher)
+  ament_add_gtest(test_fpfh_coarse_align test/test_fpfh_coarse_align.cpp)
+  target_link_libraries(test_fpfh_coarse_align lidar_imu_matcher)
 endif()
 
 ament_auto_package(

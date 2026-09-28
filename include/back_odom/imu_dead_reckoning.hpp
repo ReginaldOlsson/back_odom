@@ -29,6 +29,7 @@ public:
 
   void set_initial_orientation(const Sophus::SO3d & orientation);
   void set_gyro_bias(const Eigen::Vector3d & gyro_bias);
+  void set_accel_bias(const Eigen::Vector3d & accel_bias);
   void integrate(
     const Eigen::Vector3d & angular_velocity, const Eigen::Vector3d & linear_acceleration,
     double dt);
@@ -39,6 +40,7 @@ public:
   [[nodiscard]] const Eigen::Vector3d & velocity() const;
   [[nodiscard]] const Eigen::Vector3d & linear_acceleration_world() const;
   [[nodiscard]] const Eigen::Vector3d & gyro_bias() const;
+  [[nodiscard]] const Eigen::Vector3d & accel_bias() const;
   [[nodiscard]] double gravity() const;
 
 private:
@@ -46,6 +48,7 @@ private:
   Eigen::Vector3d position_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d velocity_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d gyro_bias_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d accel_bias_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d linear_acceleration_world_{Eigen::Vector3d::Zero()};
   double gravity_{9.81};
 };

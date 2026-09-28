@@ -177,13 +177,13 @@ void ImuProcessor::reset_state(
 }
 
 void ImuProcessor::apply_lidar_correction(
-  const Sophus::SE3d & error, const Eigen::Vector3d & velocity_world, const double scan_stamp,
+  const Sophus::SE3d & body_delta, const Eigen::Vector3d & velocity_world, const double scan_stamp,
   const double since_stamp)
 {
   if (!dead_reckoning_) {
     throw std::runtime_error("imu integrator is not aligned");
   }
-  const Sophus::SE3d::Tangent tangent = error.log();
+  const Sophus::SE3d::Tangent tangent = body_delta.log();
   const double span = scan_stamp - since_stamp;
   if (tangent.norm() > 1e-8) {
     for (StampedPose & sample : trajectory_) {
@@ -193,14 +193,46 @@ void ImuProcessor::apply_lidar_correction(
       const double alpha = (sample.stamp < scan_stamp && span > 1e-9)
                              ? std::clamp((sample.stamp - since_stamp) / span, 0.0, 1.0)
                              : 1.0;
-      sample.pose = Sophus::SE3d::exp(alpha * tangent) * sample.pose;
+      sample.pose = sample.pose * Sophus::SE3d::exp(alpha * tangent);
     }
   }
-  const Sophus::SE3d corrected = error * pose();
+  const Sophus::SE3d corrected = pose() * body_delta;
   dead_reckoning_->reset_state(corrected, velocity_world);
   if (!trajectory_.empty() && std::abs(trajectory_.back().stamp - previous_stamp_) < 1e-6) {
     trajectory_.back().pose = corrected;
   }
+}
+
+Eigen::Vector3d ImuProcessor::gyro_bias() const
+{
+  if (!dead_reckoning_) {
+    return Eigen::Vector3d::Zero();
+  }
+  return dead_reckoning_->gyro_bias();
+}
+
+Eigen::Vector3d ImuProcessor::accel_bias() const
+{
+  if (!dead_reckoning_) {
+    return Eigen::Vector3d::Zero();
+  }
+  return dead_reckoning_->accel_bias();
+}
+
+void ImuProcessor::set_gyro_bias(const Eigen::Vector3d & gyro_bias)
+{
+  if (!dead_reckoning_) {
+    throw std::runtime_error("imu integrator is not aligned");
+  }
+  dead_reckoning_->set_gyro_bias(gyro_bias);
+}
+
+void ImuProcessor::set_accel_bias(const Eigen::Vector3d & accel_bias)
+{
+  if (!dead_reckoning_) {
+    throw std::runtime_error("imu integrator is not aligned");
+  }
+  dead_reckoning_->set_accel_bias(accel_bias);
 }
 
 void ImuProcessor::record_pose(const double stamp)

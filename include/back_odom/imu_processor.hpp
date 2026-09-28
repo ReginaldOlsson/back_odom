@@ -42,11 +42,15 @@ public:
   [[nodiscard]] Sophus::SE3d interpolate_pose(double stamp) const;
   void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, double stamp);
 
-  /// Left-multiply `error` into the current pose. Samples from `since_stamp` to `scan_stamp` blend
-  /// it in.
+  /// Right-multiply `body_delta` so a positive body-x correction moves forward and a positive yaw
+  /// turns about the vehicle. Samples from `since_stamp` to `scan_stamp` blend it in.
   void apply_lidar_correction(
-    const Sophus::SE3d & error, const Eigen::Vector3d & velocity_world, double scan_stamp,
+    const Sophus::SE3d & body_delta, const Eigen::Vector3d & velocity_world, double scan_stamp,
     double since_stamp);
+  [[nodiscard]] Eigen::Vector3d gyro_bias() const;
+  [[nodiscard]] Eigen::Vector3d accel_bias() const;
+  void set_gyro_bias(const Eigen::Vector3d & gyro_bias);
+  void set_accel_bias(const Eigen::Vector3d & accel_bias);
 
 private:
   void record_pose(double stamp);

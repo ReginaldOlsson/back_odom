@@ -165,6 +165,21 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 3);
+  lidar_params.fpfh.enabled = this->declare_parameter<bool>("fpfh_enabled", true);
+  lidar_params.fpfh.keypoint_voxel = this->declare_parameter<double>("fpfh_keypoint_voxel", 1.5);
+  lidar_params.fpfh.normal_radius = this->declare_parameter<double>("fpfh_normal_radius", 2.0);
+  lidar_params.fpfh.fpfh_radius = this->declare_parameter<double>("fpfh_radius", 5.0);
+  lidar_params.fpfh.max_keypoints = this->declare_parameter<int>("fpfh_max_keypoints", 1500);
+  lidar_params.fpfh.correspondence_distance =
+    this->declare_parameter<double>("fpfh_correspondence_distance", 5.0);
+  lidar_params.fpfh.min_inliers = this->declare_parameter<int>("fpfh_min_inliers", 20);
+  lidar_params.fpfh.omp_threads = this->declare_parameter<int>("fpfh_omp_threads", 0);
+  lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
+  lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
+  lidar_params.speed_correction_gain =
+    this->declare_parameter<double>("speed_correction_gain", 0.5);
+  lidar_params.max_gyro_bias = this->declare_parameter<double>("max_gyro_bias", 0.05);
+  lidar_params.max_accel_bias = this->declare_parameter<double>("max_accel_bias", 1.0);
 
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
@@ -308,7 +323,21 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
   if (!matched.applied) {
+    if (lidar_matcher_->has_reference()) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "ICP correction rejected. vehicle translation %.3f m, rotation %.3f rad, iterations %.0f",
+        matched.translation_error, matched.rotation_error, matched.iterations);
+    }
     return;
+  }
+  if (!matched.first_scan) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "ICP correction applied. vehicle translation %.3f m, rotation %.4f rad, gyro bias z %.5f, "
+      "accel bias x %.4f",
+      matched.translation_error, matched.rotation_error, matched.gyro_bias.z(),
+      matched.accel_bias.x());
   }
   publish_odometry(imu_odom_pub_, prior, stamp);
   const ProcessorOutput corrected = imu_processor_->output_at(

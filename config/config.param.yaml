@@ -1,10 +1,11 @@
 /**:
   ros__parameters:
     publish_tf: true
-    # Boreas imu_raw is left-handed (x-back, y-left, z-up). The imu extrinsic is a
-    # proper rotation from the right-handed stand-in (x-back, y-right, z-up). Without
-    # this, yaw during a turn is the mirror of the road.
-    imu_left_handed: true
+    # Bags exported before boreas converts imu_raw still contain left-handed samples
+    # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
+    # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
+    # the bag, or the yaw correction is applied twice and the turn mirrors again.
+    imu_left_handed: false
     parent_frame: "map"
     child_frame: "base_link"
     alignment_sample_count: 500
@@ -24,3 +25,17 @@
     max_iterations: 50
     max_points_per_voxel: 20
     backward_match_stride: 3
+    # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
+    gyro_bias_gain: 0.1
+    accel_bias_gain: 0.02
+    speed_correction_gain: 0.5
+    max_gyro_bias: 0.05
+    max_accel_bias: 1.0
+    fpfh_enabled: true
+    fpfh_keypoint_voxel: 1.5
+    fpfh_normal_radius: 2.0
+    fpfh_radius: 5.0
+    fpfh_max_keypoints: 1500
+    fpfh_correspondence_distance: 5.0
+    fpfh_min_inliers: 20
+    fpfh_omp_threads: 0

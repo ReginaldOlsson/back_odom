@@ -15,6 +15,7 @@
 #ifndef BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 #define BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 
+#include "back_odom/fpfh_coarse_align.hpp"
 #include "back_odom/imu_processor.hpp"
 
 #include <Eigen/Core>
@@ -45,17 +46,47 @@ struct LidarMatchParams
   int max_iterations{50};
   int max_points_per_voxel{20};
   int backward_match_stride{3};
+  // Fraction of the vehicle-frame residual turned into a bias step each accepted scan.
+  double gyro_bias_gain{0.1};
+  double accel_bias_gain{0.02};
+  // How much of the speed comes from the lidar displacement. Direction stays with the IMU.
+  double speed_correction_gain{0.5};
+  double max_gyro_bias{0.05};
+  double max_accel_bias{1.0};
+  FpfhParams fpfh{};
 };
+
+/// Velocity and bias step implied by one accepted ICP residual.
+/// `vehicle_delta` is predicted.inverse() * aligned, so rotation is about the vehicle.
+struct InertialCorrection
+{
+  Eigen::Vector3d velocity_world{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d gyro_bias_delta{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d accel_bias_delta{Eigen::Vector3d::Zero()};
+};
+
+[[nodiscard]] InertialCorrection inertial_correction_from_match(
+  const Sophus::SE3d & vehicle_delta, const Sophus::SO3d & orientation_correction,
+  const Sophus::SE3d & corrected_pose, const Eigen::Vector3d & imu_velocity_world,
+  const Eigen::Vector3d & previous_position, double dt, double gyro_bias_gain,
+  double accel_bias_gain, double speed_gain);
 
 struct MatchResult
 {
   bool applied{false};
   bool inserted_scan{false};
   bool first_scan{false};
+  bool used_coarse_guess{false};
   Sophus::SE3d imu_pose{};
   Sophus::SE3d corrected_pose{};
+  /// World-frame left increment applied to the pose. `correction * predicted = aligned`.
   Sophus::SE3d correction{};
+  /// Vehicle-frame residual used for the gate and the bias update.
+  double translation_error{0.0};
+  double rotation_error{0.0};
   double iterations{0.0};
+  Eigen::Vector3d gyro_bias{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d accel_bias{Eigen::Vector3d::Zero()};
 };
 
 class LidarImuMatcher
@@ -77,7 +108,8 @@ public:
   [[nodiscard]] MatchResult on_imu(ImuProcessor & imu);
 
 private:
-  void apply_correction(ImuProcessor & imu, const Sophus::SE3d & error, double scan_stamp);
+  void apply_correction(
+    ImuProcessor & imu, const Sophus::SE3d & vehicle_delta, double scan_stamp);
   void cull_map(const Sophus::SE3d & lidar_pose);
   [[nodiscard]] kiss_icp::PlaneAlignResult align(
     const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations);
@@ -88,12 +120,16 @@ private:
   double half_lateral_{25.0};
   kiss_icp::VoxelHashMap map_;
   kiss_icp::Registration registration_;
+  FpfhCoarseAlign fpfh_;
   std::vector<Eigen::Vector3d> stored_scan_;
   Sophus::SE3d stored_pose_{};
   bool has_reference_{false};
   int imu_steps_{0};
   double last_correction_stamp_{0.0};
   Eigen::Vector3d last_correction_position_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d gyro_bias_prior_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d accel_bias_prior_{Eigen::Vector3d::Zero()};
+  bool has_bias_prior_{false};
 };
 
 }  // namespace back_odom

@@ -36,6 +36,11 @@ void ImuDeadReckoning::set_gyro_bias(const Eigen::Vector3d & gyro_bias)
   gyro_bias_ = gyro_bias;
 }
 
+void ImuDeadReckoning::set_accel_bias(const Eigen::Vector3d & accel_bias)
+{
+  accel_bias_ = accel_bias;
+}
+
 void ImuDeadReckoning::reset_state(
   const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world)
 {
@@ -52,10 +57,17 @@ void ImuDeadReckoning::integrate(
     return;
   }
 
+  const Sophus::SO3d previous_orientation = orientation_;
   orientation_ = orientation_ * Sophus::SO3d::exp((angular_velocity - gyro_bias_) * dt);
+  // Carry the velocity with the heading, then drop the lateral part so it cannot steer the
+  // next lidar guess off the forward axis.
+  velocity_ = orientation_ * previous_orientation.inverse() * velocity_;
   const Eigen::Vector3d gravity_world(0.0, 0.0, -gravity_);
-  linear_acceleration_world_ = orientation_ * linear_acceleration - gravity_world;
+  linear_acceleration_world_ = orientation_ * (linear_acceleration - accel_bias_) - gravity_world;
   velocity_ += linear_acceleration_world_ * dt;
+  Eigen::Vector3d velocity_body = orientation_.inverse() * velocity_;
+  velocity_body.y() = 0.0;
+  velocity_ = orientation_ * velocity_body;
   position_ += velocity_ * dt;
 }
 
@@ -82,6 +94,11 @@ const Eigen::Vector3d & ImuDeadReckoning::linear_acceleration_world() const
 const Eigen::Vector3d & ImuDeadReckoning::gyro_bias() const
 {
   return gyro_bias_;
+}
+
+const Eigen::Vector3d & ImuDeadReckoning::accel_bias() const
+{
+  return accel_bias_;
 }
 
 double ImuDeadReckoning::gravity() const
