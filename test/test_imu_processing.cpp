@@ -131,6 +131,24 @@ TEST(ImuProcessor, static_window_then_forward_accel)
   EXPECT_NEAR(output.position.x(), 0.01, 1e-6);
 }
 
+TEST(ImuFrame, left_handed_sample_follows_base_forward_after_mount_yaw)
+{
+  constexpr double k_pi = 3.14159265358979323846;
+  const Sophus::SE3d base_from_imu(Sophus::SO3d::rotZ(k_pi), Eigen::Vector3d::Zero());
+  // x-back, y-left, z-up: forward acceleration is negative x, gravity is negative z.
+  const ImuSample raw =
+    make_sample(1.0, Eigen::Vector3d(-1.5, 0.4, -9.81), Eigen::Vector3d(0.2, -0.3, 0.5));
+  const ImuSample body = transform_imu_sample(
+    to_right_handed_imu(raw), base_from_imu, Eigen::Vector3d::Zero(), 0.0, false);
+
+  EXPECT_NEAR(body.linear_acceleration.x(), 1.5, 1e-9);
+  EXPECT_NEAR(body.linear_acceleration.y(), 0.4, 1e-9);
+  EXPECT_NEAR(body.linear_acceleration.z(), -9.81, 1e-9);
+  EXPECT_NEAR(body.angular_velocity.x(), 0.2, 1e-9);
+  EXPECT_NEAR(body.angular_velocity.y(), 0.3, 1e-9);
+  EXPECT_NEAR(body.angular_velocity.z(), -0.5, 1e-9);
+}
+
 TEST(ImuFrame, rotated_mount_keeps_up_and_turns_forward)
 {
   constexpr double k_pi = 3.14159265358979323846;

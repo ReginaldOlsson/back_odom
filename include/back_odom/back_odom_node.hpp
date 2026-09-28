@@ -87,6 +87,7 @@ private:
   std::size_t path_max_poses_{1000};
   double path_min_dt_{0.1};
   bool publish_tf_{true};
+  bool imu_left_handed_{false};
   std::string time_field_;
 };
 

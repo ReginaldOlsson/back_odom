@@ -38,6 +38,12 @@ struct AlignmentResult
 [[nodiscard]] Sophus::SO3d compute_initial_alignment(
   const std::vector<Eigen::Vector3d> & linear_accelerations);
 
+/// Map a left-handed sample into the right-handed frame `target_from_imu` describes.
+/// Boreas imu_raw is x-back, y-left, z-up. Its extrinsic is a proper rotation from the
+/// right-handed stand-in (x-back, y-right, z-up). A polar vector negates Y. Angular
+/// velocity is axial, so that same reflection negates X and Z as well.
+[[nodiscard]] ImuSample to_right_handed_imu(const ImuSample & sample);
+
 /// Rotate an IMU sample into the target frame. `target_from_imu` is the static extrinsic.
 /// The previous target-frame gyro supplies angular acceleration for the lever arm.
 [[nodiscard]] ImuSample transform_imu_sample(

@@ -68,6 +68,15 @@ Sophus::SO3d compute_initial_alignment(const std::vector<Eigen::Vector3d> & line
   return rotation_aligning_vectors(acceleration_mean, -Eigen::Vector3d::UnitZ());
 }
 
+ImuSample to_right_handed_imu(const ImuSample & sample)
+{
+  ImuSample right_handed = sample;
+  right_handed.linear_acceleration.y() = -sample.linear_acceleration.y();
+  right_handed.angular_velocity.x() = -sample.angular_velocity.x();
+  right_handed.angular_velocity.z() = -sample.angular_velocity.z();
+  return right_handed;
+}
+
 ImuSample transform_imu_sample(
   const ImuSample & sample, const Sophus::SE3d & target_from_imu,
   const Eigen::Vector3d & previous_angular_velocity, const double previous_stamp,

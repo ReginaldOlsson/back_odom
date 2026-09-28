@@ -140,6 +140,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const auto pointcloud_topic =
     this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
+  imu_left_handed_ = this->declare_parameter<bool>("imu_left_handed", false);
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
   child_frame_ = this->declare_parameter<std::string>("child_frame", "base_link");
   const int alignment_sample_count = this->declare_parameter<int>("alignment_sample_count", 100);
@@ -203,7 +204,9 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
 
-  RCLCPP_INFO(this->get_logger(), "BackOdomNode initialized.");
+  RCLCPP_INFO(
+    this->get_logger(), "BackOdomNode initialized. imu_left_handed=%s",
+    imu_left_handed_ ? "true" : "false");
 }
 
 BackOdomNode::~BackOdomNode()
@@ -232,6 +235,9 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
     to_vector3(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
   measured.angular_velocity =
     to_vector3(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+  if (imu_left_handed_) {
+    measured = to_right_handed_imu(measured);
+  }
   const ImuSample sample = transform_imu_sample(
     measured, base_from_imu, previous_angular_velocity_, previous_angular_velocity_stamp_,
     has_previous_angular_velocity_);

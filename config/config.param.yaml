@@ -1,6 +1,10 @@
 /**:
   ros__parameters:
     publish_tf: true
+    # Boreas imu_raw is left-handed (x-back, y-left, z-up). The imu extrinsic is a
+    # proper rotation from the right-handed stand-in (x-back, y-right, z-up). Without
+    # this, yaw during a turn is the mirror of the road.
+    imu_left_handed: true
     parent_frame: "map"
     child_frame: "base_link"
     alignment_sample_count: 500
