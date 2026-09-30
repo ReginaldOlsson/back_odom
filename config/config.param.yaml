@@ -17,14 +17,15 @@
     path_max_poses: 1000
     time_field: "time"
     voxel_size: 0.5
-    crop_longitudinal: 75.0
+    crop_longitudinal: 50.0
     crop_lateral: 50.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     convergence_criterion: 0.0001
     max_iterations: 50
-    max_points_per_voxel: 20
-    backward_match_stride: 3
+    max_points_per_voxel: 7
+    # Recent scans kept with the lidar pose that inserted them.
+    backward_match_stride: 4
     # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
@@ -39,3 +40,10 @@
     fpfh_correspondence_distance: 5.0
     fpfh_min_inliers: 20
     fpfh_omp_threads: 0
+    max_speed: 20.0
+    max_acceleration: 5.0
+    max_yaw_rate: 1.0
+    max_match_rejects: 5
+    visual_enabled: true
+    visual_odom_topic: "/visual_odom"
+    min_scale_travel: 0.5

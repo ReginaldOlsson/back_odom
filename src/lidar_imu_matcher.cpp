@@ -15,6 +15,8 @@
 #include "back_odom/lidar_imu_matcher.hpp"
 
 #include "back_odom/lidar_preprocess.hpp"
+#include "back_odom/scan_window.hpp"
+#include "back_odom/visual_motion.hpp"
 
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 
@@ -96,6 +98,7 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   half_longitudinal_(params.crop_longitudinal * 0.5),
   half_lateral_(params.crop_lateral * 0.5),
   map_(params.voxel_size, 1.0e6, static_cast<unsigned int>(params.max_points_per_voxel)),
+  frozen_(params.voxel_size, 1.0e6, static_cast<unsigned int>(params.max_points_per_voxel)),
   registration_(params.max_iterations, params.convergence_criterion, 0),
   fpfh_(params.fpfh)
 {
@@ -116,6 +119,11 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   }
   if (params_.max_gyro_bias < 0.0 || params_.max_accel_bias < 0.0) {
     throw std::invalid_argument("bias magnitude limits must be non-negative");
+  }
+  if (
+    params_.limits.max_speed < 0.0 || params_.limits.max_acceleration < 0.0 ||
+    params_.limits.max_yaw_rate < 0.0 || params_.limits.max_match_rejects < 1) {
+    throw std::invalid_argument("vehicle limits must be non-negative and allow one rejected scan");
   }
   if (!params_.fpfh.enabled) {
     return;
@@ -142,6 +150,56 @@ void LidarImuMatcher::set_body_from_lidar(const Sophus::SE3d & body_from_lidar)
   body_from_lidar_ = body_from_lidar;
 }
 
+void LidarImuMatcher::set_body_from_camera(const Sophus::SE3d & body_from_camera)
+{
+  body_from_camera_ = body_from_camera;
+  has_camera_ = true;
+}
+
+void LidarImuMatcher::push_visual_pose(const double stamp, const Sophus::SE3d & world_from_camera)
+{
+  if (!params_.visual_enabled || !std::isfinite(stamp)) {
+    return;
+  }
+  if (
+    !visual_poses_.empty() && stamp + 1.0e-6 < visual_poses_.back().stamp) {
+    return;
+  }
+  if (!visual_poses_.empty() && std::abs(stamp - visual_poses_.back().stamp) < 1.0e-6) {
+    visual_poses_.back().pose = world_from_camera;
+    return;
+  }
+  visual_poses_.push_back(StampedPose{stamp, world_from_camera});
+  while (visual_poses_.size() > 200U) {
+    visual_poses_.pop_front();
+  }
+}
+
+LocalizationHealth LidarImuMatcher::health() const
+{
+  return health_.health;
+}
+
+int LidarImuMatcher::reject_streak() const
+{
+  return health_.reject_streak;
+}
+
+bool LidarImuMatcher::scale_frozen() const
+{
+  return scale_.frozen;
+}
+
+double LidarImuMatcher::visual_scale() const
+{
+  return scale_.scale;
+}
+
+bool LidarImuMatcher::has_visual_scale() const
+{
+  return scale_.has_scale;
+}
+
 bool LidarImuMatcher::has_reference() const
 {
   return has_reference_;
@@ -152,9 +210,34 @@ std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
   return map_.Pointcloud();
 }
 
+std::vector<StampedPose> LidarImuMatcher::visible_scan_poses() const
+{
+  return {scan_poses_.cbegin(), scan_poses_.cend()};
+}
+
+void LidarImuMatcher::record_scan_pose(const Sophus::SE3d & pose, const double stamp)
+{
+  scan_poses_.push_back(StampedPose{stamp, pose});
+  const Sophus::SE3d & latest = scan_poses_.back().pose;
+  std::deque<StampedPose> kept;
+  for (const StampedPose & scan : scan_poses_) {
+    if (
+      scan_pose_inside_visible_cloud(
+        latest, scan.pose, params_.crop_longitudinal, params_.crop_lateral)) {
+      kept.push_back(scan);
+    }
+  }
+  constexpr std::size_t k_max_visible_scans = 1000;
+  while (kept.size() > k_max_visible_scans) {
+    kept.pop_front();
+  }
+  scan_poses_ = std::move(kept);
+}
+
 MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
 {
   MatchResult result;
+  result.health = health_.health;
   if (!imu.aligned()) {
     return result;
   }
@@ -174,63 +257,96 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
   const double scan_end = *std::max_element(scan.timestamps.cbegin(), scan.timestamps.cend());
   const Sophus::SE3d predicted = imu.interpolate_pose(scan_end);
   result.imu_pose = predicted;
-  result.applied = true;
+  PreparedScan prepared{scan_end, map_points, source, predicted};
 
   if (!has_reference_) {
-    map_.Update(map_points, predicted);
-    cull_map(predicted);
-    stored_scan_ = source;
-    stored_pose_ = predicted;
+    window_.push_back(WindowScan{scan_end, map_points, source, predicted});
     has_reference_ = true;
     last_correction_stamp_ = scan.stamp;
     last_correction_position_ = predicted.translation();
-    imu_steps_ = 0;
+    rebuild_map(predicted);
+    record_scan_pose(predicted, scan_end);
+    result.applied = true;
     result.inserted_scan = true;
     result.first_scan = true;
     result.corrected_pose = predicted;
+    remember_healthy(predicted, imu.velocity(), scan_end);
+    note_health(imu, HealthEvent::Accepted);
+    result.health = health_.health;
     return result;
   }
 
-  double iterations = 0.0;
-  Sophus::SE3d guess = predicted;
+  Sophus::SE3d imu_guess = predicted;
   if (params_.fpfh.enabled) {
     if (
       const std::optional<Sophus::SE3d> coarse =
         fpfh_.estimate(source, map_.Pointcloud(), predicted)) {
-      guess = *coarse;
+      imu_guess = *coarse;
       result.used_coarse_guess = true;
     }
   }
-  kiss_icp::PlaneAlignResult aligned = align(source, guess, iterations);
-  // Gate the motion of the vehicle. The world-frame left increment grows with distance from the
-  // map origin, so a small yaw fix on a curve looks like a multi-meter jump and used to be dropped.
-  Sophus::SE3d vehicle_delta = predicted.inverse() * aligned.pose;
-  Sophus::SE3d world_error = aligned.pose * predicted.inverse();
-  if (result.used_coarse_guess && !accept_vehicle_delta(iterations, vehicle_delta)) {
+  MatchCandidate imu_candidate = score_alignment(source, imu_guess, predicted, true);
+  if (result.used_coarse_guess && !imu_candidate.passes) {
     result.used_coarse_guess = false;
-    aligned = align(source, predicted, iterations);
-    vehicle_delta = predicted.inverse() * aligned.pose;
-    world_error = aligned.pose * predicted.inverse();
+    imu_candidate = score_alignment(source, predicted, predicted, true);
   }
-  result.iterations = iterations;
-  result.correction = world_error;
-  result.translation_error = vehicle_delta.translation().norm();
-  result.rotation_error = vehicle_delta.so3().log().norm();
-  if (!accept_vehicle_delta(iterations, vehicle_delta)) {
+
+  MatchCandidate visual_candidate;
+  Sophus::SE3d visual_guess;
+  bool has_visual_guess = false;
+  const std::optional<VisualSegment> segment = visual_segment(window_.back().stamp, scan_end);
+  if (segment.has_value()) {
+    Sophus::SE3d tail = Sophus::SE3d();
+    if (scan_end - segment->t1 > 1.0e-3) {
+      const Sophus::SE3d from = imu.interpolate_pose(segment->t1);
+      tail = from.inverse() * imu.interpolate_pose(scan_end);
+    }
+    visual_guess = window_.back().pose * segment->body * tail;
+    has_visual_guess = true;
+    const Sophus::SE3d separation = predicted.inverse() * visual_guess;
+    if (separation.translation().norm() > 0.05 || separation.so3().log().norm() > 0.02) {
+      visual_candidate = score_alignment(source, visual_guess, predicted, true);
+    }
+  }
+  result.has_lidar_debug = imu_candidate.present;
+  result.lidar_pose = imu_candidate.pose;
+  result.lidar_cost = imu_candidate.cost;
+  result.lidar_passed = imu_candidate.passes;
+  if (visual_candidate.present) {
+    result.has_camera_debug = true;
+    result.camera_pose = visual_candidate.pose;
+    result.camera_cost = visual_candidate.cost;
+    result.camera_passed = visual_candidate.passes;
+  } else if (has_visual_guess) {
+    result.has_camera_debug = true;
+    result.camera_pose = visual_guess;
+  }
+
+  const MatchCandidate * chosen = select_match_candidate(
+    imu_candidate, visual_candidate.present ? &visual_candidate : nullptr);
+  if (chosen == nullptr) {
+    const Sophus::SE3d failed = imu_candidate.present ? imu_candidate.pose : predicted;
+    const Sophus::SE3d vehicle_delta = predicted.inverse() * failed;
     result.applied = false;
+    result.correction = failed * predicted.inverse();
+    result.translation_error = vehicle_delta.translation().norm();
+    result.rotation_error = vehicle_delta.so3().log().norm();
+    result.iterations = imu_candidate.iterations;
+    result.health = health_.health;
     return result;
   }
 
-  result.corrected_pose = imu.pose() * vehicle_delta;
-  result.inserted_scan = true;
-  apply_correction(imu, vehicle_delta, scan_end);
+  result.used_visual_guess = chosen == &visual_candidate;
+  result.iterations = chosen->iterations;
+  finish_accepted_scan(
+    result, prepared, chosen->pose, chosen->iterations, imu, last_correction_stamp_, true,
+    std::nullopt);
+  note_health(imu, HealthEvent::Accepted);
+  update_scale(result.corrected_pose, scan_end);
+  remember_healthy(result.corrected_pose, imu.velocity(), scan_end);
+  result.health = health_.health;
   result.gyro_bias = imu.gyro_bias();
   result.accel_bias = imu.accel_bias();
-  map_.Update(map_points, aligned.pose);
-  cull_map(aligned.pose);
-  stored_scan_ = source;
-  stored_pose_ = aligned.pose;
-  imu_steps_ = 0;
   return result;
 }
 
@@ -239,8 +355,15 @@ MatchResult LidarImuMatcher::on_imu(ImuProcessor & /*imu*/)
   return {};
 }
 
+void LidarImuMatcher::notify_speed_limit(ImuProcessor & imu)
+{
+  note_health(imu, HealthEvent::SpeedClamped);
+}
+
 void LidarImuMatcher::apply_correction(
-  ImuProcessor & imu, const Sophus::SE3d & vehicle_delta, const double scan_stamp)
+  ImuProcessor & imu, const Sophus::SE3d & vehicle_delta, const double scan_stamp,
+  const double since_stamp, const bool update_bias,
+  const std::optional<Eigen::Vector3d> & velocity_override)
 {
   if (!has_bias_prior_) {
     gyro_bias_prior_ = imu.gyro_bias();
@@ -250,29 +373,234 @@ void LidarImuMatcher::apply_correction(
   // Right multiply: +body x adds forward, -body x subtracts, +yaw turns left about the vehicle.
   const Sophus::SE3d corrected = imu.pose() * vehicle_delta;
   const Sophus::SO3d orientation_correction = corrected.so3() * imu.pose().so3().inverse();
-  const double dt = imu.latest_stamp() - last_correction_stamp_;
+  const double dt = std::max(1.0e-3, imu.latest_stamp() - last_correction_stamp_);
   const InertialCorrection inertial = inertial_correction_from_match(
     vehicle_delta, orientation_correction, corrected, imu.velocity(), last_correction_position_, dt,
     params_.gyro_bias_gain, params_.accel_bias_gain, params_.speed_correction_gain);
-  imu.apply_lidar_correction(
-    vehicle_delta, inertial.velocity_world, scan_stamp, last_correction_stamp_);
-  // Leak toward the stationary prior so registration noise cannot random-walk the bias.
-  const Eigen::Vector3d gyro_bias = clamp_vector(
-    imu.gyro_bias() + inertial.gyro_bias_delta + k_bias_leak * (gyro_bias_prior_ - imu.gyro_bias()),
-    params_.max_gyro_bias);
-  const Eigen::Vector3d accel_bias = clamp_vector(
-    imu.accel_bias() + inertial.accel_bias_delta +
-      k_bias_leak * (accel_bias_prior_ - imu.accel_bias()),
-    params_.max_accel_bias);
-  imu.set_gyro_bias(gyro_bias);
-  imu.set_accel_bias(accel_bias);
+  Eigen::Vector3d velocity = velocity_override.value_or(inertial.velocity_world);
+  const Eigen::Vector3d body = clamp_body_velocity(corrected.so3().inverse() * velocity, params_.limits.max_speed);
+  velocity = corrected.so3() * body;
+  imu.apply_lidar_correction(vehicle_delta, velocity, scan_stamp, since_stamp);
+  if (update_bias) {
+    // Leak toward the stationary prior so registration noise cannot random-walk the bias.
+    const Eigen::Vector3d gyro_bias = clamp_vector(
+      imu.gyro_bias() + inertial.gyro_bias_delta + k_bias_leak * (gyro_bias_prior_ - imu.gyro_bias()),
+      params_.max_gyro_bias);
+    const Eigen::Vector3d accel_bias = clamp_vector(
+      imu.accel_bias() + inertial.accel_bias_delta +
+        k_bias_leak * (accel_bias_prior_ - imu.accel_bias()),
+      params_.max_accel_bias);
+    imu.set_gyro_bias(gyro_bias);
+    imu.set_accel_bias(accel_bias);
+  }
   last_correction_stamp_ = imu.latest_stamp();
   last_correction_position_ = imu.pose().translation();
 }
 
-void LidarImuMatcher::cull_map(const Sophus::SE3d & lidar_pose)
+void LidarImuMatcher::finish_accepted_scan(
+  MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
+  const double iterations, ImuProcessor & imu, const double since_stamp, const bool update_bias,
+  const std::optional<Eigen::Vector3d> & velocity_override)
 {
-  map_.RemovePointsOutsideBox(lidar_pose.inverse(), half_longitudinal_, half_lateral_);
+  map_.Update(prepared.map_points, aligned_pose);
+  window_.push_back(
+    WindowScan{prepared.scan_end, std::move(prepared.map_points), std::move(prepared.source), aligned_pose});
+  while (static_cast<int>(window_.size()) > params_.backward_match_stride) {
+    window_.pop_front();
+  }
+  map_.RemovePointsOutsideBox(aligned_pose.inverse(), half_longitudinal_, half_lateral_);
+  record_scan_pose(aligned_pose, prepared.scan_end);
+
+  const Sophus::SE3d vehicle_delta = prepared.predicted.inverse() * aligned_pose;
+  result.correction = window_.back().pose * prepared.predicted.inverse();
+  result.translation_error = vehicle_delta.translation().norm();
+  result.rotation_error = vehicle_delta.so3().log().norm();
+  result.corrected_pose = imu.pose() * vehicle_delta;
+  result.inserted_scan = true;
+  result.applied = true;
+  result.iterations = iterations;
+  apply_correction(imu, vehicle_delta, prepared.scan_end, since_stamp, update_bias, velocity_override);
+  result.corrected_pose = imu.pose();
+  result.gyro_bias = imu.gyro_bias();
+  result.accel_bias = imu.accel_bias();
+}
+
+void LidarImuMatcher::remember_healthy(
+  const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, const double stamp)
+{
+  has_healthy_ = true;
+  last_healthy_pose_ = pose;
+  last_healthy_stamp_ = stamp;
+  last_healthy_velocity_ = velocity;
+  last_healthy_speed_ = (pose.so3().inverse() * velocity).x();
+}
+
+void LidarImuMatcher::restore_healthy_speed(ImuProcessor & imu)
+{
+  if (!has_healthy_) {
+    imu.set_velocity(Eigen::Vector3d::Zero());
+    return;
+  }
+  imu.set_velocity(last_healthy_velocity_);
+}
+
+void LidarImuMatcher::note_health(ImuProcessor & imu, const HealthEvent event)
+{
+  health_ = advance_localization_health(health_, event, params_.limits.max_match_rejects);
+  scale_.frozen = health_.scale_frozen;
+  if (!health_.scale_frozen) {
+    scale_.resume();
+  }
+  if (health_.restore_speed) {
+    restore_healthy_speed(imu);
+  }
+}
+
+std::optional<StampedPose> LidarImuMatcher::visual_at_or_before(const double stamp) const
+{
+  const StampedPose * best = nullptr;
+  for (const StampedPose & pose : visual_poses_) {
+    if (pose.stamp <= stamp + 1.0e-6) {
+      best = &pose;
+    }
+  }
+  if (best == nullptr || stamp - best->stamp > 3.0) {
+    return std::nullopt;
+  }
+  return *best;
+}
+
+std::optional<LidarImuMatcher::VisualSegment> LidarImuMatcher::visual_segment(
+  const double from_stamp, const double to_stamp) const
+{
+  if (!params_.visual_enabled || !has_camera_ || !scale_.has_scale) {
+    return std::nullopt;
+  }
+  const std::optional<StampedPose> start = visual_at_or_before(from_stamp);
+  const std::optional<StampedPose> end = visual_at_or_before(to_stamp);
+  if (!start.has_value() || !end.has_value() || end->stamp <= start->stamp + 1.0e-3) {
+    return std::nullopt;
+  }
+  VisualSegment segment;
+  segment.t0 = start->stamp;
+  segment.t1 = end->stamp;
+  segment.body = scaled_body_motion(start->pose, end->pose, body_from_camera_, scale_.scale);
+  return segment;
+}
+
+Sophus::SO3d LidarImuMatcher::imu_rotation_between(
+  const ImuProcessor & imu, const double from_stamp, const double to_stamp) const
+{
+  if (to_stamp <= from_stamp + 1.0e-6) {
+    return Sophus::SO3d();
+  }
+  return imu.interpolate_pose(from_stamp).so3().inverse() * imu.interpolate_pose(to_stamp).so3();
+}
+
+Sophus::SE3d LidarImuMatcher::recovery_pose(const double scan_end, const ImuProcessor & imu) const
+{
+  RecoveryGuess guess;
+  guess.last_healthy = has_healthy_ ? last_healthy_pose_ : imu.pose();
+  guess.max_speed = params_.limits.max_speed;
+  guess.held_speed = last_healthy_speed_;
+  const double origin_stamp = has_healthy_ ? last_healthy_stamp_ : scan_end;
+  if (const std::optional<VisualSegment> segment = visual_segment(origin_stamp, scan_end)) {
+    guess.has_visual = true;
+    guess.visual_body = segment->body;
+    guess.visual_dt = std::max(1.0e-3, segment->t1 - segment->t0);
+    guess.tail_dt = std::max(0.0, scan_end - segment->t1);
+    guess.tail_rotation = imu_rotation_between(imu, segment->t1, scan_end);
+  } else {
+    guess.tail_dt = std::max(0.0, scan_end - origin_stamp);
+    guess.tail_rotation = imu_rotation_between(imu, origin_stamp, scan_end);
+  }
+  return make_recovery_guess(guess);
+}
+
+MatchCandidate LidarImuMatcher::score_alignment(
+  const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess,
+  const Sophus::SE3d & imu_reference, const bool check_imu_gate)
+{
+  MatchCandidate candidate;
+  candidate.present = true;
+  double iterations = 0.0;
+  const kiss_icp::PlaneAlignResult aligned = align(source, guess, iterations);
+  candidate.pose = aligned.pose;
+  candidate.iterations = iterations;
+  candidate.saturated = iterations + 0.5 >= static_cast<double>(params_.max_iterations);
+  candidate.cost = robust_plane_cost(
+    source, aligned.pose, map_, params_.max_correspondence_distance, params_.kernel_scale);
+  const Sophus::SE3d imu_delta = imu_reference.inverse() * aligned.pose;
+  const bool imu_ok = !check_imu_gate || accept_vehicle_delta(iterations, imu_delta);
+  candidate.passes = iterations > 0.0 && imu_ok && std::isfinite(candidate.cost);
+  return candidate;
+}
+
+void LidarImuMatcher::update_scale(const Sophus::SE3d & lidar_pose, const double stamp)
+{
+  if (scale_.frozen || !params_.visual_enabled) {
+    return;
+  }
+  const std::optional<StampedPose> visual = visual_at_or_before(stamp);
+  if (!visual.has_value()) {
+    return;
+  }
+  scale_.observe(lidar_pose.translation(), visual->pose.translation(), params_.limits.min_scale_travel);
+}
+
+void LidarImuMatcher::optimize_window(ImuProcessor & imu)
+{
+  if (window_.size() < 2) {
+    return;
+  }
+  std::vector<Sophus::SE3d> poses;
+  std::vector<std::vector<Eigen::Vector3d>> queries;
+  std::vector<std::vector<Eigen::Vector3d>> surfaces;
+  std::vector<Sophus::SE3d> relatives;
+  poses.reserve(window_.size());
+  queries.reserve(window_.size());
+  surfaces.reserve(window_.size());
+  for (const WindowScan & scan : window_) {
+    poses.push_back(scan.pose);
+    queries.push_back(scan.source_points);
+    surfaces.push_back(scan.map_points);
+  }
+  for (std::size_t index = 1; index < window_.size(); ++index) {
+    const Sophus::SE3d before = imu.interpolate_pose(window_[index - 1].stamp);
+    const Sophus::SE3d after = imu.interpolate_pose(window_[index].stamp);
+    relatives.push_back(before.inverse() * after);
+  }
+  const int window_iterations = std::min(params_.max_iterations, 15);
+  optimize_scan_window(
+    poses, queries, surfaces, relatives, frozen_, params_.max_correspondence_distance,
+    params_.kernel_scale, window_iterations, params_.convergence_criterion, 0.05, 0.01,
+    params_.voxel_size, static_cast<unsigned int>(params_.max_points_per_voxel));
+  for (std::size_t index = 0; index < window_.size(); ++index) {
+    window_[index].pose = poses[index];
+  }
+}
+
+void LidarImuMatcher::freeze_oldest(const Sophus::SE3d & cull_pose)
+{
+  while (static_cast<int>(window_.size()) > params_.backward_match_stride) {
+    frozen_.Update(window_.front().map_points, window_.front().pose);
+    window_.pop_front();
+  }
+  if (!frozen_.Empty()) {
+    frozen_.RemovePointsOutsideBox(cull_pose.inverse(), half_longitudinal_, half_lateral_);
+  }
+}
+
+void LidarImuMatcher::rebuild_map(const Sophus::SE3d & cull_pose)
+{
+  map_.Clear();
+  if (!frozen_.Empty()) {
+    map_.AddPoints(frozen_.Pointcloud());
+  }
+  for (const WindowScan & scan : window_) {
+    map_.Update(scan.map_points, scan.pose);
+  }
+  map_.RemovePointsOutsideBox(cull_pose.inverse(), half_longitudinal_, half_lateral_);
 }
 
 kiss_icp::PlaneAlignResult LidarImuMatcher::align(

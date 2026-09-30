@@ -14,6 +14,8 @@
 
 #include "back_odom/imu_dead_reckoning.hpp"
 
+#include "back_odom/kinematic_limits.hpp"
+
 #include <stdexcept>
 
 namespace back_odom
@@ -47,6 +49,11 @@ void ImuDeadReckoning::reset_state(
   orientation_ = pose.so3();
   position_ = pose.translation();
   velocity_ = velocity_world;
+}
+
+bool ImuDeadReckoning::clamp_speed(const double max_speed)
+{
+  return clamp_world_velocity(orientation_, velocity_, max_speed);
 }
 
 void ImuDeadReckoning::integrate(

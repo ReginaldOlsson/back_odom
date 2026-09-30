@@ -2,9 +2,14 @@
   <arg name="use_sim_time" default="false"/>
   <arg name="launch_vehicle" default="true" description="Publish the vehicle TF tree. Set false when vehicle.launch.xml is already running."/>
   <arg name="launch_vehicle_interface" default="false"/>
+  <arg name="launch_visual_odom" default="true" description="Start the DPVO camera tracker. Set false to run lidar and IMU only."/>
   <arg name="sensor_model" default="boreas_sensor_kit"/>
   <arg name="vehicle_model" default="sample_vehicle"/>
   <arg name="config_file" default="$(find-pkg-share back_odom)/config/config.param.yaml"/>
+  <arg name="dpvo_root" default="$(env HOME)/autoware/src/universe/external/DPVO"/>
+  <arg name="image_topic" default="/boreas/image/compressed"/>
+  <arg name="camera_info_topic" default="/boreas/camera_info"/>
+  <arg name="visual_odom_topic" default="/visual_odom"/>
 
   <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
 
@@ -20,5 +25,16 @@
     <remap from="/imu/data" to="/boreas/imu"/>
     <remap from="/pointcloud" to="/boreas/pointcloud"/>
     <param from="$(var config_file)"/>
+    <param name="visual_odom_topic" value="$(var visual_odom_topic)"/>
+    <param name="visual_enabled" value="$(var launch_visual_odom)" type="bool"/>
   </node>
+
+  <!-- The tracker lives in the DPVO virtualenv, so it is not a colcon executable. -->
+  <executable
+    if="$(var launch_visual_odom)"
+    cmd="$(var dpvo_root)/.venv/bin/python $(var dpvo_root)/scripts/dpvo_node.py --ros-args -p use_sim_time:=$(var use_sim_time) -p image_topic:=$(var image_topic) -p info_topic:=$(var camera_info_topic) -p odom_topic:=$(var visual_odom_topic) -p path_topic:=$(var visual_odom_topic)/path -p network:=$(var dpvo_root)/dpvo.pth -p config:=$(var dpvo_root)/config/default.yaml -p scale:=0.5 -p stride:=3"
+    cwd="$(var dpvo_root)"
+    name="dpvo_node"
+    output="screen"
+  />
 </launch>

@@ -22,6 +22,7 @@
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
 
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -46,6 +47,9 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void callback_visual(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  void publish_health(const rclcpp::Time & stamp);
+  void publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp);
   void publish_odometry(
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
     const ProcessorOutput & output, const rclcpp::Time & stamp);
@@ -55,6 +59,7 @@ private:
   void publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_tf(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp);
+  void publish_scan_poses(const rclcpp::Time & stamp);
   void publish_local_map(const rclcpp::Time & stamp);
 
   std::unique_ptr<ImuProcessor> imu_processor_;
@@ -62,18 +67,29 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr visual_sub_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr scan_pose_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr health_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lidar_debug_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr lidar_debug_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr camera_debug_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr camera_debug_path_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unordered_map<std::string, Sophus::SE3d> extrinsics_;
 
   nav_msgs::msg::Path path_;
+  nav_msgs::msg::Path lidar_debug_path_;
+  nav_msgs::msg::Path camera_debug_path_;
+  MatchResult last_match_{};
+  bool has_last_match_{false};
   rclcpp::Time last_path_stamp_{0, 0, RCL_ROS_TIME};
   bool has_published_path_{false};
   bool aligned_{false};

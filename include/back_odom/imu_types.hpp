@@ -38,6 +38,8 @@ struct ProcessorParams
   double stationary_accel_dev_thresh{0.5};
   double gravity{9.81};
   double max_dt{0.1};
+  double max_speed{20.0};
+  double max_acceleration{5.0};
 };
 
 enum class ProcessorPhase { Collecting, Tracking };
@@ -60,6 +62,7 @@ struct ProcessorOutput
   Eigen::Vector3d linear_acceleration_world{Eigen::Vector3d::Zero()};
   Eigen::Vector3d specific_force_body{Eigen::Vector3d::Zero()};
   double gravity{9.81};
+  bool speed_clamped{false};
 };
 
 }  // namespace back_odom

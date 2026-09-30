@@ -15,6 +15,7 @@
 #include "back_odom/imu_processor.hpp"
 
 #include "back_odom/imu_alignment.hpp"
+#include "back_odom/kinematic_limits.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +34,9 @@ ImuProcessor::ImuProcessor(const ProcessorParams & params) : params_(params)
   }
   if (params_.max_dt <= 0.0) {
     throw std::invalid_argument("max_dt must be positive");
+  }
+  if (params_.max_speed < 0.0 || params_.max_acceleration < 0.0) {
+    throw std::invalid_argument("speed and acceleration limits must be non-negative");
   }
 }
 
@@ -82,13 +86,29 @@ ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
 ProcessorOutput ImuProcessor::process_tracking(const ImuSample & sample)
 {
   const double dt = sample.stamp - previous_stamp_;
+  bool speed_clamped = false;
   if (has_previous_stamp_ && dt > 0.0 && dt <= params_.max_dt) {
+    const Eigen::Vector3d velocity_before = dead_reckoning_->velocity();
+    const Sophus::SO3d orientation_before = dead_reckoning_->orientation();
     dead_reckoning_->integrate(sample.angular_velocity, sample.linear_acceleration, dt);
+    const Eigen::Vector3d body_before = orientation_before.inverse() * velocity_before;
+    const Eigen::Vector3d body_after =
+      dead_reckoning_->orientation().inverse() * dead_reckoning_->velocity();
+    VehicleLimits limits;
+    limits.max_speed = params_.max_speed;
+    limits.max_acceleration = params_.max_acceleration;
+    const Eigen::Vector3d limited = limit_body_velocity(body_before, body_after, dt, limits);
+    speed_clamped = std::abs(body_after.x()) > params_.max_speed + 1.0e-3 ||
+                    std::abs(body_after.z()) > params_.max_speed + 1.0e-3;
+    dead_reckoning_->reset_state(
+      Sophus::SE3d(dead_reckoning_->orientation(), dead_reckoning_->position()),
+      dead_reckoning_->orientation() * limited);
   }
   previous_stamp_ = sample.stamp;
   has_previous_stamp_ = true;
 
   ProcessorOutput output = make_tracking_output(sample);
+  output.speed_clamped = speed_clamped;
   output.sample_count = params_.alignment_sample_count;
   record_pose(sample.stamp);
   return output;
@@ -160,6 +180,14 @@ Sophus::SE3d ImuProcessor::interpolate_pose(const double stamp) const
     return before.pose * Sophus::SE3d::exp(alpha * relative.log());
   }
   return trajectory_.back().pose;
+}
+
+void ImuProcessor::set_velocity(const Eigen::Vector3d & velocity_world)
+{
+  if (!dead_reckoning_) {
+    throw std::runtime_error("imu integrator is not aligned");
+  }
+  dead_reckoning_->reset_state(pose(), velocity_world);
 }
 
 void ImuProcessor::reset_state(

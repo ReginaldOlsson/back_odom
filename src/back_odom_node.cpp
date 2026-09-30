@@ -164,7 +164,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("convergence_criterion", 1.0e-4);
   lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
-  lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 3);
+  lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
   lidar_params.fpfh.enabled = this->declare_parameter<bool>("fpfh_enabled", true);
   lidar_params.fpfh.keypoint_voxel = this->declare_parameter<double>("fpfh_keypoint_voxel", 1.5);
   lidar_params.fpfh.normal_radius = this->declare_parameter<double>("fpfh_normal_radius", 2.0);
@@ -180,6 +180,14 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("speed_correction_gain", 0.5);
   lidar_params.max_gyro_bias = this->declare_parameter<double>("max_gyro_bias", 0.05);
   lidar_params.max_accel_bias = this->declare_parameter<double>("max_accel_bias", 1.0);
+  lidar_params.limits.max_speed = this->declare_parameter<double>("max_speed", 20.0);
+  lidar_params.limits.max_acceleration = this->declare_parameter<double>("max_acceleration", 5.0);
+  lidar_params.limits.max_yaw_rate = this->declare_parameter<double>("max_yaw_rate", 1.0);
+  lidar_params.limits.max_match_rejects = this->declare_parameter<int>("max_match_rejects", 5);
+  lidar_params.limits.min_scale_travel = this->declare_parameter<double>("min_scale_travel", 0.5);
+  lidar_params.visual_enabled = this->declare_parameter<bool>("visual_enabled", true);
+  const auto visual_odom_topic =
+    this->declare_parameter<std::string>("visual_odom_topic", "/visual_odom");
 
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
@@ -197,6 +205,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   params.stationary_accel_dev_thresh = stationary_accel_dev_thresh;
   params.gravity = gravity;
   params.max_dt = max_dt;
+  params.max_speed = lidar_params.limits.max_speed;
+  params.max_acceleration = lidar_params.limits.max_acceleration;
   imu_processor_ = std::make_unique<ImuProcessor>(params);
   lidar_matcher_ = std::make_unique<LidarImuMatcher>(lidar_params);
 
@@ -208,13 +218,30 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
+  if (lidar_params.visual_enabled) {
+    visual_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      visual_odom_topic, rclcpp::QoS(10),
+      [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) { this->callback_visual(msg); });
+  }
 
   odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom", rclcpp::QoS(10));
   imu_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom/imu", rclcpp::QoS(10));
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("back_odom/path", rclcpp::QoS(10));
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "back_odom/markers", rclcpp::QoS(10));
+  scan_pose_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "back_odom/scan_poses", rclcpp::QoS(10));
   map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("back_odom/map", rclcpp::QoS(1));
+  health_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
+    "back_odom/health", rclcpp::QoS(10));
+  lidar_debug_pub_ =
+    this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/lidar", rclcpp::QoS(10));
+  lidar_debug_path_pub_ =
+    this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/lidar/path", rclcpp::QoS(10));
+  camera_debug_pub_ =
+    this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/camera", rclcpp::QoS(10));
+  camera_debug_path_pub_ =
+    this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/camera/path", rclcpp::QoS(10));
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
@@ -261,6 +288,12 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   has_previous_angular_velocity_ = true;
 
   ProcessorOutput output = imu_processor_->process(sample);
+  if (output.speed_clamped) {
+    output = imu_processor_->output_at(sample);
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "IMU speed was clamped to the vehicle limit.");
+  }
 
   if (!output.aligned && output.sample_count >= alignment_sample_count_) {
     RCLCPP_WARN_THROTTLE(
@@ -292,6 +325,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   if (publish_tf_) {
     publish_tf(output, stamp);
   }
+  publish_health(stamp);
 }
 
 void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
@@ -322,22 +356,30 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
   const ProcessorOutput prior = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
+  last_match_ = matched;
+  has_last_match_ = true;
+  publish_debug_odometry(matched, stamp);
+  publish_scan_poses(stamp);
   if (!matched.applied) {
     if (lidar_matcher_->has_reference()) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "ICP correction rejected. vehicle translation %.3f m, rotation %.3f rad, iterations %.0f",
-        matched.translation_error, matched.rotation_error, matched.iterations);
+        "ICP correction rejected. health %s, source %s, lidar cost %.3f pass %s, "
+        "camera cost %.3f pass %s, translation %.3f m, rotation %.3f rad",
+        health_name(matched.health), matched.used_visual_guess ? "camera" : "lidar",
+        matched.lidar_cost, matched.lidar_passed ? "yes" : "no", matched.camera_cost,
+        matched.camera_passed ? "yes" : "no", matched.translation_error, matched.rotation_error);
     }
+    publish_health(stamp);
     return;
   }
   if (!matched.first_scan) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP correction applied. vehicle translation %.3f m, rotation %.4f rad, gyro bias z %.5f, "
-      "accel bias x %.4f",
-      matched.translation_error, matched.rotation_error, matched.gyro_bias.z(),
-      matched.accel_bias.x());
+      "ICP correction applied from the %s guess. lidar cost %.3f, camera cost %.3f, "
+      "translation %.3f m, rotation %.4f rad, health %s",
+      matched.used_visual_guess ? "camera" : "lidar", matched.lidar_cost, matched.camera_cost,
+      matched.translation_error, matched.rotation_error, health_name(matched.health));
   }
   publish_odometry(imu_odom_pub_, prior, stamp);
   const ProcessorOutput corrected = imu_processor_->output_at(
@@ -349,8 +391,109 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
   if (publish_tf_) {
     publish_tf(corrected, stamp);
   }
+  publish_health(stamp);
   if (matched.first_scan) {
     RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
+  }
+}
+
+void BackOdomNode::callback_visual(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+{
+  const std::string camera_frame =
+    msg->child_frame_id.empty() ? msg->header.frame_id : msg->child_frame_id;
+  if (!camera_frame.empty() && camera_frame != parent_frame_) {
+    Sophus::SE3d base_from_camera;
+    if (base_from_frame(camera_frame, base_from_camera)) {
+      lidar_matcher_->set_body_from_camera(base_from_camera);
+    }
+  }
+  const Eigen::Quaterniond rotation(
+    msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+    msg->pose.pose.orientation.z);
+  if (rotation.norm() < 1.0e-9) {
+    return;
+  }
+  const Sophus::SE3d world_from_camera(
+    Sophus::SO3d(rotation.normalized()),
+    Eigen::Vector3d(
+      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
+  lidar_matcher_->push_visual_pose(rclcpp::Time(msg->header.stamp).seconds(), world_from_camera);
+}
+
+void BackOdomNode::publish_health(const rclcpp::Time & stamp)
+{
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "back_odom";
+  status.hardware_id = "back_odom";
+  const LocalizationHealth health = lidar_matcher_->health();
+  status.message = health_name(health);
+  if (health == LocalizationHealth::Healthy) {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+  } else if (health == LocalizationHealth::Degraded) {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+  } else {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+  }
+  const auto add_value = [&status](const std::string & key, const std::string & value) {
+    diagnostic_msgs::msg::KeyValue entry;
+    entry.key = key;
+    entry.value = value;
+    status.values.push_back(entry);
+  };
+  add_value(
+    "visual_scale",
+    lidar_matcher_->has_visual_scale() ? std::to_string(lidar_matcher_->visual_scale()) : "unset");
+  add_value("scale_frozen", lidar_matcher_->scale_frozen() ? "true" : "false");
+  add_value("reject_streak", std::to_string(lidar_matcher_->reject_streak()));
+  if (has_last_match_) {
+    add_value("source", last_match_.used_visual_guess ? "camera" : "lidar");
+    add_value("lidar_cost", last_match_.has_lidar_debug ? std::to_string(last_match_.lidar_cost) : "none");
+    add_value("lidar_passed", last_match_.lidar_passed ? "true" : "false");
+    add_value(
+      "camera_cost", last_match_.has_camera_debug ? std::to_string(last_match_.camera_cost) : "none");
+    add_value("camera_passed", last_match_.camera_passed ? "true" : "false");
+    add_value("translation_error_m", std::to_string(last_match_.translation_error));
+    add_value("rotation_error_rad", std::to_string(last_match_.rotation_error));
+  }
+  (void)stamp;
+  health_pub_->publish(status);
+}
+
+void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp)
+{
+  const auto publish_one =
+    [this, &stamp](
+      const Sophus::SE3d & pose, const std::string & child_frame,
+      const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & odometry_publisher,
+      nav_msgs::msg::Path & path,
+      const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr & path_publisher) {
+      nav_msgs::msg::Odometry odometry;
+      odometry.header.stamp = stamp;
+      odometry.header.frame_id = parent_frame_;
+      odometry.child_frame_id = child_frame;
+      odometry.pose.pose.position.x = pose.translation().x();
+      odometry.pose.pose.position.y = pose.translation().y();
+      odometry.pose.pose.position.z = pose.translation().z();
+      set_quaternion(odometry.pose.pose.orientation, pose.so3());
+      odometry_publisher->publish(odometry);
+
+      geometry_msgs::msg::PoseStamped stamped;
+      stamped.header = odometry.header;
+      stamped.pose = odometry.pose.pose;
+      path.header = odometry.header;
+      path.poses.push_back(stamped);
+      if (path.poses.size() > path_max_poses_) {
+        path.poses.erase(path.poses.begin());
+      }
+      path_publisher->publish(path);
+    };
+
+  if (match.has_lidar_debug) {
+    publish_one(match.lidar_pose, "lidar_odom", lidar_debug_pub_, lidar_debug_path_, lidar_debug_path_pub_);
+  }
+  if (match.has_camera_debug) {
+    publish_one(
+      match.camera_pose, "camera_odom", camera_debug_pub_, camera_debug_path_, camera_debug_path_pub_);
   }
 }
 
@@ -567,7 +710,8 @@ void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp:
   std::ostringstream stream;
   stream << std::fixed << std::setprecision(2);
   if (output.aligned) {
-    stream << "tracking |f|=" << output.specific_force_body.norm()
+    stream << "tracking " << health_name(lidar_matcher_->health())
+           << " |f|=" << output.specific_force_body.norm()
            << " |w|=" << output.angular_velocity_body.norm();
   } else {
     stream << "collecting " << output.sample_count << "/" << alignment_sample_count_;
@@ -575,6 +719,81 @@ void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp:
   text.text = stream.str();
   markers.markers.push_back(text);
   marker_pub_->publish(markers);
+}
+
+void BackOdomNode::publish_scan_poses(const rclcpp::Time & stamp)
+{
+  const std::vector<StampedPose> poses = lidar_matcher_->visible_scan_poses();
+  visualization_msgs::msg::MarkerArray markers;
+
+  const auto delete_namespace = [&](const std::string & ns) {
+    visualization_msgs::msg::Marker clear;
+    clear.header.stamp = stamp;
+    clear.header.frame_id = parent_frame_;
+    clear.ns = ns;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    markers.markers.push_back(clear);
+  };
+  delete_namespace("scan_horizon");
+  delete_namespace("scan_pose");
+  if (poses.empty()) {
+    scan_pose_pub_->publish(markers);
+    return;
+  }
+
+  visualization_msgs::msg::Marker horizon;
+  horizon.header.stamp = stamp;
+  horizon.header.frame_id = parent_frame_;
+  horizon.ns = "scan_horizon";
+  horizon.id = 0;
+  horizon.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  horizon.action = visualization_msgs::msg::Marker::ADD;
+  horizon.pose.orientation.w = 1.0;
+  horizon.scale.x = 0.08;
+  horizon.color.r = 1.0F;
+  horizon.color.g = 0.85F;
+  horizon.color.b = 0.2F;
+  horizon.color.a = 0.9F;
+  horizon.points.reserve(poses.size());
+  for (const StampedPose & scan : poses) {
+    horizon.points.push_back(to_point(scan.pose.translation()));
+  }
+  markers.markers.push_back(horizon);
+
+  const std::size_t count = poses.size();
+  for (std::size_t index = 0; index < count; ++index) {
+    const float age =
+      count == 1U ? 1.0F : static_cast<float>(index) / static_cast<float>(count - 1U);
+    const Eigen::Vector3d origin = poses[index].pose.translation();
+    const Eigen::Vector3d forward = origin + poses[index].pose.so3() * Eigen::Vector3d(3.0, 0.0, 0.0);
+    visualization_msgs::msg::Marker arrow = make_arrow(
+      stamp, parent_frame_, static_cast<int>(index), origin, forward, age, 0.35F, 1.0F - age);
+    arrow.ns = "scan_pose";
+    arrow.scale.x = 0.08;
+    arrow.scale.y = 0.16;
+    arrow.scale.z = 0.22;
+    arrow.color.a = 0.45F + 0.55F * age;
+    markers.markers.push_back(arrow);
+  }
+
+  visualization_msgs::msg::Marker text;
+  text.header.stamp = stamp;
+  text.header.frame_id = parent_frame_;
+  text.ns = "scan_pose";
+  text.id = static_cast<int>(count);
+  text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+  text.action = visualization_msgs::msg::Marker::ADD;
+  text.pose.position = to_point(poses.back().pose.translation());
+  text.pose.position.z += 1.2;
+  text.pose.orientation.w = 1.0;
+  text.scale.z = 0.4;
+  text.color.r = 1.0F;
+  text.color.g = 1.0F;
+  text.color.b = 1.0F;
+  text.color.a = 1.0F;
+  text.text = std::to_string(count) + " scans in view";
+  markers.markers.push_back(text);
+  scan_pose_pub_->publish(markers);
 }
 
 }  // namespace back_odom

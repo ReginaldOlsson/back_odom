@@ -20,6 +20,7 @@ target_link_libraries(imu_processor Sophus::Sophus)
 ament_auto_add_library(lidar_imu_matcher SHARED
   src/lidar_preprocess.cpp
   src/lidar_imu_matcher.cpp
+  src/scan_window.cpp
   src/fpfh_coarse_align.cpp
 )
 target_include_directories(lidar_imu_matcher PRIVATE ${PCL_INCLUDE_DIRS})

@@ -34,6 +34,8 @@ public:
     const Eigen::Vector3d & angular_velocity, const Eigen::Vector3d & linear_acceleration,
     double dt);
   void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world);
+  /// Returns true when the stored speed was outside [-max_speed, max_speed].
+  bool clamp_speed(double max_speed);
 
   [[nodiscard]] const Sophus::SO3d & orientation() const;
   [[nodiscard]] const Eigen::Vector3d & position() const;

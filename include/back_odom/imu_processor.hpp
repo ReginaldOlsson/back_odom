@@ -41,6 +41,7 @@ public:
   [[nodiscard]] const std::vector<StampedPose> & trajectory() const;
   [[nodiscard]] Sophus::SE3d interpolate_pose(double stamp) const;
   void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, double stamp);
+  void set_velocity(const Eigen::Vector3d & velocity_world);
 
   /// Right-multiply `body_delta` so a positive body-x correction moves forward and a positive yaw
   /// turns about the vehicle. Samples from `since_stamp` to `scan_stamp` blend it in.
