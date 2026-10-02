@@ -68,12 +68,4 @@ bool cuda_voxel_downsample(const double *, const std::uint64_t *, int, std::vect
   return false;
 }
 
-bool cuda_histogram_matches(
-  const float *, int query_count, const float *, int, const double *, const double *, double,
-  std::vector<int> & matches)
-{
-  matches.assign(static_cast<std::size_t>(std::max(query_count, 0)), -1);
-  return false;
-}
-
 }  // namespace back_odom

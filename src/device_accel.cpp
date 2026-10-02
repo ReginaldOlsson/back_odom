@@ -441,37 +441,4 @@ std::optional<DeviceAlignResult> align_points_on_device(
   return result;
 }
 
-std::optional<std::vector<int>> device_histogram_matches(
-  const float * query_hist, const int query_count, const float * reference_hist,
-  const int reference_count, const std::vector<Eigen::Vector3d> & query_xyz,
-  const std::vector<Eigen::Vector3d> & reference_xyz, const double gate_squared)
-{
-  if (!cuda_available() || query_hist == nullptr || reference_hist == nullptr) {
-    return std::nullopt;
-  }
-  if (static_cast<int>(query_xyz.size()) != query_count ||
-      static_cast<int>(reference_xyz.size()) != reference_count) {
-    return std::nullopt;
-  }
-  std::vector<double> query(static_cast<std::size_t>(std::max(query_count, 0)) * 3);
-  std::vector<double> reference(static_cast<std::size_t>(std::max(reference_count, 0)) * 3);
-  for (int index = 0; index < query_count; ++index) {
-    query[static_cast<std::size_t>(3 * index)] = query_xyz[static_cast<std::size_t>(index)].x();
-    query[static_cast<std::size_t>(3 * index + 1)] = query_xyz[static_cast<std::size_t>(index)].y();
-    query[static_cast<std::size_t>(3 * index + 2)] = query_xyz[static_cast<std::size_t>(index)].z();
-  }
-  for (int index = 0; index < reference_count; ++index) {
-    reference[static_cast<std::size_t>(3 * index)] = reference_xyz[static_cast<std::size_t>(index)].x();
-    reference[static_cast<std::size_t>(3 * index + 1)] = reference_xyz[static_cast<std::size_t>(index)].y();
-    reference[static_cast<std::size_t>(3 * index + 2)] = reference_xyz[static_cast<std::size_t>(index)].z();
-  }
-  std::vector<int> matches;
-  if (!cuda_histogram_matches(
-        query_hist, query_count, reference_hist, reference_count, query.data(), reference.data(),
-        gate_squared, matches)) {
-    return std::nullopt;
-  }
-  return matches;
-}
-
 }  // namespace back_odom

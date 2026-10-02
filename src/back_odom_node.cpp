@@ -215,15 +215,6 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
   lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
   lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);
-  lidar_params.fpfh.enabled = this->declare_parameter<bool>("fpfh_enabled", true);
-  lidar_params.fpfh.keypoint_voxel = this->declare_parameter<double>("fpfh_keypoint_voxel", 1.5);
-  lidar_params.fpfh.normal_radius = this->declare_parameter<double>("fpfh_normal_radius", 2.0);
-  lidar_params.fpfh.fpfh_radius = this->declare_parameter<double>("fpfh_radius", 5.0);
-  lidar_params.fpfh.max_keypoints = this->declare_parameter<int>("fpfh_max_keypoints", 1500);
-  lidar_params.fpfh.correspondence_distance =
-    this->declare_parameter<double>("fpfh_correspondence_distance", 5.0);
-  lidar_params.fpfh.min_inliers = this->declare_parameter<int>("fpfh_min_inliers", 20);
-  lidar_params.fpfh.omp_threads = this->declare_parameter<int>("fpfh_omp_threads", 0);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
   lidar_params.speed_correction_gain =
@@ -444,9 +435,9 @@ void BackOdomNode::match_pending_scan(const bool force)
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
   RCLCPP_DEBUG(
     this->get_logger(),
-    "scan stages ms deskew %.2f voxel %.2f fpfh %.2f align %.2f cost %.2f refine %.2f map %.2f",
-    matched.deskew_ms, matched.voxel_ms, matched.fpfh_ms, matched.align_ms, matched.cost_ms,
-    matched.refine_ms, matched.map_ms);
+    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f",
+    matched.deskew_ms, matched.voxel_ms, matched.align_ms, matched.cost_ms, matched.refine_ms,
+    matched.map_ms);
   last_match_ = matched;
   has_last_match_ = true;
   publish_debug_odometry(matched, stamp);

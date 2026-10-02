@@ -40,14 +40,6 @@
     max_longitudinal_correction: 0.15
     max_gyro_bias: 0.05
     max_accel_bias: 1.0
-    fpfh_enabled: true
-    fpfh_keypoint_voxel: 1.5
-    fpfh_normal_radius: 2.0
-    fpfh_radius: 5.0
-    fpfh_max_keypoints: 1500
-    fpfh_correspondence_distance: 5.0
-    fpfh_min_inliers: 20
-    fpfh_omp_threads: 0
     max_speed: 20.0
     max_acceleration: 5.0
     max_yaw_rate: 1.0

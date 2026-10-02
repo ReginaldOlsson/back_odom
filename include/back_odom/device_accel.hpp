@@ -73,13 +73,7 @@ struct DeviceAlignResult
 [[nodiscard]] std::optional<DeviceAlignResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   std::uint64_t map_epoch, const Sophus::SE3d & initial_guess, double max_distance,
-  double kernel_scale, int max_iterations, double convergence_criterion, bool float_rank = false);
-
-/// One nearest reference histogram per query, or -1. Same float L2 and spatial gate as the CPU loop.
-[[nodiscard]] std::optional<std::vector<int>> device_histogram_matches(
-  const float * query_hist, int query_count, const float * reference_hist, int reference_count,
-  const std::vector<Eigen::Vector3d> & query_xyz,
-  const std::vector<Eigen::Vector3d> & reference_xyz, double gate_squared);
+  double kernel_scale, int max_iterations,   double convergence_criterion, bool float_rank = false);
 
 }  // namespace back_odom
 

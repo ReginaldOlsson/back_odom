@@ -627,41 +627,6 @@ __global__ void plane_kernel(
   }
 }
 
-__global__ void histogram_kernel(
-  const float * query_hist, int query_count, const float * reference_hist, int reference_count,
-  const double * query_xyz, const double * reference_xyz, double gate_squared, int * matches)
-{
-  const int query = blockIdx.x * blockDim.x + threadIdx.x;
-  if (query >= query_count) {
-    return;
-  }
-  const float * signature = query_hist + 33 * query;
-  const double qx = query_xyz[3 * query];
-  const double qy = query_xyz[3 * query + 1];
-  const double qz = query_xyz[3 * query + 2];
-  float best = INFINITY;
-  int best_index = -1;
-  for (int reference = 0; reference < reference_count; ++reference) {
-    const double dx = qx - reference_xyz[3 * reference];
-    const double dy = qy - reference_xyz[3 * reference + 1];
-    const double dz = qz - reference_xyz[3 * reference + 2];
-    if (dx * dx + dy * dy + dz * dz > gate_squared) {
-      continue;
-    }
-    const float * other = reference_hist + 33 * reference;
-    float distance = 0.0F;
-    for (int bin = 0; bin < 33; ++bin) {
-      const float delta = signature[bin] - other[bin];
-      distance += delta * delta;
-    }
-    if (distance < best) {
-      best = distance;
-      best_index = reference;
-    }
-  }
-  matches[query] = best_index;
-}
-
 int upper_host(int row, int col)
 {
   return row * 6 - (row * (row - 1)) / 2 + (col - row);
@@ -1271,86 +1236,6 @@ bool cuda_voxel_downsample(
     kept_xyz.push_back(point.z);
   }
   return true;
-}
-
-bool cuda_histogram_matches(
-  const float * query_hist, const int query_count, const float * reference_hist,
-  const int reference_count, const double * query_xyz, const double * reference_xyz,
-  const double gate_squared, std::vector<int> & matches)
-{
-  matches.assign(static_cast<std::size_t>(std::max(query_count, 0)), -1);
-  if (!cuda_available() || query_count <= 0 || reference_count <= 0) {
-    return cuda_available() && query_count > 0;
-  }
-  float * query = nullptr;
-  float * reference = nullptr;
-  double * query_points = nullptr;
-  double * reference_points = nullptr;
-  int * match_device = nullptr;
-  const bool allocated =
-    check("cudaMalloc", cudaMalloc(&query, static_cast<std::size_t>(query_count) * 33 * sizeof(float))) &&
-    check(
-      "cudaMalloc",
-      cudaMalloc(&reference, static_cast<std::size_t>(reference_count) * 33 * sizeof(float))) &&
-    check("cudaMalloc", cudaMalloc(&query_points, static_cast<std::size_t>(query_count) * 3 * sizeof(double))) &&
-    check(
-      "cudaMalloc",
-      cudaMalloc(&reference_points, static_cast<std::size_t>(reference_count) * 3 * sizeof(double))) &&
-    check("cudaMalloc", cudaMalloc(&match_device, static_cast<std::size_t>(query_count) * sizeof(int)));
-  if (!allocated) {
-    cudaFree(query);
-    cudaFree(reference);
-    cudaFree(query_points);
-    cudaFree(reference_points);
-    cudaFree(match_device);
-    return false;
-  }
-  const bool copied =
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        query, query_hist, static_cast<std::size_t>(query_count) * 33 * sizeof(float),
-        cudaMemcpyHostToDevice)) &&
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        reference, reference_hist, static_cast<std::size_t>(reference_count) * 33 * sizeof(float),
-        cudaMemcpyHostToDevice)) &&
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        query_points, query_xyz, static_cast<std::size_t>(query_count) * 3 * sizeof(double),
-        cudaMemcpyHostToDevice)) &&
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        reference_points, reference_xyz, static_cast<std::size_t>(reference_count) * 3 * sizeof(double),
-        cudaMemcpyHostToDevice));
-  if (!copied) {
-    cudaFree(query);
-    cudaFree(reference);
-    cudaFree(query_points);
-    cudaFree(reference_points);
-    cudaFree(match_device);
-    return false;
-  }
-  const int blocks = (query_count + k_threads - 1) / k_threads;
-  histogram_kernel<<<blocks, k_threads>>>(
-    query, query_count, reference, reference_count, query_points, reference_points, gate_squared,
-    match_device);
-  const bool ok = check("histogram_kernel", cudaGetLastError()) &&
-                  check("cudaDeviceSynchronize", cudaDeviceSynchronize()) &&
-                  check(
-                    "cudaMemcpy",
-                    cudaMemcpy(
-                      matches.data(), match_device, static_cast<std::size_t>(query_count) * sizeof(int),
-                      cudaMemcpyDeviceToHost));
-  cudaFree(query);
-  cudaFree(reference);
-  cudaFree(query_points);
-  cudaFree(reference_points);
-  cudaFree(match_device);
-  return ok;
 }
 
 }  // namespace back_odom

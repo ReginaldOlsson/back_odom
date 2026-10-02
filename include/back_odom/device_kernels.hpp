@@ -93,11 +93,6 @@ struct CudaPlaneSystem
 [[nodiscard]] bool cuda_voxel_downsample(
   const double * xyz, const std::uint64_t * keys, int count, std::vector<double> & kept_xyz);
 
-[[nodiscard]] bool cuda_histogram_matches(
-  const float * query_hist, int query_count, const float * reference_hist, int reference_count,
-  const double * query_xyz, const double * reference_xyz, double gate_squared,
-  std::vector<int> & matches);
-
 }  // namespace back_odom
 
 #endif  // BACK_ODOM__DEVICE_KERNELS_HPP_

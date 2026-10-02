@@ -26,7 +26,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -176,7 +179,6 @@ LidarMatchParams match_params()
   params.voxel_size = 0.25;
   params.backward_match_stride = 3;
   params.max_correspondence_distance = 2.0;
-  params.fpfh.enabled = false;
   return params;
 }
 
@@ -612,6 +614,85 @@ TEST(MatchSelection, lower_plane_residual_wins_until_its_gate_fails)
   EXPECT_EQ(select_match_candidate(imu, &visual), &imu);
   imu.passes = false;
   EXPECT_EQ(select_match_candidate(imu, &visual), nullptr);
+}
+
+LidarScan street_scan(const double stamp)
+{
+  LidarScan scan;
+  scan.stamp = stamp;
+  scan.points.reserve(90000);
+  scan.timestamps.reserve(90000);
+  const auto add = [&](const double x, const double y, const double z) {
+    scan.points.emplace_back(x, y, z);
+    scan.timestamps.push_back(stamp);
+  };
+  for (double x = -15.0; x <= 25.0; x += 0.15) {
+    for (double y = -12.0; y <= 12.0; y += 0.15) {
+      add(x, y, 0.0);
+    }
+  }
+  for (double x = -15.0; x <= 25.0; x += 0.2) {
+    for (double z = 0.2; z <= 3.0; z += 0.2) {
+      add(x, -8.0, z);
+      add(x, 8.0, z);
+    }
+  }
+  return scan;
+}
+
+TEST(LidarMatch, stage_times_without_coarse_guess)
+{
+  LidarMatchParams params;
+  params.voxel_size = 0.5;
+  params.crop_longitudinal = 50.0;
+  params.crop_lateral = 50.0;
+  params.max_iterations = 50;
+  params.max_points_per_voxel = 7;
+  params.refine_window = true;
+  params.refine_min_travel = 2.0;
+  params.convergence_criterion = 1.0e-4;
+  LidarImuMatcher matcher(params);
+  ImuProcessor imu = aligned_imu();
+  const LidarScan scan = street_scan(imu.latest_stamp());
+  std::vector<MatchResult> results;
+  results.reserve(8);
+  for (int step = 0; step < 8; ++step) {
+    const double stamp = imu.latest_stamp() + 0.1;
+    LidarScan moved = scan;
+    moved.stamp = stamp;
+    std::fill(moved.timestamps.begin(), moved.timestamps.end(), stamp);
+    imu.reset_state(
+      Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.5 * step, 0.0, 0.0)), Eigen::Vector3d(10.0, 0.0, 0.0),
+      stamp);
+    const auto started = std::chrono::steady_clock::now();
+    const MatchResult matched = matcher.on_scan(moved, imu);
+    const double wall_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    std::cout << "scan " << step << " wall " << wall_ms << " deskew " << matched.deskew_ms << " voxel "
+              << matched.voxel_ms << " align " << matched.align_ms << " cost " << matched.cost_ms
+              << " refine " << matched.refine_ms << " map " << matched.map_ms << " iters "
+              << matched.iterations << " applied " << matched.applied << " points "
+              << moved.points.size() << std::endl;
+    results.push_back(matched);
+  }
+  const auto median = [](std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+  };
+  std::vector<double> deskew;
+  std::vector<double> voxel;
+  std::vector<double> align;
+  std::vector<double> refine;
+  std::vector<double> map;
+  for (const MatchResult & result : results) {
+    deskew.push_back(result.deskew_ms);
+    voxel.push_back(result.voxel_ms);
+    align.push_back(result.align_ms);
+    refine.push_back(result.refine_ms);
+    map.push_back(result.map_ms);
+  }
+  std::cout << "median ms deskew " << median(deskew) << " voxel " << median(voxel) << " align "
+            << median(align) << " refine " << median(refine) << " map " << median(map) << std::endl;
 }
 
 }  // namespace back_odom

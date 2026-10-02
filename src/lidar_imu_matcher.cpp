@@ -137,8 +137,7 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   half_lateral_(params.crop_lateral * 0.5),
   map_(params.voxel_size, 1.0e6, static_cast<unsigned int>(params.max_points_per_voxel)),
   frozen_(params.voxel_size, 1.0e6, static_cast<unsigned int>(params.max_points_per_voxel)),
-  registration_(params.max_iterations, params.convergence_criterion, 0),
-  fpfh_(params.fpfh)
+  registration_(params.max_iterations, params.convergence_criterion, 0)
 {
   if (
     params_.voxel_size <= 0.0 || params_.crop_longitudinal <= 0.0 || params_.crop_lateral <= 0.0) {
@@ -166,24 +165,6 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
     params_.limits.max_yaw_rate < 0.0 || params_.limits.max_match_rejects < 1 ||
     params_.refine_min_travel < 0.0) {
     throw std::invalid_argument("vehicle limits must be non-negative and allow one rejected scan");
-  }
-  if (!params_.fpfh.enabled) {
-    return;
-  }
-  if (params_.fpfh.keypoint_voxel <= 0.0 || params_.fpfh.normal_radius <= 0.0) {
-    throw std::invalid_argument("fpfh voxel and normal radius must be positive");
-  }
-  if (params_.fpfh.fpfh_radius <= params_.fpfh.normal_radius) {
-    throw std::invalid_argument("fpfh radius must be larger than the normal radius");
-  }
-  if (params_.fpfh.max_keypoints < 3 || params_.fpfh.min_inliers < 3) {
-    throw std::invalid_argument("fpfh keypoint and inlier counts must be at least 3");
-  }
-  if (params_.fpfh.correspondence_distance <= 0.0) {
-    throw std::invalid_argument("fpfh correspondence distance must be positive");
-  }
-  if (params_.fpfh.omp_threads < 0) {
-    throw std::invalid_argument("fpfh omp thread count must be non-negative");
   }
 }
 
@@ -487,25 +468,8 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     return result;
   }
 
-  Sophus::SE3d imu_guess = predicted;
-  if (params_.fpfh.enabled) {
-    const auto fpfh_start = std::chrono::steady_clock::now();
-    std::vector<Eigen::Vector3d> target_map;
-    if (!fpfh_.target_cached(map_epoch_, predicted.translation())) {
-      target_map = map_.Pointcloud();
-    }
-    if (const std::optional<Sophus::SE3d> coarse =
-          fpfh_.estimate(source, target_map, predicted, map_epoch_)) {
-      imu_guess = *coarse;
-      result.used_coarse_guess = true;
-    }
-    result.fpfh_ms += elapsed_ms(fpfh_start);
-  }
-  MatchCandidate imu_candidate = score_alignment(source, imu_guess, predicted, true, result);
-  if (result.used_coarse_guess && !imu_candidate.passes) {
-    result.used_coarse_guess = false;
-    imu_candidate = score_alignment(source, predicted, predicted, true, result);
-  }
+  const Sophus::SE3d imu_guess = predicted;
+  const MatchCandidate imu_candidate = score_alignment(source, imu_guess, predicted, true, result);
 
   MatchCandidate visual_candidate;
   Sophus::SE3d visual_guess;

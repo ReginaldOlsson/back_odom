@@ -27,8 +27,6 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
-#include <limits>
-#include <random>
 #include <vector>
 
 namespace back_odom
@@ -233,68 +231,6 @@ TEST(DeviceAccel, plane_align_stays_within_one_millimetre)
   EXPECT_LT(float_delta.so3().log().norm(), 1.0e-3);
   EXPECT_NEAR(device->robust_cost, robust_plane_cost(frame, device->pose, map, 2.0, 0.5), 1.0e-4);
   (void)cpu_cost;
-}
-
-TEST(DeviceAccel, histogram_matches_are_identical)
-{
-  if (!device_available()) {
-    GTEST_SKIP() << "CUDA is not available";
-  }
-  constexpr int k_query = 180;
-  constexpr int k_reference = 220;
-  std::mt19937 generator(7);
-  std::uniform_real_distribution<float> bins(0.0F, 1.0F);
-  std::uniform_real_distribution<double> place(-8.0, 8.0);
-  std::vector<float> query_hist(static_cast<std::size_t>(k_query) * 33);
-  std::vector<float> reference_hist(static_cast<std::size_t>(k_reference) * 33);
-  std::vector<Eigen::Vector3d> query_points(k_query);
-  std::vector<Eigen::Vector3d> reference_points(k_reference);
-  for (float & value : query_hist) {
-    value = bins(generator);
-  }
-  for (float & value : reference_hist) {
-    value = bins(generator);
-  }
-  for (Eigen::Vector3d & point : query_points) {
-    point = Eigen::Vector3d(place(generator), place(generator), place(generator));
-  }
-  for (Eigen::Vector3d & point : reference_points) {
-    point = Eigen::Vector3d(place(generator), place(generator), place(generator));
-  }
-  const double gate_squared = 25.0;
-  const auto device_start = std::chrono::steady_clock::now();
-  const std::optional<std::vector<int>> device = device_histogram_matches(
-    query_hist.data(), k_query, reference_hist.data(), k_reference, query_points, reference_points,
-    gate_squared);
-  const double device_ms = elapsed_ms(device_start);
-  const auto cpu_start = std::chrono::steady_clock::now();
-  std::vector<int> cpu(k_query, -1);
-  for (int query = 0; query < k_query; ++query) {
-    float best = std::numeric_limits<float>::infinity();
-    int best_index = -1;
-    for (int reference = 0; reference < k_reference; ++reference) {
-      const Eigen::Vector3d delta = query_points[static_cast<std::size_t>(query)] -
-                                    reference_points[static_cast<std::size_t>(reference)];
-      if (delta.squaredNorm() > gate_squared) {
-        continue;
-      }
-      float distance = 0.0F;
-      for (int bin = 0; bin < 33; ++bin) {
-        const float diff = query_hist[static_cast<std::size_t>(query * 33 + bin)] -
-                           reference_hist[static_cast<std::size_t>(reference * 33 + bin)];
-        distance += diff * diff;
-      }
-      if (distance < best) {
-        best = distance;
-        best_index = reference;
-      }
-    }
-    cpu[static_cast<std::size_t>(query)] = best_index;
-  }
-  const double cpu_ms = elapsed_ms(cpu_start);
-  std::cout << "histogram device " << device_ms << " ms, cpu " << cpu_ms << " ms" << std::endl;
-  ASSERT_TRUE(device.has_value());
-  EXPECT_EQ(*device, cpu);
 }
 
 }  // namespace back_odom

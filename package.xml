@@ -9,7 +9,6 @@
 
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
   <depend>eigen</depend>
-  <depend>libpcl-all-dev</depend>
   <depend>kiss_icp_cpp</depend>
   <depend>tbb</depend>
   <depend>diagnostic_msgs</depend>

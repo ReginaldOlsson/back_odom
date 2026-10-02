@@ -15,7 +15,6 @@
 #ifndef BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 #define BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 
-#include "back_odom/fpfh_coarse_align.hpp"
 #include "back_odom/imu_processor.hpp"
 #include "back_odom/kinematic_limits.hpp"
 #include "back_odom/visual_motion.hpp"
@@ -74,7 +73,6 @@ struct LidarMatchParams
   double max_accel_bias{1.0};
   VehicleLimits limits{};
   bool visual_enabled{true};
-  FpfhParams fpfh{};
 };
 
 /// A scan still contributes to the visible cloud while its pose is inside the crop around the latest scan.
@@ -120,7 +118,6 @@ struct MatchResult
   bool applied{false};
   bool inserted_scan{false};
   bool first_scan{false};
-  bool used_coarse_guess{false};
   Sophus::SE3d imu_pose{};
   Sophus::SE3d corrected_pose{};
   /// World-frame left increment applied to the pose. `correction * predicted = aligned`.
@@ -147,7 +144,6 @@ struct MatchResult
   bool camera_passed{false};
   double deskew_ms{0.0};
   double voxel_ms{0.0};
-  double fpfh_ms{0.0};
   double align_ms{0.0};
   double cost_ms{0.0};
   double refine_ms{0.0};
@@ -264,7 +260,6 @@ private:
   kiss_icp::VoxelHashMap map_;
   kiss_icp::VoxelHashMap frozen_;
   kiss_icp::Registration registration_;
-  FpfhCoarseAlign fpfh_;
   struct HorizonScan
   {
     double stamp{0.0};
