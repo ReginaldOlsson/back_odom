@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "back_odom/bump_map.hpp"
 #include "back_odom/imu_dead_reckoning.hpp"
 #include "back_odom/imu_processor.hpp"
 #include "back_odom/kinematic_limits.hpp"
@@ -693,6 +694,123 @@ TEST(LidarMatch, stage_times_without_coarse_guess)
   }
   std::cout << "median ms deskew " << median(deskew) << " voxel " << median(voxel) << " align "
             << median(align) << " refine " << median(refine) << " map " << median(map) << std::endl;
+}
+
+std::vector<Eigen::Vector3d> grid_cloud(
+  const double x0, const double x1, const double y0, const double y1, const double step,
+  const double height)
+{
+  std::vector<Eigen::Vector3d> cloud;
+  for (double x = x0; x <= x1; x += step) {
+    for (double y = y0; y <= y1; y += step) {
+      cloud.emplace_back(x, y, height);
+    }
+  }
+  return cloud;
+}
+
+BumpMapConfig bump_test_config()
+{
+  BumpMapConfig config;
+  config.voxel_size = 0.5;
+  config.pixel_size = 0.05;
+  config.max_correspondence_distance = 2.0;
+  config.fuse_distance = 0.15;
+  config.max_iterations = 15;
+  config.min_confirm_points = 3;
+  return config;
+}
+
+TEST(BumpImage, flat_ground_keeps_the_lateral_offset_and_corrects_height)
+{
+  BumpMap map(bump_test_config());
+  const std::vector<Eigen::Vector3d> ground = grid_cloud(-2.0, 2.0, -2.0, 2.0, 0.1, 0.0);
+  map.integrate(ground, Eigen::Vector3d::Zero());
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(0.2, 0.0, 0.08));
+  const BumpAlignResult aligned = map.align(ground, guess);
+  ASSERT_TRUE(aligned.accepted);
+  EXPECT_NEAR(aligned.pose.translation().x(), 0.2, 0.08);
+  EXPECT_NEAR(aligned.pose.translation().z(), 0.0, 0.03);
+}
+
+TEST(BumpImage, curb_depth_image_corrects_a_lateral_slide)
+{
+  BumpMap map(bump_test_config());
+  std::vector<Eigen::Vector3d> curb;
+  for (double x = 0.05; x <= 0.45; x += 0.04) {
+    for (double y = 0.05; y <= 0.45; y += 0.04) {
+      curb.emplace_back(x, y, y < 0.25 ? 0.0 : 0.12);
+    }
+  }
+  map.integrate(curb, Eigen::Vector3d::Zero());
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(0.0, 0.04, 0.02));
+  const BumpAlignResult aligned = map.align(curb, guess);
+  ASSERT_TRUE(aligned.accepted);
+  EXPECT_LT(std::abs(aligned.pose.translation().y()), 0.02);
+  EXPECT_NEAR(aligned.pose.translation().z(), 0.0, 0.03);
+}
+
+TEST(BumpImage, a_truck_that_has_moved_is_skipped)
+{
+  BumpMap map(bump_test_config());
+  const std::vector<Eigen::Vector3d> ground = grid_cloud(-4.0, 4.0, -4.0, 4.0, 0.15, 0.0);
+  map.integrate(ground, Eigen::Vector3d::Zero());
+  ASSERT_TRUE(map.align(ground, Sophus::SE3d()).accepted);
+
+  std::vector<Eigen::Vector3d> truck;
+  for (double x = -0.6; x <= 0.6; x += 0.1) {
+    for (double y = -1.0; y <= 1.0; y += 0.1) {
+      truck.emplace_back(x, y, 3.0);
+    }
+  }
+  map.integrate(truck, Eigen::Vector3d::Zero());
+
+  std::vector<Eigen::Vector3d> moved = ground;
+  for (const Eigen::Vector3d & point : truck) {
+    moved.push_back(point + Eigen::Vector3d(3.0, 0.0, 0.0));
+  }
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(0.0, 0.0, 0.05));
+  const BumpAlignResult aligned = map.align(moved, guess);
+  ASSERT_TRUE(aligned.accepted);
+  EXPECT_GE(aligned.skipped, static_cast<int>(truck.size()));
+  EXPECT_NEAR(aligned.pose.translation().z(), 0.0, 0.03);
+  EXPECT_NEAR(aligned.pose.translation().x(), 0.0, 0.08);
+}
+
+TEST(BumpImage, a_vehicle_inside_the_correspondence_gate_is_not_fused_into_the_road)
+{
+  BumpMap map(bump_test_config());
+  const std::vector<Eigen::Vector3d> ground = grid_cloud(-2.0, 2.0, -2.0, 2.0, 0.1, 0.0);
+  map.integrate(ground, Eigen::Vector3d::Zero());
+  ASSERT_TRUE(map.align(ground, Sophus::SE3d()).accepted);
+
+  std::vector<Eigen::Vector3d> low_car = ground;
+  for (Eigen::Vector3d & point : low_car) {
+    point.z() = 0.4;
+  }
+  map.integrate(low_car, Eigen::Vector3d::Zero());
+
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(0.0, 0.0, 0.06));
+  const BumpAlignResult aligned = map.align(ground, guess);
+  ASSERT_TRUE(aligned.accepted);
+  EXPECT_NEAR(aligned.pose.translation().z(), 0.0, 0.03);
+}
+
+TEST(BumpImage, a_solid_blob_never_becomes_a_surface)
+{
+  BumpMap map(bump_test_config());
+  std::vector<Eigen::Vector3d> blob;
+  for (double x = 0.0; x <= 1.0; x += 0.15) {
+    for (double y = 0.0; y <= 1.0; y += 0.15) {
+      for (double z = 0.0; z <= 1.0; z += 0.15) {
+        blob.emplace_back(x, y, z);
+      }
+    }
+  }
+  map.integrate(blob, Eigen::Vector3d::Zero());
+  const BumpAlignResult aligned = map.align(blob, Sophus::SE3d());
+  EXPECT_FALSE(aligned.accepted);
+  EXPECT_EQ(map.usable_count(), 0U);
 }
 
 }  // namespace back_odom

@@ -228,6 +228,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.limits.max_yaw_rate = this->declare_parameter<double>("max_yaw_rate", 1.0);
   lidar_params.limits.max_match_rejects = this->declare_parameter<int>("max_match_rejects", 5);
   lidar_params.limits.min_scale_travel = this->declare_parameter<double>("min_scale_travel", 0.5);
+  lidar_params.bump_enabled = this->declare_parameter<bool>("bump_enabled", true);
+  lidar_params.bump_pixel_size = this->declare_parameter<double>("bump_pixel_size", 0.05);
+  lidar_params.bump_max_iterations = this->declare_parameter<int>("bump_max_iterations", 15);
+  lidar_params.bump_huber_delta = this->declare_parameter<double>("bump_huber_delta", 0.1);
+  lidar_params.bump_fuse_distance = this->declare_parameter<double>("bump_fuse_distance", 0.15);
   lidar_params.visual_enabled = this->declare_parameter<bool>("visual_enabled", true);
   const auto visual_odom_topic =
     this->declare_parameter<std::string>("visual_odom_topic", "/visual_odom");

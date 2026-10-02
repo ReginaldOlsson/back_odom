@@ -25,6 +25,7 @@ ament_auto_add_library(imu_processor SHARED
 target_link_libraries(imu_processor Sophus::Sophus)
 
 ament_auto_add_library(lidar_imu_matcher SHARED
+  src/bump_map.cpp
   src/lidar_preprocess.cpp
   src/lidar_imu_matcher.cpp
   src/scan_window.cpp

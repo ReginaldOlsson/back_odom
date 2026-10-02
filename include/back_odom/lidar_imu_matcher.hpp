@@ -15,6 +15,7 @@
 #ifndef BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 #define BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 
+#include "back_odom/bump_map.hpp"
 #include "back_odom/imu_processor.hpp"
 #include "back_odom/kinematic_limits.hpp"
 #include "back_odom/visual_motion.hpp"
@@ -73,6 +74,13 @@ struct LidarMatchParams
   double max_accel_bias{1.0};
   VehicleLimits limits{};
   bool visual_enabled{true};
+  /// Depth-image registration. A moving vehicle is skipped unless it still lies on a surface
+  /// from an earlier scan, which is the same correspondence test kiss-icp uses.
+  bool bump_enabled{true};
+  double bump_pixel_size{0.05};
+  int bump_max_iterations{15};
+  double bump_huber_delta{0.1};
+  double bump_fuse_distance{0.15};
 };
 
 /// A scan still contributes to the visible cloud while its pose is inside the crop around the latest scan.
@@ -239,8 +247,9 @@ private:
     const ImuProcessor & imu, double from_stamp, double to_stamp) const;
   [[nodiscard]] Sophus::SE3d recovery_pose(double scan_end, const ImuProcessor & imu) const;
   [[nodiscard]] MatchCandidate score_alignment(
-    const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess,
-    const Sophus::SE3d & imu_reference, bool check_imu_gate, MatchResult & timing);
+    const std::vector<Eigen::Vector3d> & source, const std::vector<Eigen::Vector3d> & map_points,
+    const Sophus::SE3d & guess, const Sophus::SE3d & imu_reference, bool check_imu_gate,
+    MatchResult & timing);
   void finish_accepted_scan(
     MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
     double iterations, ImuProcessor & imu, double since_stamp, bool update_bias,
@@ -252,6 +261,8 @@ private:
   bool refine_window_if_due(MatchResult & result, Sophus::SE3d & newest_pose);
   void rebuild_from_horizon(const Sophus::SE3d & cull_pose);
   void cull_local_map(kiss_icp::VoxelHashMap & map, const Sophus::SE3d & pose) const;
+  void integrate_bump(const Sophus::SE3d & pose, const std::vector<Eigen::Vector3d> & body_points);
+  void rebuild_bump(const Sophus::SE3d & cull_pose);
 
   Sophus::SE3d body_from_lidar_{};
   LidarMatchParams params_;
@@ -260,6 +271,7 @@ private:
   kiss_icp::VoxelHashMap map_;
   kiss_icp::VoxelHashMap frozen_;
   kiss_icp::Registration registration_;
+  BumpMap bump_;
   struct HorizonScan
   {
     double stamp{0.0};

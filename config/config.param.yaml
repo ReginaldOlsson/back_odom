@@ -44,6 +44,16 @@
     max_acceleration: 5.0
     max_yaw_rate: 1.0
     max_match_rejects: 5
+    # Covariance plane in each voxel, then a depth image on that plane.
+    # Points farther than max_correspondence_distance from that surface are skipped,
+    # including cars and trucks that are not where the previous scan left them.
+    # fuse_distance is the band that may be written into the image, so a vehicle
+    # that only grazes a wall is not averaged into it.
+    bump_enabled: true
+    bump_pixel_size: 0.05
+    bump_max_iterations: 15
+    bump_huber_delta: 0.1
+    bump_fuse_distance: 0.15
     visual_enabled: true
     visual_odom_topic: "/visual_odom"
     min_scale_travel: 0.5
