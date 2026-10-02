@@ -1,0 +1,41 @@
+<launch>
+  <!-- back_odom + EKF at IMU rate for Boreas bags.
+       Example: ros2 launch back_odom back_odom_ekf.launch.xml use_sim_time:=true
+       Then play the bag with the clock flag enabled.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <arg name="launch_vehicle" default="true" description="Publish Boreas base_link to imu/lidar/applanix. Set false if vehicle.launch.xml is already running."/>
+  <arg name="launch_vehicle_interface" default="false"/>
+  <arg name="sensor_model" default="boreas_sensor_kit"/>
+  <arg name="vehicle_model" default="boreas_vehicle"/>
+  <arg name="imu_topic" default="/boreas/imu"/>
+  <arg name="pointcloud_topic" default="/boreas/pointcloud"/>
+  <arg name="config_file" default="$(find-pkg-share back_odom)/config/config.param.yaml"/>
+  <arg name="ekf_param_file" default="$(find-pkg-share back_odom)/config/ekf_back_odom.param.yaml"/>
+
+  <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
+
+  <!-- base_link -> sensor_kit_base_link -> imu, lidar, applanix -->
+  <include if="$(var launch_vehicle)" file="$(find-pkg-share tier4_vehicle_launch)/launch/vehicle.launch.xml">
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
+    <arg name="launch_vehicle_interface" value="$(var launch_vehicle_interface)"/>
+    <arg name="sensor_model" value="$(var sensor_model)"/>
+    <arg name="vehicle_model" value="$(var vehicle_model)"/>
+  </include>
+
+  <!-- ICP pose + IMU twist. publish_tf is false in config; EKF owns map -> base_link. -->
+  <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen">
+    <param from="$(var config_file)"/>
+    <param name="imu_topic" value="$(var imu_topic)"/>
+    <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+  </node>
+
+  <!-- predict_on_twist EKF; inputs remapped to back_odom publishers -->
+  <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
+    <arg name="param_file" value="$(var ekf_param_file)"/>
+    <arg name="input_initial_pose_name" value="/back_odom/initialpose"/>
+    <arg name="input_pose_with_cov_name" value="/back_odom/pose_with_covariance"/>
+    <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
+  </include>
+</launch>

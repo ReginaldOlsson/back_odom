@@ -186,6 +186,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const auto pointcloud_topic =
     this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
+  twist_variance_vx_ = this->declare_parameter<double>("twist_variance_vx", 0.05);
+  twist_variance_wz_ = this->declare_parameter<double>("twist_variance_wz", 0.01);
+  pose_variance_xy_ = this->declare_parameter<double>("pose_variance_xy", 0.05);
+  pose_variance_yaw_ = this->declare_parameter<double>("pose_variance_yaw", 0.01);
+  if (
+    twist_variance_vx_ <= 0.0 || twist_variance_wz_ <= 0.0 || pose_variance_xy_ <= 0.0 ||
+    pose_variance_yaw_ <= 0.0) {
+    throw std::invalid_argument("EKF measurement variances must be positive");
+  }
   imu_left_handed_ = this->declare_parameter<bool>("imu_left_handed", false);
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
   child_frame_ = this->declare_parameter<std::string>("child_frame", "base_link");
@@ -227,11 +236,6 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.limits.max_acceleration = this->declare_parameter<double>("max_acceleration", 5.0);
   lidar_params.limits.max_yaw_rate = this->declare_parameter<double>("max_yaw_rate", 1.0);
   lidar_params.limits.max_match_rejects = this->declare_parameter<int>("max_match_rejects", 5);
-  lidar_params.limits.min_scale_travel = this->declare_parameter<double>("min_scale_travel", 0.5);
-  lidar_params.visual_enabled = this->declare_parameter<bool>("visual_enabled", true);
-  const auto visual_odom_topic =
-    this->declare_parameter<std::string>("visual_odom_topic", "/visual_odom");
-
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
   }
@@ -261,14 +265,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
-  if (lidar_params.visual_enabled) {
-    visual_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      visual_odom_topic, rclcpp::QoS(10),
-      [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) { this->callback_visual(msg); });
-  }
 
   odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom", rclcpp::QoS(10));
   imu_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom/imu", rclcpp::QoS(10));
+  twist_pub_ = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>(
+    "/back_odom/twist_with_covariance", rclcpp::QoS(10));
+  pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "/back_odom/pose_with_covariance", rclcpp::QoS(10));
+  initial_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "/back_odom/initialpose", rclcpp::QoS(10));
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("back_odom/path", rclcpp::QoS(10));
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "back_odom/markers", rclcpp::QoS(10));
@@ -282,10 +287,6 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/lidar", rclcpp::QoS(10));
   lidar_debug_path_pub_ =
     this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/lidar/path", rclcpp::QoS(10));
-  camera_debug_pub_ =
-    this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/camera", rclcpp::QoS(10));
-  camera_debug_path_pub_ =
-    this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/camera/path", rclcpp::QoS(10));
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
@@ -364,6 +365,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   }
 
   publish_odometry(odometry_pub_, output, stamp);
+  publish_twist(output, stamp);
   publish_path(output, stamp);
   publish_markers(output, stamp);
   if (publish_tf_) {
@@ -446,11 +448,10 @@ void BackOdomNode::match_pending_scan(const bool force)
     if (lidar_matcher_->has_reference()) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "ICP correction rejected. health %s, source %s, lidar cost %.3f pass %s, "
-        "camera cost %.3f pass %s, translation %.3f m, rotation %.3f rad",
-        health_name(matched.health), matched.used_visual_guess ? "camera" : "lidar",
-        matched.lidar_cost, matched.lidar_passed ? "yes" : "no", matched.camera_cost,
-        matched.camera_passed ? "yes" : "no", matched.translation_error, matched.rotation_error);
+        "ICP correction rejected. health %s, lidar cost %.3f pass %s, translation %.3f m, "
+        "rotation %.3f rad",
+        health_name(matched.health), matched.lidar_cost, matched.lidar_passed ? "yes" : "no",
+        matched.translation_error, matched.rotation_error);
     }
     publish_health(stamp);
     return;
@@ -458,10 +459,9 @@ void BackOdomNode::match_pending_scan(const bool force)
   if (!matched.first_scan) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP correction applied from the %s guess. lidar cost %.3f, camera cost %.3f, "
-      "translation %.3f m, rotation %.4f rad, health %s",
-      matched.used_visual_guess ? "camera" : "lidar", matched.lidar_cost, matched.camera_cost,
-      matched.translation_error, matched.rotation_error, health_name(matched.health));
+      "ICP correction applied. lidar cost %.3f, translation %.3f m, rotation %.4f rad, health %s",
+      matched.lidar_cost, matched.translation_error, matched.rotation_error,
+      health_name(matched.health));
   }
   if (matched.refined_window) {
     RCLCPP_INFO(
@@ -472,6 +472,7 @@ void BackOdomNode::match_pending_scan(const bool force)
   const ProcessorOutput corrected = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   publish_odometry(odometry_pub_, corrected, stamp);
+  publish_pose(corrected, stamp);
   publish_path(corrected, stamp);
   publish_markers(corrected, stamp);
   publish_local_map(stamp);
@@ -484,28 +485,6 @@ void BackOdomNode::match_pending_scan(const bool force)
   }
 }
 
-void BackOdomNode::callback_visual(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
-{
-  const std::string camera_frame =
-    msg->child_frame_id.empty() ? msg->header.frame_id : msg->child_frame_id;
-  if (!camera_frame.empty() && camera_frame != parent_frame_) {
-    Sophus::SE3d base_from_camera;
-    if (base_from_frame(camera_frame, base_from_camera)) {
-      lidar_matcher_->set_body_from_camera(base_from_camera);
-    }
-  }
-  const Eigen::Quaterniond rotation(
-    msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
-    msg->pose.pose.orientation.z);
-  if (rotation.norm() < 1.0e-9) {
-    return;
-  }
-  const Sophus::SE3d world_from_camera(
-    Sophus::SO3d(rotation.normalized()),
-    Eigen::Vector3d(
-      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
-  lidar_matcher_->push_visual_pose(rclcpp::Time(msg->header.stamp).seconds(), world_from_camera);
-}
 
 void BackOdomNode::publish_health(const rclcpp::Time & stamp)
 {
@@ -527,18 +506,10 @@ void BackOdomNode::publish_health(const rclcpp::Time & stamp)
     entry.value = value;
     status.values.push_back(entry);
   };
-  add_value(
-    "visual_scale",
-    lidar_matcher_->has_visual_scale() ? std::to_string(lidar_matcher_->visual_scale()) : "unset");
-  add_value("scale_frozen", lidar_matcher_->scale_frozen() ? "true" : "false");
   add_value("reject_streak", std::to_string(lidar_matcher_->reject_streak()));
   if (has_last_match_) {
-    add_value("source", last_match_.used_visual_guess ? "camera" : "lidar");
     add_value("lidar_cost", last_match_.has_lidar_debug ? std::to_string(last_match_.lidar_cost) : "none");
     add_value("lidar_passed", last_match_.lidar_passed ? "true" : "false");
-    add_value(
-      "camera_cost", last_match_.has_camera_debug ? std::to_string(last_match_.camera_cost) : "none");
-    add_value("camera_passed", last_match_.camera_passed ? "true" : "false");
     add_value("translation_error_m", std::to_string(last_match_.translation_error));
     add_value("rotation_error_rad", std::to_string(last_match_.rotation_error));
   }
@@ -577,10 +548,6 @@ void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcp
 
   if (match.has_lidar_debug) {
     publish_one(match.lidar_pose, "lidar_odom", lidar_debug_pub_, lidar_debug_path_, lidar_debug_path_pub_);
-  }
-  if (match.has_camera_debug) {
-    publish_one(
-      match.camera_pose, "camera_odom", camera_debug_pub_, camera_debug_path_, camera_debug_path_pub_);
   }
 }
 
@@ -727,6 +694,41 @@ void BackOdomNode::publish_odometry(
   odometry.twist.twist.angular.y = output.angular_velocity_body.y();
   odometry.twist.twist.angular.z = output.angular_velocity_body.z();
   publisher->publish(odometry);
+}
+
+void BackOdomNode::publish_twist(const ProcessorOutput & output, const rclcpp::Time & stamp)
+{
+  geometry_msgs::msg::TwistWithCovarianceStamped twist;
+  twist.header.stamp = stamp;
+  twist.header.frame_id = child_frame_;
+  const Eigen::Vector3d velocity_body = output.orientation.inverse() * output.velocity_world;
+  twist.twist.twist.linear.x = velocity_body.x();
+  twist.twist.twist.angular.z = output.angular_velocity_body.z();
+  twist.twist.covariance[0] = twist_variance_vx_;
+  twist.twist.covariance[35] = twist_variance_wz_;
+  twist_pub_->publish(twist);
+}
+
+void BackOdomNode::publish_pose(const ProcessorOutput & output, const rclcpp::Time & stamp)
+{
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.stamp = stamp;
+  pose.header.frame_id = parent_frame_;
+  pose.pose.pose.position.x = output.position.x();
+  pose.pose.pose.position.y = output.position.y();
+  pose.pose.pose.position.z = output.position.z();
+  set_quaternion(pose.pose.pose.orientation, output.orientation);
+  pose.pose.covariance[0] = pose_variance_xy_;
+  pose.pose.covariance[7] = pose_variance_xy_;
+  pose.pose.covariance[14] = pose_variance_xy_;
+  pose.pose.covariance[21] = pose_variance_yaw_;
+  pose.pose.covariance[28] = pose_variance_yaw_;
+  pose.pose.covariance[35] = pose_variance_yaw_;
+  pose_pub_->publish(pose);
+  if (!initial_pose_sent_) {
+    initial_pose_pub_->publish(pose);
+    initial_pose_sent_ = true;
+  }
 }
 
 void BackOdomNode::publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp)

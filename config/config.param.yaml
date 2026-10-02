@@ -1,6 +1,7 @@
 /**:
   ros__parameters:
-    publish_tf: true
+    # The EKF publishes map to base_link. Leave this false so both nodes do not publish that transform.
+    publish_tf: false
     # Bags exported before boreas converts imu_raw still contain left-handed samples
     # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
     # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
@@ -44,6 +45,8 @@
     max_acceleration: 5.0
     max_yaw_rate: 1.0
     max_match_rejects: 5
-    visual_enabled: true
-    visual_odom_topic: "/visual_odom"
-    min_scale_travel: 0.5
+    # Diagonal entries of the twist and pose messages sent to the EKF.
+    twist_variance_vx: 0.05
+    twist_variance_wz: 0.01
+    pose_variance_xy: 0.05
+    pose_variance_yaw: 0.01

@@ -17,7 +17,7 @@
 
 #include "back_odom/imu_processor.hpp"
 #include "back_odom/kinematic_limits.hpp"
-#include "back_odom/visual_motion.hpp"
+#include "back_odom/match_candidate.hpp"
 
 #include <Eigen/Core>
 #include <kiss_icp_cpp/core/Registration.hpp>
@@ -72,7 +72,6 @@ struct LidarMatchParams
   double max_gyro_bias{0.05};
   double max_accel_bias{1.0};
   VehicleLimits limits{};
-  bool visual_enabled{true};
 };
 
 /// A scan still contributes to the visible cloud while its pose is inside the crop around the latest scan.
@@ -129,7 +128,6 @@ struct MatchResult
   Eigen::Vector3d gyro_bias{Eigen::Vector3d::Zero()};
   Eigen::Vector3d accel_bias{Eigen::Vector3d::Zero()};
   LocalizationHealth health{LocalizationHealth::Healthy};
-  bool used_visual_guess{false};
   bool has_lidar_debug{false};
   Sophus::SE3d lidar_pose{};
   double lidar_cost{0.0};
@@ -138,10 +136,6 @@ struct MatchResult
   double refine_shift{0.0};
   int refine_scans{0};
   int refine_settled{0};
-  bool has_camera_debug{false};
-  Sophus::SE3d camera_pose{};
-  double camera_cost{0.0};
-  bool camera_passed{false};
   double deskew_ms{0.0};
   double voxel_ms{0.0};
   double align_ms{0.0};
@@ -173,16 +167,9 @@ public:
 
   /// Static pose of the lidar in the integrator frame. Identity until tf_static provides it.
   void set_body_from_lidar(const Sophus::SE3d & body_from_lidar);
-  void set_body_from_camera(const Sophus::SE3d & body_from_camera);
-
-  /// Monocular camera pose in the visual world. Scale is recovered from healthy lidar motion.
-  void push_visual_pose(double stamp, const Sophus::SE3d & world_from_camera);
 
   [[nodiscard]] LocalizationHealth health() const;
   [[nodiscard]] int reject_streak() const;
-  [[nodiscard]] bool scale_frozen() const;
-  [[nodiscard]] double visual_scale() const;
-  [[nodiscard]] bool has_visual_scale() const;
 
   /// Deskew, crop, and either store the first scan or match a new scan into the map.
   [[nodiscard]] MatchResult on_scan(const LidarScan & scan, ImuProcessor & imu);
@@ -226,15 +213,6 @@ private:
   void remember_healthy(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, double stamp);
   void restore_healthy_speed(ImuProcessor & imu);
   void note_health(ImuProcessor & imu, HealthEvent event);
-  struct VisualSegment
-  {
-    Sophus::SE3d body{};
-    double t0{0.0};
-    double t1{0.0};
-  };
-
-  [[nodiscard]] std::optional<StampedPose> visual_at_or_before(double stamp) const;
-  [[nodiscard]] std::optional<VisualSegment> visual_segment(double from_stamp, double to_stamp) const;
   [[nodiscard]] Sophus::SO3d imu_rotation_between(
     const ImuProcessor & imu, double from_stamp, double to_stamp) const;
   [[nodiscard]] Sophus::SE3d recovery_pose(double scan_end, const ImuProcessor & imu) const;
@@ -245,7 +223,6 @@ private:
     MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
     double iterations, ImuProcessor & imu, double since_stamp, bool update_bias,
     const std::optional<Eigen::Vector3d> & velocity_override);
-  void update_scale(const Sophus::SE3d & lidar_pose, double stamp);
   void record_horizon_scan(
     const Sophus::SE3d & pose, double stamp, const std::vector<Eigen::Vector3d> & points,
     const ImuProcessor & imu);
@@ -284,10 +261,6 @@ private:
   Eigen::Vector3d accel_bias_prior_{Eigen::Vector3d::Zero()};
   bool has_bias_prior_{false};
   HealthState health_{};
-  Sophus::SE3d body_from_camera_{};
-  bool has_camera_{false};
-  std::deque<StampedPose> visual_poses_;
-  ScaleEstimator scale_{};
   bool has_healthy_{false};
   Sophus::SE3d last_healthy_pose_{};
   double last_healthy_stamp_{0.0};

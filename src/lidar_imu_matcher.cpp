@@ -17,7 +17,6 @@
 #include "back_odom/device_accel.hpp"
 #include "back_odom/lidar_preprocess.hpp"
 #include "back_odom/scan_window.hpp"
-#include "back_odom/visual_motion.hpp"
 
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 
@@ -173,31 +172,6 @@ void LidarImuMatcher::set_body_from_lidar(const Sophus::SE3d & body_from_lidar)
   body_from_lidar_ = body_from_lidar;
 }
 
-void LidarImuMatcher::set_body_from_camera(const Sophus::SE3d & body_from_camera)
-{
-  body_from_camera_ = body_from_camera;
-  has_camera_ = true;
-}
-
-void LidarImuMatcher::push_visual_pose(const double stamp, const Sophus::SE3d & world_from_camera)
-{
-  if (!params_.visual_enabled || !std::isfinite(stamp)) {
-    return;
-  }
-  if (
-    !visual_poses_.empty() && stamp + 1.0e-6 < visual_poses_.back().stamp) {
-    return;
-  }
-  if (!visual_poses_.empty() && std::abs(stamp - visual_poses_.back().stamp) < 1.0e-6) {
-    visual_poses_.back().pose = world_from_camera;
-    return;
-  }
-  visual_poses_.push_back(StampedPose{stamp, world_from_camera});
-  while (visual_poses_.size() > 200U) {
-    visual_poses_.pop_front();
-  }
-}
-
 LocalizationHealth LidarImuMatcher::health() const
 {
   return health_.health;
@@ -206,21 +180,6 @@ LocalizationHealth LidarImuMatcher::health() const
 int LidarImuMatcher::reject_streak() const
 {
   return health_.reject_streak;
-}
-
-bool LidarImuMatcher::scale_frozen() const
-{
-  return scale_.frozen;
-}
-
-double LidarImuMatcher::visual_scale() const
-{
-  return scale_.scale;
-}
-
-bool LidarImuMatcher::has_visual_scale() const
-{
-  return scale_.has_scale;
 }
 
 bool LidarImuMatcher::has_reference() const
@@ -471,40 +430,12 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
   const Sophus::SE3d imu_guess = predicted;
   const MatchCandidate imu_candidate = score_alignment(source, imu_guess, predicted, true, result);
 
-  MatchCandidate visual_candidate;
-  Sophus::SE3d visual_guess;
-  bool has_visual_guess = false;
-  const std::optional<VisualSegment> segment = visual_segment(window_.back().stamp, scan_end);
-  if (segment.has_value()) {
-    Sophus::SE3d tail = Sophus::SE3d();
-    if (scan_end - segment->t1 > 1.0e-3) {
-      const Sophus::SE3d from = imu.interpolate_pose(segment->t1);
-      tail = from.inverse() * imu.interpolate_pose(scan_end);
-    }
-    visual_guess = window_.back().pose * segment->body * tail;
-    has_visual_guess = true;
-    const Sophus::SE3d separation = predicted.inverse() * visual_guess;
-    if (separation.translation().norm() > 0.05 || separation.so3().log().norm() > 0.02) {
-      visual_candidate = score_alignment(source, visual_guess, predicted, true, result);
-    }
-  }
   result.has_lidar_debug = imu_candidate.present;
   result.lidar_pose = imu_candidate.pose;
   result.lidar_cost = imu_candidate.cost;
   result.lidar_passed = imu_candidate.passes;
-  if (visual_candidate.present) {
-    result.has_camera_debug = true;
-    result.camera_pose = visual_candidate.pose;
-    result.camera_cost = visual_candidate.cost;
-    result.camera_passed = visual_candidate.passes;
-  } else if (has_visual_guess) {
-    result.has_camera_debug = true;
-    result.camera_pose = visual_guess;
-  }
 
-  const MatchCandidate * chosen = select_match_candidate(
-    imu_candidate, visual_candidate.present ? &visual_candidate : nullptr);
-  if (chosen == nullptr) {
+  if (!(imu_candidate.present && imu_candidate.passes)) {
     const Sophus::SE3d failed = imu_candidate.present ? imu_candidate.pose : predicted;
     const Sophus::SE3d vehicle_delta = predicted.inverse() * failed;
     result.applied = false;
@@ -516,13 +447,11 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     return result;
   }
 
-  result.used_visual_guess = chosen == &visual_candidate;
-  result.iterations = chosen->iterations;
+  result.iterations = imu_candidate.iterations;
   finish_accepted_scan(
-    result, prepared, chosen->pose, chosen->iterations, imu, last_correction_stamp_, true,
+    result, prepared, imu_candidate.pose, imu_candidate.iterations, imu, last_correction_stamp_, true,
     std::nullopt);
   note_health(imu, HealthEvent::Accepted);
-  update_scale(result.corrected_pose, scan_end);
   remember_healthy(result.corrected_pose, imu.velocity(), scan_end);
   result.health = health_.health;
   result.gyro_bias = imu.gyro_bias();
@@ -637,45 +566,9 @@ void LidarImuMatcher::restore_healthy_speed(ImuProcessor & imu)
 void LidarImuMatcher::note_health(ImuProcessor & imu, const HealthEvent event)
 {
   health_ = advance_localization_health(health_, event, params_.limits.max_match_rejects);
-  scale_.frozen = health_.scale_frozen;
-  if (!health_.scale_frozen) {
-    scale_.resume();
-  }
   if (health_.restore_speed) {
     restore_healthy_speed(imu);
   }
-}
-
-std::optional<StampedPose> LidarImuMatcher::visual_at_or_before(const double stamp) const
-{
-  const StampedPose * best = nullptr;
-  for (const StampedPose & pose : visual_poses_) {
-    if (pose.stamp <= stamp + 1.0e-6) {
-      best = &pose;
-    }
-  }
-  if (best == nullptr || stamp - best->stamp > 3.0) {
-    return std::nullopt;
-  }
-  return *best;
-}
-
-std::optional<LidarImuMatcher::VisualSegment> LidarImuMatcher::visual_segment(
-  const double from_stamp, const double to_stamp) const
-{
-  if (!params_.visual_enabled || !has_camera_ || !scale_.has_scale) {
-    return std::nullopt;
-  }
-  const std::optional<StampedPose> start = visual_at_or_before(from_stamp);
-  const std::optional<StampedPose> end = visual_at_or_before(to_stamp);
-  if (!start.has_value() || !end.has_value() || end->stamp <= start->stamp + 1.0e-3) {
-    return std::nullopt;
-  }
-  VisualSegment segment;
-  segment.t0 = start->stamp;
-  segment.t1 = end->stamp;
-  segment.body = scaled_body_motion(start->pose, end->pose, body_from_camera_, scale_.scale);
-  return segment;
 }
 
 Sophus::SO3d LidarImuMatcher::imu_rotation_between(
@@ -689,22 +582,13 @@ Sophus::SO3d LidarImuMatcher::imu_rotation_between(
 
 Sophus::SE3d LidarImuMatcher::recovery_pose(const double scan_end, const ImuProcessor & imu) const
 {
-  RecoveryGuess guess;
-  guess.last_healthy = has_healthy_ ? last_healthy_pose_ : imu.pose();
-  guess.max_speed = params_.limits.max_speed;
-  guess.held_speed = last_healthy_speed_;
+  const Sophus::SE3d last_healthy = has_healthy_ ? last_healthy_pose_ : imu.pose();
   const double origin_stamp = has_healthy_ ? last_healthy_stamp_ : scan_end;
-  if (const std::optional<VisualSegment> segment = visual_segment(origin_stamp, scan_end)) {
-    guess.has_visual = true;
-    guess.visual_body = segment->body;
-    guess.visual_dt = std::max(1.0e-3, segment->t1 - segment->t0);
-    guess.tail_dt = std::max(0.0, scan_end - segment->t1);
-    guess.tail_rotation = imu_rotation_between(imu, segment->t1, scan_end);
-  } else {
-    guess.tail_dt = std::max(0.0, scan_end - origin_stamp);
-    guess.tail_rotation = imu_rotation_between(imu, origin_stamp, scan_end);
-  }
-  return make_recovery_guess(guess);
+  const double tail_dt = std::max(0.0, scan_end - origin_stamp);
+  const double limit = std::max(0.0, params_.limits.max_speed);
+  const double speed = std::clamp(last_healthy_speed_, -limit, limit);
+  const Sophus::SO3d tail_rotation = imu_rotation_between(imu, origin_stamp, scan_end);
+  return last_healthy * Sophus::SE3d(tail_rotation, Eigen::Vector3d(speed * tail_dt, 0.0, 0.0));
 }
 
 MatchCandidate LidarImuMatcher::score_alignment(
@@ -733,18 +617,6 @@ MatchCandidate LidarImuMatcher::score_alignment(
   const bool imu_ok = !check_imu_gate || accept_vehicle_delta(iterations, imu_delta);
   candidate.passes = iterations > 0.0 && imu_ok && std::isfinite(candidate.cost);
   return candidate;
-}
-
-void LidarImuMatcher::update_scale(const Sophus::SE3d & lidar_pose, const double stamp)
-{
-  if (scale_.frozen || !params_.visual_enabled) {
-    return;
-  }
-  const std::optional<StampedPose> visual = visual_at_or_before(stamp);
-  if (!visual.has_value()) {
-    return;
-  }
-  scale_.observe(lidar_pose.translation(), visual->pose.translation(), params_.limits.min_scale_travel);
 }
 
 void LidarImuMatcher::optimize_window(ImuProcessor & imu)

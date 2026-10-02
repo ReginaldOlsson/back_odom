@@ -18,7 +18,7 @@
 #include "back_odom/lidar_imu_matcher.hpp"
 #include "back_odom/lidar_preprocess.hpp"
 #include "back_odom/scan_window.hpp"
-#include "back_odom/visual_motion.hpp"
+#include "back_odom/match_candidate.hpp"
 
 #include <kiss_icp_cpp/core/Registration.hpp>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
@@ -404,7 +404,6 @@ TEST(LocalizationHealth, rejected_scans_keep_matching_and_do_not_rewrite_speed)
     EXPECT_FALSE(matched.applied);
   }
   EXPECT_EQ(matcher.health(), LocalizationHealth::Healthy);
-  EXPECT_FALSE(matcher.scale_frozen());
   EXPECT_NEAR(imu.velocity().x(), 40.0, 1.0e-6);
 }
 
@@ -430,34 +429,7 @@ TEST(ImuIntegration, body_speed_stays_inside_the_vehicle_limit)
   EXPECT_LE(std::abs((imu.pose().so3().inverse() * imu.velocity()).x()), 20.0);
 }
 
-TEST(VisualScale, frozen_estimator_keeps_the_healthy_scale)
-{
-  ScaleEstimator scale;
-  scale.observe(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.5);
-  scale.observe(Eigen::Vector3d(2.0, 0.0, 0.0), Eigen::Vector3d(1.0, 0.0, 0.0), 0.5);
-  ASSERT_TRUE(scale.has_scale);
-  EXPECT_NEAR(scale.scale, 2.0, 1.0e-9);
-  scale.freeze();
-  scale.observe(Eigen::Vector3d(8.0, 0.0, 0.0), Eigen::Vector3d(1.0, 0.0, 0.0), 0.5);
-  EXPECT_TRUE(scale.frozen);
-  EXPECT_NEAR(scale.scale, 2.0, 1.0e-9);
-}
 
-TEST(VisualRecovery, guess_appends_visual_motion_and_a_speed_matched_tail)
-{
-  RecoveryGuess guess;
-  guess.last_healthy = Sophus::SE3d();
-  guess.has_visual = true;
-  guess.visual_body = Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(2.0, 0.0, 0.0));
-  guess.visual_dt = 1.0;
-  guess.tail_dt = 0.5;
-  guess.tail_rotation = Sophus::SO3d();
-  guess.max_speed = 20.0;
-  const Sophus::SE3d pose = make_recovery_guess(guess);
-  EXPECT_NEAR(pose.translation().x(), 3.0, 1.0e-9);
-  EXPECT_NEAR(pose.translation().y(), 0.0, 1.0e-9);
-  EXPECT_NEAR(signed_visual_speed(guess.visual_body, guess.visual_dt, guess.max_speed), 2.0, 1.0e-9);
-}
 
 TEST(ScanPoses, pose_outside_the_crop_is_not_part_of_the_visible_cloud)
 {
@@ -599,22 +571,6 @@ TEST(LidarMatch, forward_slide_is_limited_and_lateral_shift_is_kept)
   EXPECT_NEAR(body.so3().log().norm(), 0.04, 1.0e-9);
 }
 
-TEST(MatchSelection, lower_plane_residual_wins_until_its_gate_fails)
-{
-  MatchCandidate imu;
-  imu.present = true;
-  imu.passes = true;
-  imu.cost = 2.0;
-  MatchCandidate visual;
-  visual.present = true;
-  visual.passes = true;
-  visual.cost = 0.5;
-  EXPECT_EQ(select_match_candidate(imu, &visual), &visual);
-  visual.passes = false;
-  EXPECT_EQ(select_match_candidate(imu, &visual), &imu);
-  imu.passes = false;
-  EXPECT_EQ(select_match_candidate(imu, &visual), nullptr);
-}
 
 LidarScan street_scan(const double stamp)
 {

@@ -67,6 +67,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_lidar_match lidar_imu_matcher)
   ament_add_gtest(test_device_accel test/test_device_accel.cpp)
   target_link_libraries(test_device_accel lidar_imu_matcher)
+  ament_add_gtest(test_ekf_messages test/test_ekf_messages.cpp)
+  target_link_libraries(test_ekf_messages ${PROJECT_NAME})
+  ament_target_dependencies(test_ekf_messages rclcpp tf2_ros sensor_msgs geometry_msgs)
 endif()
 
 ament_auto_package(

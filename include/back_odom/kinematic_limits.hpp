@@ -29,7 +29,6 @@ struct VehicleLimits
   double max_acceleration{5.0};
   double max_yaw_rate{1.0};
   int max_match_rejects{5};
-  double min_scale_travel{0.5};
 };
 
 enum class LocalizationHealth { Healthy, Degraded, Diverged };
@@ -40,7 +39,6 @@ enum class HealthEvent
   Saturated,
   Rejected,
   KinematicViolation,
-  VisualDisagreement,
   SpeedClamped
 };
 
@@ -48,7 +46,6 @@ struct HealthState
 {
   LocalizationHealth health{LocalizationHealth::Healthy};
   int reject_streak{0};
-  bool scale_frozen{false};
   bool update_bias{true};
   bool restore_speed{false};
 };
@@ -116,7 +113,6 @@ struct HealthState
 
   if (event == HealthEvent::KinematicViolation || event == HealthEvent::SpeedClamped) {
     next.health = LocalizationHealth::Diverged;
-    next.scale_frozen = true;
     next.update_bias = false;
     next.restore_speed = true;
     next.reject_streak = state.reject_streak + 1;
@@ -127,18 +123,16 @@ struct HealthState
     next.update_bias = false;
     if (next.reject_streak >= reject_limit || state.health == LocalizationHealth::Diverged) {
       next.health = LocalizationHealth::Diverged;
-      next.scale_frozen = true;
       next.restore_speed = true;
     } else {
       next.health = LocalizationHealth::Degraded;
     }
     return next;
   }
-  if (event == HealthEvent::Saturated || event == HealthEvent::VisualDisagreement) {
+  if (event == HealthEvent::Saturated) {
     next.update_bias = false;
     if (state.health == LocalizationHealth::Diverged) {
       next.health = LocalizationHealth::Diverged;
-      next.scale_frozen = true;
       next.restore_speed = true;
       return next;
     }
@@ -148,7 +142,6 @@ struct HealthState
 
   next.health = LocalizationHealth::Healthy;
   next.reject_streak = 0;
-  next.scale_frozen = false;
   next.update_bias = true;
   next.restore_speed = false;
   return next;
