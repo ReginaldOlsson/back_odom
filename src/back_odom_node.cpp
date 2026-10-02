@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace back_odom
 {
@@ -104,6 +105,45 @@ sensor_msgs::msg::PointField float_field(const std::string & name, const std::ui
   field.datatype = sensor_msgs::msg::PointField::FLOAT32;
   field.count = 1;
   return field;
+}
+
+std::vector<LocalMapPoint> thin_for_display(const std::vector<LocalMapPoint> & points, const double voxel)
+{
+  if (voxel <= 0.0 || points.size() < 2) {
+    return points;
+  }
+  struct Key
+  {
+    std::int64_t x;
+    std::int64_t y;
+    std::int64_t z;
+    bool operator==(const Key & other) const { return x == other.x && y == other.y && z == other.z; }
+  };
+  struct Hash
+  {
+    std::size_t operator()(const Key & key) const
+    {
+      std::size_t value = static_cast<std::size_t>(key.x);
+      value ^= static_cast<std::size_t>(key.y) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+      value ^= static_cast<std::size_t>(key.z) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+      return value;
+    }
+  };
+  std::unordered_set<Key, Hash> occupied;
+  occupied.reserve(points.size());
+  std::vector<LocalMapPoint> kept;
+  kept.reserve(points.size() / 4U);
+  const double inverse = 1.0 / voxel;
+  for (const LocalMapPoint & point : points) {
+    const Key key{
+      static_cast<std::int64_t>(std::floor(point.position.x() * inverse)),
+      static_cast<std::int64_t>(std::floor(point.position.y() * inverse)),
+      static_cast<std::int64_t>(std::floor(point.position.z() * inverse))};
+    if (occupied.insert(key).second) {
+      kept.push_back(point);
+    }
+  }
+  return kept;
 }
 
 sensor_msgs::msg::PointCloud2 to_annotated_pointcloud(
@@ -243,7 +283,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     "back_odom/markers", rclcpp::QoS(10));
   scan_pose_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
     "back_odom/scan_poses", rclcpp::QoS(10));
-  map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("back_odom/map", rclcpp::QoS(1));
+  map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+    "back_odom/map", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
   health_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
     "back_odom/health", rclcpp::QoS(10));
   lidar_debug_pub_ =
@@ -401,6 +442,11 @@ void BackOdomNode::match_pending_scan(const bool force)
   const ProcessorOutput prior = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
+  RCLCPP_DEBUG(
+    this->get_logger(),
+    "scan stages ms deskew %.2f voxel %.2f fpfh %.2f align %.2f cost %.2f refine %.2f map %.2f",
+    matched.deskew_ms, matched.voxel_ms, matched.fpfh_ms, matched.align_ms, matched.cost_ms,
+    matched.refine_ms, matched.map_ms);
   last_match_ = matched;
   has_last_match_ = true;
   publish_debug_odometry(matched, stamp);
@@ -710,11 +756,10 @@ void BackOdomNode::publish_path(const ProcessorOutput & output, const rclcpp::Ti
     }
     last_path_stamp_ = stamp;
     has_published_path_ = true;
+    path_.header.stamp = stamp;
+    path_.header.frame_id = parent_frame_;
+    path_pub_->publish(path_);
   }
-
-  path_.header.stamp = stamp;
-  path_.header.frame_id = parent_frame_;
-  path_pub_->publish(path_);
 }
 
 void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time & stamp)
@@ -732,7 +777,9 @@ void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time
 
 void BackOdomNode::publish_local_map(const rclcpp::Time & stamp)
 {
-  map_pub_->publish(to_annotated_pointcloud(stamp, parent_frame_, lidar_matcher_->annotated_local_map()));
+  const std::vector<LocalMapPoint> shown =
+    thin_for_display(lidar_matcher_->annotated_local_map(), 0.5);
+  map_pub_->publish(to_annotated_pointcloud(stamp, parent_frame_, shown));
 }
 
 void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp)

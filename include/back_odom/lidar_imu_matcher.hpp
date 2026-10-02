@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace back_odom
@@ -144,6 +145,13 @@ struct MatchResult
   Sophus::SE3d camera_pose{};
   double camera_cost{0.0};
   bool camera_passed{false};
+  double deskew_ms{0.0};
+  double voxel_ms{0.0};
+  double fpfh_ms{0.0};
+  double align_ms{0.0};
+  double cost_ms{0.0};
+  double refine_ms{0.0};
+  double map_ms{0.0};
 };
 
 struct LocalMapPoint
@@ -214,7 +222,11 @@ private:
   void freeze_oldest(const Sophus::SE3d & cull_pose);
   void rebuild_map(const Sophus::SE3d & cull_pose);
   [[nodiscard]] kiss_icp::PlaneAlignResult align(
-    const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations);
+    const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations,
+    double * robust_cost);
+  void note_map_edit();
+  std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> prepare_scan(
+    const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing);
   void remember_healthy(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, double stamp);
   void restore_healthy_speed(ImuProcessor & imu);
   void note_health(ImuProcessor & imu, HealthEvent event);
@@ -232,7 +244,7 @@ private:
   [[nodiscard]] Sophus::SE3d recovery_pose(double scan_end, const ImuProcessor & imu) const;
   [[nodiscard]] MatchCandidate score_alignment(
     const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess,
-    const Sophus::SE3d & imu_reference, bool check_imu_gate);
+    const Sophus::SE3d & imu_reference, bool check_imu_gate, MatchResult & timing);
   void finish_accepted_scan(
     MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
     double iterations, ImuProcessor & imu, double since_stamp, bool update_bias,
@@ -286,6 +298,12 @@ private:
   double last_healthy_stamp_{0.0};
   Eigen::Vector3d last_healthy_velocity_{Eigen::Vector3d::Zero()};
   double last_healthy_speed_{0.0};
+  std::uint64_t map_epoch_{1};
+  bool device_prepare_decided_{false};
+  bool device_front_use_{false};
+  bool device_align_decided_{false};
+  bool device_align_use_{false};
+  bool device_align_float_{false};
 };
 
 }  // namespace back_odom

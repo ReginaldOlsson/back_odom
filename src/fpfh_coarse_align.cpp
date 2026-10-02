@@ -14,6 +14,8 @@
 
 #include "back_odom/fpfh_coarse_align.hpp"
 
+#include "back_odom/device_accel.hpp"
+
 #include <Eigen/Geometry>
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 
@@ -24,8 +26,10 @@
 #include <pcl/point_types.h>
 #include <pcl/search/kdtree.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <random>
 #include <vector>
@@ -173,7 +177,18 @@ std::optional<DescribedCloud> describe(
   return described;
 }
 
-std::vector<int> nearest_gated(
+std::vector<float> pack_histograms(const pcl::PointCloud<pcl::FPFHSignature33> & cloud)
+{
+  std::vector<float> packed(cloud.size() * 33);
+  for (std::size_t index = 0; index < cloud.size(); ++index) {
+    for (int bin = 0; bin < k_histogram_bins; ++bin) {
+      packed[index * 33 + static_cast<std::size_t>(bin)] = cloud.points[index].histogram[bin];
+    }
+  }
+  return packed;
+}
+
+std::vector<int> nearest_gated_cpu(
   const DescribedCloud & query, const DescribedCloud & reference,
   const std::vector<Eigen::Vector3d> & query_in_map,
   const std::vector<Eigen::Vector3d> & reference_in_map, const double gate_squared,
@@ -205,6 +220,51 @@ std::vector<int> nearest_gated(
     matches[static_cast<std::size_t>(query_index)] = best_index;
   }
   return matches;
+}
+
+std::vector<int> nearest_gated(
+  const DescribedCloud & query, const DescribedCloud & reference,
+  const std::vector<Eigen::Vector3d> & query_in_map,
+  const std::vector<Eigen::Vector3d> & reference_in_map, const double gate_squared,
+  const int threads)
+{
+  static int device_mode = -1;
+  if (device_mode == 1 && query.features && reference.features) {
+    const std::vector<float> query_hist = pack_histograms(*query.features);
+    const std::vector<float> reference_hist = pack_histograms(*reference.features);
+    if (
+      const std::optional<std::vector<int>> device = device_histogram_matches(
+        query_hist.data(), static_cast<int>(query.points.size()), reference_hist.data(),
+        static_cast<int>(reference.points.size()), query_in_map, reference_in_map, gate_squared)) {
+      return *device;
+    }
+  }
+  const auto cpu_start = std::chrono::steady_clock::now();
+  const std::vector<int> cpu = nearest_gated_cpu(
+    query, reference, query_in_map, reference_in_map, gate_squared, threads);
+  if (device_mode >= 0 || !query.features || !reference.features || query.points.size() < 64) {
+    if (device_mode < 0) {
+      device_mode = 0;
+    }
+    return cpu;
+  }
+  const double cpu_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - cpu_start)
+                          .count();
+  const std::vector<float> query_hist = pack_histograms(*query.features);
+  const std::vector<float> reference_hist = pack_histograms(*reference.features);
+  (void)device_histogram_matches(
+    query_hist.data(), static_cast<int>(query.points.size()), reference_hist.data(),
+    static_cast<int>(reference.points.size()), query_in_map, reference_in_map, gate_squared);
+  const auto device_start = std::chrono::steady_clock::now();
+  const std::optional<std::vector<int>> device = device_histogram_matches(
+    query_hist.data(), static_cast<int>(query.points.size()), reference_hist.data(),
+    static_cast<int>(reference.points.size()), query_in_map, reference_in_map, gate_squared);
+  const double device_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - device_start)
+                             .count();
+  device_mode = device && *device == cpu && device_ms < cpu_ms ? 1 : 0;
+  return cpu;
 }
 
 std::vector<Correspondence> mutual_matches(
@@ -375,20 +435,39 @@ std::optional<Sophus::SE3d> solve_rigid(
 
 }  // namespace
 
+struct FpfhCoarseAlign::TargetCache
+{
+  DescribedCloud cloud;
+  std::vector<Eigen::Vector3d> points;
+  Eigen::Vector3d viewpoint{Eigen::Vector3d::Zero()};
+  std::uint64_t epoch{0};
+};
+
 FpfhCoarseAlign::FpfhCoarseAlign(const FpfhParams & params) : params_(params)
 {
 }
 
+FpfhCoarseAlign::~FpfhCoarseAlign() = default;
+
+bool FpfhCoarseAlign::target_cached(
+  const std::uint64_t map_epoch, const Eigen::Vector3d & viewpoint) const
+{
+  return map_epoch != 0 && target_cache_ && target_cache_->epoch == map_epoch &&
+         target_cache_->viewpoint == viewpoint;
+}
+
 std::optional<Sophus::SE3d> FpfhCoarseAlign::estimate(
   const std::vector<Eigen::Vector3d> & source_body, const std::vector<Eigen::Vector3d> & target_map,
-  const Sophus::SE3d & imu_guess) const
+  const Sophus::SE3d & imu_guess, const std::uint64_t map_epoch) const
 {
   if (!params_.enabled || params_.min_inliers < 3) {
     return std::nullopt;
   }
   const int threads = thread_count(params_.omp_threads);
   const std::vector<Eigen::Vector3d> source_points = keypoints(source_body, params_);
-  const std::vector<Eigen::Vector3d> target_points = keypoints(target_map, params_);
+  const bool cached = target_cached(map_epoch, imu_guess.translation());
+  const std::vector<Eigen::Vector3d> target_points =
+    cached ? target_cache_->points : keypoints(target_map, params_);
   if (
     static_cast<int>(source_points.size()) < params_.min_inliers ||
     static_cast<int>(target_points.size()) < params_.min_inliers) {
@@ -397,8 +476,23 @@ std::optional<Sophus::SE3d> FpfhCoarseAlign::estimate(
 
   const std::optional<DescribedCloud> source =
     describe(source_points, Eigen::Vector3d::Zero(), params_, threads);
-  const std::optional<DescribedCloud> target =
-    describe(target_points, imu_guess.translation(), params_, threads);
+  std::optional<DescribedCloud> target;
+  if (cached) {
+    target = target_cache_->cloud;
+  } else if (
+    target_cache_ && map_epoch == 0 && target_cache_->points == target_points &&
+    target_cache_->viewpoint == imu_guess.translation()) {
+    target = target_cache_->cloud;
+  } else {
+    target = describe(target_points, imu_guess.translation(), params_, threads);
+    if (target) {
+      target_cache_ = std::make_unique<TargetCache>();
+      target_cache_->cloud = *target;
+      target_cache_->points = target_points;
+      target_cache_->viewpoint = imu_guess.translation();
+      target_cache_->epoch = map_epoch;
+    }
+  }
   if (!source || !target) {
     return std::nullopt;
   }
