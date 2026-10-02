@@ -36,6 +36,22 @@ constexpr double k_max_gyro_bias_step = 0.002;
 constexpr double k_max_accel_bias_step = 0.05;
 constexpr double k_bias_leak = 0.01;
 
+Sophus::SE3d clamp_pose_to_insertion(Sophus::SE3d pose, const Sophus::SE3d & insertion)
+{
+  Eigen::Matrix<double, 6, 1> delta = (insertion.inverse() * pose).log();
+  const double translation = delta.head<3>().norm();
+  const double rotation = delta.tail<3>().norm();
+  constexpr double k_max_carry_translation = 0.15;
+  constexpr double k_max_carry_rotation = 0.05;
+  if (translation > k_max_carry_translation && translation > 1.0e-12) {
+    delta.head<3>() *= k_max_carry_translation / translation;
+  }
+  if (rotation > k_max_carry_rotation && rotation > 1.0e-12) {
+    delta.tail<3>() *= k_max_carry_rotation / rotation;
+  }
+  return insertion * Sophus::SE3d::exp(delta);
+}
+
 Eigen::Vector3d clamp_vector(const Eigen::Vector3d & value, const double limit)
 {
   const double norm = value.norm();
@@ -120,9 +136,13 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   if (params_.max_gyro_bias < 0.0 || params_.max_accel_bias < 0.0) {
     throw std::invalid_argument("bias magnitude limits must be non-negative");
   }
+  if (params_.max_longitudinal_correction < 0.0) {
+    throw std::invalid_argument("max longitudinal correction must be non-negative");
+  }
   if (
     params_.limits.max_speed < 0.0 || params_.limits.max_acceleration < 0.0 ||
-    params_.limits.max_yaw_rate < 0.0 || params_.limits.max_match_rejects < 1) {
+    params_.limits.max_yaw_rate < 0.0 || params_.limits.max_match_rejects < 1 ||
+    params_.refine_min_travel < 0.0) {
     throw std::invalid_argument("vehicle limits must be non-negative and allow one rejected scan");
   }
   if (!params_.fpfh.enabled) {
@@ -210,28 +230,202 @@ std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
   return map_.Pointcloud();
 }
 
-std::vector<StampedPose> LidarImuMatcher::visible_scan_poses() const
+std::vector<LocalMapPoint> LidarImuMatcher::annotated_local_map() const
 {
-  return {scan_poses_.cbegin(), scan_poses_.cend()};
-}
-
-void LidarImuMatcher::record_scan_pose(const Sophus::SE3d & pose, const double stamp)
-{
-  scan_poses_.push_back(StampedPose{stamp, pose});
-  const Sophus::SE3d & latest = scan_poses_.back().pose;
-  std::deque<StampedPose> kept;
-  for (const StampedPose & scan : scan_poses_) {
-    if (
-      scan_pose_inside_visible_cloud(
-        latest, scan.pose, params_.crop_longitudinal, params_.crop_lateral)) {
-      kept.push_back(scan);
+  const int settle_passes = std::max(1, params_.refine_settle_passes);
+  std::vector<LocalMapPoint> annotated;
+  annotated.reserve(visible_scan_point_count());
+  for (const HorizonScan & scan : horizon_) {
+    const bool frozen = scan.collective_passes >= settle_passes;
+    const float intensity = frozen ? 255.0F : 30.0F;
+    for (const Eigen::Vector3d & point : scan.points) {
+      LocalMapPoint annotated_point;
+      annotated_point.position = scan.pose * point;
+      annotated_point.intensity = intensity;
+      annotated_point.scan_id = static_cast<float>(scan.scan_id);
+      annotated_point.collective_passes = static_cast<float>(scan.collective_passes);
+      annotated.push_back(annotated_point);
     }
   }
-  constexpr std::size_t k_max_visible_scans = 1000;
-  while (kept.size() > k_max_visible_scans) {
+  return annotated;
+}
+
+std::vector<StampedPose> LidarImuMatcher::visible_scan_poses() const
+{
+  std::vector<StampedPose> poses;
+  poses.reserve(horizon_.size());
+  for (const HorizonScan & scan : horizon_) {
+    poses.push_back(StampedPose{scan.stamp, scan.pose});
+  }
+  return poses;
+}
+
+std::size_t LidarImuMatcher::visible_scan_point_count() const
+{
+  std::size_t count = 0;
+  for (const HorizonScan & scan : horizon_) {
+    count += scan.points.size();
+  }
+  return count;
+}
+
+void LidarImuMatcher::record_horizon_scan(
+  const Sophus::SE3d & pose, const double stamp, const std::vector<Eigen::Vector3d> & points,
+  const ImuProcessor & imu)
+{
+  HorizonScan scan;
+  scan.stamp = stamp;
+  scan.pose = pose;
+  scan.prior = pose;
+  scan.points = points;
+  scan.scan_id = next_scan_id_++;
+  if (!horizon_.empty()) {
+    const HorizonScan & previous = horizon_.back();
+    const std::vector<StampedPose> & trajectory = imu.trajectory();
+    if (!trajectory.empty() && previous.stamp + 1.0e-6 >= trajectory.front().stamp) {
+      scan.imu_from_previous =
+        imu.interpolate_pose(previous.stamp).inverse() * imu.interpolate_pose(stamp);
+    } else {
+      scan.imu_from_previous = previous.pose.inverse() * pose;
+    }
+  }
+  horizon_.push_back(std::move(scan));
+  const Sophus::SE3d & latest = horizon_.back().pose;
+  std::deque<HorizonScan> kept;
+  for (HorizonScan & stored : horizon_) {
+    const bool inside = scan_pose_inside_visible_cloud(
+      latest, stored.pose, half_longitudinal_, half_lateral_);
+    if (inside) {
+      kept.push_back(std::move(stored));
+    }
+  }
+  const std::size_t max_scans = static_cast<std::size_t>(std::max(1, params_.max_visible_scans));
+  while (kept.size() > max_scans) {
     kept.pop_front();
   }
-  scan_poses_ = std::move(kept);
+  horizon_ = std::move(kept);
+}
+
+bool LidarImuMatcher::refine_window_if_due(MatchResult & result, Sophus::SE3d & newest_pose)
+{
+  // Freezing each scan at its own pose painted the same building once per scan and stalled the callback.
+  if (!params_.refine_window || horizon_.size() < 3) {
+    return false;
+  }
+  if (
+    has_refined_ &&
+    (newest_pose.translation() - last_refine_position_).norm() < params_.refine_min_travel) {
+    return false;
+  }
+  std::vector<Sophus::SE3d> poses;
+  std::vector<Sophus::SE3d> priors;
+  std::vector<Sophus::SE3d> clamps;
+  std::vector<Sophus::SE3d> relatives;
+  std::vector<const std::vector<Eigen::Vector3d> *> clouds;
+  std::vector<std::uint8_t> adjustable;
+  poses.reserve(horizon_.size());
+  priors.reserve(horizon_.size());
+  clamps.reserve(horizon_.size());
+  relatives.reserve(horizon_.size());
+  clouds.reserve(horizon_.size());
+  adjustable.reserve(horizon_.size());
+  int settled = 0;
+  const int settle_passes = std::max(1, params_.refine_settle_passes);
+  for (const HorizonScan & scan : horizon_) {
+    poses.push_back(scan.pose);
+    priors.push_back(scan.pose);
+    clamps.push_back(scan.prior);
+    relatives.push_back(scan.imu_from_previous);
+    clouds.push_back(&scan.points);
+    const bool settled_scan = scan.collective_passes >= settle_passes;
+    adjustable.push_back(settled_scan ? 0 : 1);
+    if (settled_scan) {
+      ++settled;
+    }
+  }
+  if (settled == 0) {
+    adjustable.front() = 0;
+    horizon_.front().optimized = true;
+    horizon_.front().collective_passes = settle_passes;
+    settled = 1;
+  }
+  adjustable.back() = 0;
+  int active_ready = 0;
+  for (const std::uint8_t free : adjustable) {
+    active_ready += free;
+  }
+  if (active_ready == 0) {
+    has_refined_ = true;
+    last_refine_position_ = newest_pose.translation();
+    return false;
+  }
+  const Sophus::SE3d previous_before = horizon_[horizon_.size() - 2].pose;
+  ScanHorizonRefine refine;
+  refine.voxel_size = params_.voxel_size;
+  refine.max_correspondence_distance = params_.max_correspondence_distance;
+  refine.kernel_scale = params_.kernel_scale;
+  refine.max_points_per_voxel = static_cast<unsigned int>(params_.max_points_per_voxel);
+  refine_scan_horizon(poses, clouds, priors, relatives, refine, adjustable, clamps);
+  double largest = 0.0;
+  int active = 0;
+  for (std::size_t index = 0; index + 1 < horizon_.size(); ++index) {
+    if (adjustable[index] == 0) {
+      continue;
+    }
+    ++active;
+    largest = std::max(largest, (horizon_[index].pose.inverse() * poses[index]).translation().norm());
+    horizon_[index].pose = poses[index];
+    horizon_[index].optimized = true;
+    horizon_[index].collective_passes += 1;
+  }
+  const Sophus::SE3d carried = clamp_pose_to_insertion(
+    horizon_[horizon_.size() - 2].pose * previous_before.inverse() * newest_pose, horizon_.back().prior);
+  largest = std::max(largest, (newest_pose.inverse() * carried).translation().norm());
+  horizon_.back().pose = carried;
+  newest_pose = carried;
+  for (std::size_t index = 1; index < horizon_.size(); ++index) {
+    horizon_[index].imu_from_previous = horizon_[index - 1].pose.inverse() * horizon_[index].pose;
+  }
+  if (largest >= 0.01) {
+    rebuild_from_horizon(newest_pose);
+  }
+  has_refined_ = true;
+  last_refine_position_ = newest_pose.translation();
+  result.refined_window = true;
+  result.refine_shift = largest;
+  result.refine_scans = active;
+  result.refine_settled = settled;
+  return true;
+}
+
+void LidarImuMatcher::rebuild_from_horizon(const Sophus::SE3d & cull_pose)
+{
+  kiss_icp::VoxelHashMap rebuilt(
+    params_.voxel_size, map_.max_distance_, static_cast<unsigned int>(params_.max_points_per_voxel));
+  for (const HorizonScan & scan : horizon_) {
+    if (scan.points.empty()) {
+      continue;
+    }
+    std::vector<Eigen::Vector3d> world;
+    world.reserve(scan.points.size());
+    for (const Eigen::Vector3d & point : scan.points) {
+      world.push_back(scan.pose * point);
+    }
+    rebuilt.AddPoints(world);
+  }
+  if (rebuilt.Empty()) {
+    return;
+  }
+  cull_local_map(rebuilt, cull_pose);
+  if (rebuilt.Empty()) {
+    return;
+  }
+  map_ = std::move(rebuilt);
+}
+
+void LidarImuMatcher::cull_local_map(kiss_icp::VoxelHashMap & map, const Sophus::SE3d & pose) const
+{
+  map.RemovePointsOutsideBox(pose.inverse(), half_longitudinal_, half_lateral_);
 }
 
 MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
@@ -265,7 +459,7 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     last_correction_stamp_ = scan.stamp;
     last_correction_position_ = predicted.translation();
     rebuild_map(predicted);
-    record_scan_pose(predicted, scan_end);
+    record_horizon_scan(predicted, scan_end, map_points, imu);
     result.applied = true;
     result.inserted_scan = true;
     result.first_scan = true;
@@ -402,16 +596,21 @@ void LidarImuMatcher::finish_accepted_scan(
   const double iterations, ImuProcessor & imu, const double since_stamp, const bool update_bias,
   const std::optional<Eigen::Vector3d> & velocity_override)
 {
-  map_.Update(prepared.map_points, aligned_pose);
+  const Sophus::SE3d limited = limit_longitudinal_correction(
+    prepared.predicted, aligned_pose, params_.max_longitudinal_correction);
+  map_.Update(prepared.map_points, limited);
+  record_horizon_scan(limited, prepared.scan_end, prepared.map_points, imu);
   window_.push_back(
-    WindowScan{prepared.scan_end, std::move(prepared.map_points), std::move(prepared.source), aligned_pose});
+    WindowScan{prepared.scan_end, std::move(prepared.map_points), std::move(prepared.source), limited});
   while (static_cast<int>(window_.size()) > params_.backward_match_stride) {
     window_.pop_front();
   }
-  map_.RemovePointsOutsideBox(aligned_pose.inverse(), half_longitudinal_, half_lateral_);
-  record_scan_pose(aligned_pose, prepared.scan_end);
+  cull_local_map(map_, limited);
+  Sophus::SE3d committed = limited;
+  refine_window_if_due(result, committed);
+  window_.back().pose = committed;
 
-  const Sophus::SE3d vehicle_delta = prepared.predicted.inverse() * aligned_pose;
+  const Sophus::SE3d vehicle_delta = prepared.predicted.inverse() * committed;
   result.correction = window_.back().pose * prepared.predicted.inverse();
   result.translation_error = vehicle_delta.translation().norm();
   result.rotation_error = vehicle_delta.so3().log().norm();

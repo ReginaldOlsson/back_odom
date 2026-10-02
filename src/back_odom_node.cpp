@@ -96,9 +96,19 @@ visualization_msgs::msg::Marker make_arrow(
   return marker;
 }
 
-sensor_msgs::msg::PointCloud2 to_pointcloud(
+sensor_msgs::msg::PointField float_field(const std::string & name, const std::uint32_t offset)
+{
+  sensor_msgs::msg::PointField field;
+  field.name = name;
+  field.offset = offset;
+  field.datatype = sensor_msgs::msg::PointField::FLOAT32;
+  field.count = 1;
+  return field;
+}
+
+sensor_msgs::msg::PointCloud2 to_annotated_pointcloud(
   const rclcpp::Time & stamp, const std::string & frame_id,
-  const std::vector<Eigen::Vector3d> & points)
+  const std::vector<LocalMapPoint> & points)
 {
   sensor_msgs::msg::PointCloud2 cloud;
   cloud.header.stamp = stamp;
@@ -107,26 +117,22 @@ sensor_msgs::msg::PointCloud2 to_pointcloud(
   cloud.width = static_cast<std::uint32_t>(points.size());
   cloud.is_dense = true;
   cloud.is_bigendian = false;
-
-  sensor_msgs::msg::PointField field_x;
-  field_x.name = "x";
-  field_x.offset = 0;
-  field_x.datatype = sensor_msgs::msg::PointField::FLOAT32;
-  field_x.count = 1;
-  sensor_msgs::msg::PointField field_y = field_x;
-  field_y.name = "y";
-  field_y.offset = 4;
-  sensor_msgs::msg::PointField field_z = field_x;
-  field_z.name = "z";
-  field_z.offset = 8;
-  cloud.fields = {field_x, field_y, field_z};
-  cloud.point_step = 12;
+  cloud.fields = {
+    float_field("x", 0),
+    float_field("y", 4),
+    float_field("z", 8),
+    float_field("intensity", 12),
+    float_field("scan_id", 16),
+    float_field("collective_passes", 20)};
+  cloud.point_step = 24;
   cloud.row_step = cloud.point_step * cloud.width;
   cloud.data.resize(static_cast<std::size_t>(cloud.row_step));
   for (std::size_t index = 0; index < points.size(); ++index) {
-    const float values[3] = {
-      static_cast<float>(points[index].x()), static_cast<float>(points[index].y()),
-      static_cast<float>(points[index].z())};
+    const LocalMapPoint & point = points[index];
+    const float values[6] = {
+      static_cast<float>(point.position.x()), static_cast<float>(point.position.y()),
+      static_cast<float>(point.position.z()), point.intensity, point.scan_id,
+      point.collective_passes};
     std::memcpy(cloud.data.data() + index * cloud.point_step, values, sizeof(values));
   }
   return cloud;
@@ -164,7 +170,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("convergence_criterion", 1.0e-4);
   lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
+  lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
+  lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
+  lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
+  lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);
   lidar_params.fpfh.enabled = this->declare_parameter<bool>("fpfh_enabled", true);
   lidar_params.fpfh.keypoint_voxel = this->declare_parameter<double>("fpfh_keypoint_voxel", 1.5);
   lidar_params.fpfh.normal_radius = this->declare_parameter<double>("fpfh_normal_radius", 2.0);
@@ -178,6 +188,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
   lidar_params.speed_correction_gain =
     this->declare_parameter<double>("speed_correction_gain", 0.5);
+  lidar_params.max_longitudinal_correction =
+    this->declare_parameter<double>("max_longitudinal_correction", 0.15);
   lidar_params.max_gyro_bias = this->declare_parameter<double>("max_gyro_bias", 0.05);
   lidar_params.max_accel_bias = this->declare_parameter<double>("max_accel_bias", 1.0);
   lidar_params.limits.max_speed = this->declare_parameter<double>("max_speed", 20.0);
@@ -326,6 +338,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
     publish_tf(output, stamp);
   }
   publish_health(stamp);
+  match_pending_scan(false);
 }
 
 void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
@@ -353,6 +366,38 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
   }
   lidar_matcher_->set_body_from_lidar(base_from_lidar);
   const rclcpp::Time stamp(msg->header.stamp);
+  if (pending_scan_.has_value()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Matching a lidar scan before IMU reached its last point.");
+    match_pending_scan(true);
+  }
+  pending_scan_ = PendingScan{std::move(scan), stamp, source_frame};
+  match_pending_scan(false);
+}
+
+void BackOdomNode::match_pending_scan(const bool force)
+{
+  if (!pending_scan_.has_value() || !aligned_ || !imu_processor_->aligned()) {
+    return;
+  }
+  const double scan_end =
+    *std::max_element(pending_scan_->scan.timestamps.cbegin(), pending_scan_->scan.timestamps.cend());
+  const double imu_stamp = imu_processor_->latest_stamp();
+  if (!force && imu_stamp + 1.0e-3 < scan_end) {
+    if (scan_end - imu_stamp > 0.25) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Lidar scan end is %.3f s ahead of the newest IMU. Matching with the IMU pose in hand.",
+        scan_end - imu_stamp);
+    } else {
+      return;
+    }
+  }
+  PendingScan pending = std::move(*pending_scan_);
+  pending_scan_.reset();
+  LidarScan scan = std::move(pending.scan);
+  const rclcpp::Time stamp = pending.header_stamp;
   const ProcessorOutput prior = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
@@ -380,6 +425,11 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
       "translation %.3f m, rotation %.4f rad, health %s",
       matched.used_visual_guess ? "camera" : "lidar", matched.lidar_cost, matched.camera_cost,
       matched.translation_error, matched.rotation_error, health_name(matched.health));
+  }
+  if (matched.refined_window) {
+    RCLCPP_INFO(
+      this->get_logger(),       "Refined %d scan poses, %d already settled. largest shift %.3f m",
+      matched.refine_scans, matched.refine_settled, matched.refine_shift);
   }
   publish_odometry(imu_odom_pub_, prior, stamp);
   const ProcessorOutput corrected = imu_processor_->output_at(
@@ -591,10 +641,30 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     scan.timestamps.push_back(time);
     max_abs_time = std::max(max_abs_time, std::abs(time));
   }
+  const double header = scan.stamp;
+  bool near_header = true;
+  for (const double time : scan.timestamps) {
+    if (std::abs(time - header) > 0.25) {
+      near_header = false;
+      break;
+    }
+  }
+  if (near_header) {
+    return scan;
+  }
   if (max_abs_time < 1000.0) {
     for (double & time : scan.timestamps) {
-      time += scan.stamp;
+      time += header;
     }
+    return scan;
+  }
+  RCLCPP_WARN_THROTTLE(
+    this->get_logger(), *this->get_clock(), 5000,
+    "Lidar point times are not on the IMU clock (%.3f s vs header %.3f s). "
+    "The sweep is posed at the cloud header, so forward motion during the scan is not removed.",
+    scan.timestamps.front(), header);
+  for (double & time : scan.timestamps) {
+    time = header;
   }
   return scan;
 }
@@ -662,7 +732,7 @@ void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time
 
 void BackOdomNode::publish_local_map(const rclcpp::Time & stamp)
 {
-  map_pub_->publish(to_pointcloud(stamp, parent_frame_, lidar_matcher_->local_map()));
+  map_pub_->publish(to_annotated_pointcloud(stamp, parent_frame_, lidar_matcher_->annotated_local_map()));
 }
 
 void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp)

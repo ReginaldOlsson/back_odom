@@ -32,6 +32,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -47,6 +48,7 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void match_pending_scan(bool force);
   void callback_visual(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void publish_health(const rclcpp::Time & stamp);
   void publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp);
@@ -93,6 +95,13 @@ private:
   rclcpp::Time last_path_stamp_{0, 0, RCL_ROS_TIME};
   bool has_published_path_{false};
   bool aligned_{false};
+  struct PendingScan
+  {
+    LidarScan scan;
+    rclcpp::Time header_stamp;
+    std::string source_frame;
+  };
+  std::optional<PendingScan> pending_scan_;
 
   std::string parent_frame_;
   std::string child_frame_;

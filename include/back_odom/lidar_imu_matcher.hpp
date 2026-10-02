@@ -25,7 +25,9 @@
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
 #include <sophus/se3.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <optional>
 #include <vector>
@@ -45,6 +47,8 @@ struct LidarMatchParams
   double voxel_size{0.5};
   double crop_longitudinal{75.0};
   double crop_lateral{50.0};
+  /// Scan copies kept for the debug cloud. The live map is still the cropped ICP cloud.
+  int max_visible_scans{120};
   double max_correspondence_distance{2.0};
   double kernel_scale{0.5};
   double convergence_criterion{1.0e-4};
@@ -52,11 +56,19 @@ struct LidarMatchParams
   int max_points_per_voxel{20};
   /// Recent scans kept with their lidar poses. The live map is updated in place.
   int backward_match_stride{4};
+  /// Off on the live path: freezing each scan into the map duplicates a building once per pose.
+  bool refine_window{false};
+  double refine_min_travel{2.0};
+  /// After this many collective passes a scan is trusted and left out of later solves.
+  int refine_settle_passes{2};
   // Fraction of the vehicle-frame residual turned into a bias step each accepted scan.
   double gyro_bias_gain{0.1};
   double accel_bias_gain{0.02};
   // How much of the speed comes from the lidar displacement. Direction stays with the IMU.
   double speed_correction_gain{0.5};
+  /// ICP may nudge the IMU step by at most this many metres along the vehicle.
+  /// Lateral shift and yaw stay with the lidar match.
+  double max_longitudinal_correction{0.15};
   double max_gyro_bias{0.05};
   double max_accel_bias{1.0};
   VehicleLimits limits{};
@@ -71,6 +83,20 @@ struct LidarMatchParams
 {
   const Eigen::Vector3d local = latest.inverse() * scan.translation();
   return std::abs(local.x()) <= longitudinal && std::abs(local.y()) <= lateral;
+}
+
+/// The road does not observe forward motion, so a match may only nudge the IMU step along the vehicle.
+[[nodiscard]] inline Sophus::SE3d limit_longitudinal_correction(
+  const Sophus::SE3d & predicted, const Sophus::SE3d & aligned, const double max_forward)
+{
+  if (!(max_forward >= 0.0) || !std::isfinite(max_forward)) {
+    return aligned;
+  }
+  Sophus::SE3d body = predicted.inverse() * aligned;
+  Eigen::Vector3d translation = body.translation();
+  translation.x() = std::clamp(translation.x(), -max_forward, max_forward);
+  body.translation() = translation;
+  return predicted * body;
 }
 
 /// Velocity and bias step implied by one accepted ICP residual.
@@ -110,10 +136,22 @@ struct MatchResult
   Sophus::SE3d lidar_pose{};
   double lidar_cost{0.0};
   bool lidar_passed{false};
+  bool refined_window{false};
+  double refine_shift{0.0};
+  int refine_scans{0};
+  int refine_settled{0};
   bool has_camera_debug{false};
   Sophus::SE3d camera_pose{};
   double camera_cost{0.0};
   bool camera_passed{false};
+};
+
+struct LocalMapPoint
+{
+  Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+  float intensity{30.0F};
+  float scan_id{0.0F};
+  float collective_passes{0.0F};
 };
 
 class LidarImuMatcher
@@ -123,8 +161,11 @@ public:
 
   [[nodiscard]] bool has_reference() const;
   [[nodiscard]] std::vector<Eigen::Vector3d> local_map() const;
+  /// Horizon points in the map frame, with scan id and collective-pass count for RViz.
+  [[nodiscard]] std::vector<LocalMapPoint> annotated_local_map() const;
   /// Lidar poses of scans whose points can still lie in the cropped cloud.
   [[nodiscard]] std::vector<StampedPose> visible_scan_poses() const;
+  [[nodiscard]] std::size_t visible_scan_point_count() const;
 
   /// Static pose of the lidar in the integrator frame. Identity until tf_static provides it.
   void set_body_from_lidar(const Sophus::SE3d & body_from_lidar);
@@ -197,7 +238,12 @@ private:
     double iterations, ImuProcessor & imu, double since_stamp, bool update_bias,
     const std::optional<Eigen::Vector3d> & velocity_override);
   void update_scale(const Sophus::SE3d & lidar_pose, double stamp);
-  void record_scan_pose(const Sophus::SE3d & pose, double stamp);
+  void record_horizon_scan(
+    const Sophus::SE3d & pose, double stamp, const std::vector<Eigen::Vector3d> & points,
+    const ImuProcessor & imu);
+  bool refine_window_if_due(MatchResult & result, Sophus::SE3d & newest_pose);
+  void rebuild_from_horizon(const Sophus::SE3d & cull_pose);
+  void cull_local_map(kiss_icp::VoxelHashMap & map, const Sophus::SE3d & pose) const;
 
   Sophus::SE3d body_from_lidar_{};
   LidarMatchParams params_;
@@ -207,8 +253,23 @@ private:
   kiss_icp::VoxelHashMap frozen_;
   kiss_icp::Registration registration_;
   FpfhCoarseAlign fpfh_;
+  struct HorizonScan
+  {
+    double stamp{0.0};
+    Sophus::SE3d pose{};
+    Sophus::SE3d prior{};
+    Sophus::SE3d imu_from_previous{};
+    std::vector<Eigen::Vector3d> points;
+    bool optimized{false};
+    int collective_passes{0};
+    std::uint32_t scan_id{0};
+  };
+
   std::deque<WindowScan> window_;
-  std::deque<StampedPose> scan_poses_;
+  std::deque<HorizonScan> horizon_;
+  std::uint32_t next_scan_id_{0};
+  bool has_refined_{false};
+  Eigen::Vector3d last_refine_position_{Eigen::Vector3d::Zero()};
   bool has_reference_{false};
   double last_correction_stamp_{0.0};
   Eigen::Vector3d last_correction_position_{Eigen::Vector3d::Zero()};

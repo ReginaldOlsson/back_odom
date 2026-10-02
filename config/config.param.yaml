@@ -17,6 +17,8 @@
     path_max_poses: 1000
     time_field: "time"
     voxel_size: 0.5
+    # Full length and width of the ICP cloud, centered on the vehicle.
+    # 20 x 20 keeps ±10 m. The scan list uses the same box.
     crop_longitudinal: 50.0
     crop_lateral: 50.0
     max_correspondence_distance: 2.0
@@ -24,12 +26,18 @@
     convergence_criterion: 0.0001
     max_iterations: 50
     max_points_per_voxel: 7
+    max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
+    # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
+    refine_window: true
+    refine_settle_passes: 2
     # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
     speed_correction_gain: 0.5
+    # Lidar keeps lateral shift and yaw. Forward motion stays with the IMU inside this band.
+    max_longitudinal_correction: 0.15
     max_gyro_bias: 0.05
     max_accel_bias: 1.0
     fpfh_enabled: true

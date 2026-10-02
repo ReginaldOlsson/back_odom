@@ -30,11 +30,5 @@
   </node>
 
   <!-- The tracker lives in the DPVO virtualenv, so it is not a colcon executable. -->
-  <executable
-    if="$(var launch_visual_odom)"
-    cmd="$(var dpvo_root)/.venv/bin/python $(var dpvo_root)/scripts/dpvo_node.py --ros-args -p use_sim_time:=$(var use_sim_time) -p image_topic:=$(var image_topic) -p info_topic:=$(var camera_info_topic) -p odom_topic:=$(var visual_odom_topic) -p path_topic:=$(var visual_odom_topic)/path -p network:=$(var dpvo_root)/dpvo.pth -p config:=$(var dpvo_root)/config/default.yaml -p scale:=0.5 -p stride:=3"
-    cwd="$(var dpvo_root)"
-    name="dpvo_node"
-    output="screen"
-  />
+
 </launch>

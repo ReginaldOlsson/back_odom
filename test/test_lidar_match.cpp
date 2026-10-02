@@ -471,14 +471,130 @@ TEST(ScanPoses, each_accepted_scan_keeps_its_lidar_pose)
   ImuProcessor imu = aligned_imu();
   LidarImuMatcher matcher(match_params());
   ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
+  const std::size_t first_points = matcher.visible_scan_point_count();
+  ASSERT_GT(first_points, 0U);
   imu.reset_state(
     Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0)), Eigen::Vector3d::Zero(),
     imu.latest_stamp());
   ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).applied);
   const std::vector<StampedPose> poses = matcher.visible_scan_poses();
   ASSERT_EQ(poses.size(), 2U);
+  EXPECT_GT(matcher.visible_scan_point_count(), first_points);
   EXPECT_NEAR(poses.front().pose.translation().x(), 0.0, 0.15);
   EXPECT_NEAR(poses.back().pose.translation().x(), 0.0, 0.15);
+}
+
+TEST(ScanPoses, map_points_carry_scan_id_and_collective_pass_count)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarImuMatcher matcher(match_params());
+  ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
+  const std::vector<LocalMapPoint> first = matcher.annotated_local_map();
+  ASSERT_FALSE(first.empty());
+  EXPECT_FLOAT_EQ(first.front().scan_id, 0.0F);
+  EXPECT_FLOAT_EQ(first.front().collective_passes, 0.0F);
+  EXPECT_FLOAT_EQ(first.front().intensity, 30.0F);
+  imu.reset_state(
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0)), Eigen::Vector3d::Zero(),
+    imu.latest_stamp());
+  ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).applied);
+  bool saw_first = false;
+  bool saw_second = false;
+  for (const LocalMapPoint & point : matcher.annotated_local_map()) {
+    saw_first = saw_first || point.scan_id == 0.0F;
+    saw_second = saw_second || point.scan_id == 1.0F;
+    EXPECT_FLOAT_EQ(point.collective_passes, 0.0F);
+    EXPECT_FLOAT_EQ(point.intensity, 30.0F);
+  }
+  EXPECT_TRUE(saw_first);
+  EXPECT_TRUE(saw_second);
+}
+
+TEST(ScanPoses, the_scan_list_drops_the_oldest_past_the_cap)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarMatchParams params = match_params();
+  params.max_visible_scans = 2;
+  LidarImuMatcher matcher(params);
+  ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
+  for (int step = 0; step < 2; ++step) {
+    imu.reset_state(
+      Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0)), Eigen::Vector3d::Zero(),
+      imu.latest_stamp());
+    ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).applied);
+  }
+  EXPECT_EQ(matcher.visible_scan_poses().size(), 2U);
+}
+
+TEST(ScanHorizon, older_scan_moves_toward_the_pinned_newest_pose)
+{
+  const std::vector<Eigen::Vector3d> cloud = corner_scan(0.0).points;
+  std::vector<Sophus::SE3d> poses{
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.04, 0.0, 0.0)), Sophus::SE3d()};
+  const std::vector<Sophus::SE3d> priors = poses;
+  const std::vector<Sophus::SE3d> relatives{Sophus::SE3d(), Sophus::SE3d()};
+  const std::vector<const std::vector<Eigen::Vector3d> *> points{&cloud, &cloud};
+  ScanHorizonRefine params;
+  params.voxel_size = 0.5;
+  params.outer_iterations = 3;
+  params.inner_iterations = 4;
+  params.max_query_points = 2000;
+  refine_scan_horizon(poses, points, priors, relatives, params, {});
+  EXPECT_NEAR(poses[1].translation().norm(), 0.0, 1.0e-12);
+  EXPECT_LT(poses[0].translation().x(), 0.035);
+  EXPECT_GT(poses[0].translation().x(), 0.0);
+  EXPECT_NEAR(poses[0].translation().y(), 0.0, 0.02);
+  EXPECT_NEAR(poses[0].translation().z(), 0.0, 0.02);
+}
+
+TEST(ScanHorizon, settled_scan_stays_put_while_its_points_remain_a_reference)
+{
+  const std::vector<Eigen::Vector3d> cloud = corner_scan(0.0).points;
+  const Sophus::SE3d shifted(Sophus::SO3d(), Eigen::Vector3d(0.04, 0.0, 0.0));
+  std::vector<Sophus::SE3d> poses{shifted, Sophus::SE3d()};
+  const std::vector<Sophus::SE3d> priors = poses;
+  const std::vector<Sophus::SE3d> relatives{Sophus::SE3d(), Sophus::SE3d()};
+  const std::vector<const std::vector<Eigen::Vector3d> *> points{&cloud, &cloud};
+  ScanHorizonRefine params;
+  params.voxel_size = 0.5;
+  params.outer_iterations = 3;
+  params.inner_iterations = 4;
+  refine_scan_horizon(poses, points, priors, relatives, params, {0, 0});
+  EXPECT_NEAR(poses[0].translation().x(), 0.04, 1.0e-12);
+  EXPECT_NEAR(poses[1].translation().norm(), 0.0, 1.0e-12);
+}
+
+TEST(ScanHorizon, current_pose_takes_the_error_against_the_settled_scan)
+{
+  const std::vector<Eigen::Vector3d> cloud = corner_scan(0.0).points;
+  std::vector<Sophus::SE3d> poses{
+    Sophus::SE3d(), Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.04, 0.0, 0.0))};
+  const std::vector<Sophus::SE3d> priors = poses;
+  const std::vector<Sophus::SE3d> relatives{Sophus::SE3d(), Sophus::SE3d()};
+  const std::vector<const std::vector<Eigen::Vector3d> *> points{&cloud, &cloud};
+  ScanHorizonRefine params;
+  params.voxel_size = 0.5;
+  params.outer_iterations = 3;
+  params.inner_iterations = 4;
+  params.max_query_points = 2000;
+  refine_scan_horizon(poses, points, priors, relatives, params, {0, 1});
+  EXPECT_NEAR(poses[0].translation().norm(), 0.0, 1.0e-12);
+  EXPECT_LT(poses[1].translation().x(), 0.02);
+  EXPECT_GT(poses[1].translation().x(), -0.01);
+}
+
+TEST(LidarMatch, forward_slide_is_limited_and_lateral_shift_is_kept)
+{
+  const Sophus::SO3d yaw = Sophus::SO3d::rotZ(1.5707963267948966);
+  const Sophus::SE3d predicted(yaw, Eigen::Vector3d(4.0, -2.0, 0.5));
+  const Sophus::SE3d aligned =
+    predicted * Sophus::SE3d(Sophus::SO3d::rotZ(0.04), Eigen::Vector3d(0.8, 0.3, -0.05));
+  const Sophus::SE3d limited = limit_longitudinal_correction(predicted, aligned, 0.15);
+  const Sophus::SE3d body = predicted.inverse() * limited;
+  EXPECT_NEAR(body.translation().x(), 0.15, 1.0e-9);
+  EXPECT_NEAR(body.translation().y(), 0.3, 1.0e-9);
+  EXPECT_NEAR(body.translation().z(), -0.05, 1.0e-9);
+  EXPECT_NEAR(body.so3().log().norm(), 0.04, 1.0e-9);
 }
 
 TEST(MatchSelection, lower_plane_residual_wins_until_its_gate_fails)
