@@ -11,22 +11,16 @@ find_package(OpenMP REQUIRED)
 
 option(BACK_ODOM_ENABLE_SIMD "Compile host code with native SIMD (AVX2/FMA via -march=native)" ON)
 if(BACK_ODOM_ENABLE_SIMD)
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-    # Keep Eigen's public ABI at 16-byte alignment so we can link against kiss_icp /
-    # other deps built without -march=native. Vector math can still use AVX2; only
-    # over-aligned Eigen fixed-size members stay ABI-compatible.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64)$")
     set(BACK_ODOM_SIMD_FLAGS -march=native -mtune=native)
-    set(BACK_ODOM_SIMD_DEFINES EIGEN_MAX_ALIGN_BYTES=16 EIGEN_MAX_STATIC_ALIGN_BYTES=16)
-  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set(BACK_ODOM_SIMD_FLAGS -march=native -mtune=native)
-    set(BACK_ODOM_SIMD_DEFINES)
   else()
     set(BACK_ODOM_SIMD_FLAGS)
-    set(BACK_ODOM_SIMD_DEFINES)
     message(WARNING "BACK_ODOM_ENABLE_SIMD is ON but no SIMD flags are known for ${CMAKE_SYSTEM_PROCESSOR}")
   endif()
+  # Match kiss_icp_cpp's 32-byte Eigen ABI (required when both enable AVX).
+  set(BACK_ODOM_SIMD_DEFINES EIGEN_MAX_ALIGN_BYTES=32 EIGEN_MAX_STATIC_ALIGN_BYTES=32)
   if(BACK_ODOM_SIMD_FLAGS)
-    message(STATUS "back_odom SIMD enabled: ${BACK_ODOM_SIMD_FLAGS}")
+    message(STATUS "back_odom SIMD enabled: ${BACK_ODOM_SIMD_FLAGS}; Eigen align=32")
   endif()
 endif()
 
