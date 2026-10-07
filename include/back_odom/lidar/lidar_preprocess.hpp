@@ -27,6 +27,27 @@ namespace back_odom
 [[nodiscard]] std::vector<Eigen::Vector3d> crop_lidar_box(
   const std::vector<Eigen::Vector3d> & points, double half_longitudinal, double half_lateral);
 
+struct IntensityCloud
+{
+  std::vector<Eigen::Vector3d> points;
+  std::vector<float> intensities;
+};
+
+/// Same box crop as `crop_lidar_box`, keeping each point's intensity.
+[[nodiscard]] IntensityCloud crop_lidar_box(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  double half_longitudinal, double half_lateral);
+
+/// First-point voxel downsample matching kiss_icp::VoxelDownsample, with intensities.
+[[nodiscard]] IntensityCloud voxel_downsample_with_intensity(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  double voxel_size);
+
+/// Intensity of the first cropped point that occupies each downsampled point's voxel.
+[[nodiscard]] std::vector<float> intensities_for_downsampled(
+  const std::vector<Eigen::Vector3d> & cropped, const std::vector<float> & cropped_intensities,
+  const std::vector<Eigen::Vector3d> & downsampled, double voxel_size);
+
 /// Put each lidar point in the integrator frame with `body_from_lidar`, then move it from its
 /// timestamp to the scan-end pose. The trajectory and the extrinsic must share that frame.
 [[nodiscard]] std::vector<Eigen::Vector3d> deskew_to_scan_end(

@@ -14,13 +14,16 @@
 
 #include "back_odom/lidar/lidar_preprocess.hpp"
 
+#include <kiss_icp_cpp/core/VoxelUtils.hpp>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tsl/robin_map.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 
 namespace back_odom
 {
@@ -90,6 +93,80 @@ std::vector<Eigen::Vector3d> crop_lidar_box(
     }
   });
   return cropped;
+}
+
+IntensityCloud crop_lidar_box(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  const double half_longitudinal, const double half_lateral)
+{
+  IntensityCloud cropped;
+  cropped.points.reserve(points.size());
+  cropped.intensities.reserve(points.size());
+  const bool have_intensity = intensities.size() == points.size();
+  for (std::size_t index = 0; index < points.size(); ++index) {
+    const Eigen::Vector3d & point = points[index];
+    if (std::abs(point.x()) > half_longitudinal || std::abs(point.y()) > half_lateral) {
+      continue;
+    }
+    cropped.points.push_back(point);
+    cropped.intensities.push_back(have_intensity ? intensities[index] : 0.0F);
+  }
+  return cropped;
+}
+
+IntensityCloud voxel_downsample_with_intensity(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  const double voxel_size)
+{
+  IntensityCloud downsampled;
+  if (points.empty() || !(voxel_size > 0.0)) {
+    return downsampled;
+  }
+  const bool have_intensity = intensities.size() == points.size();
+  tsl::robin_map<kiss_icp::Voxel, std::pair<Eigen::Vector3d, float>> grid;
+  grid.reserve(points.size());
+  for (std::size_t index = 0; index < points.size(); ++index) {
+    const kiss_icp::Voxel voxel = kiss_icp::PointToVoxel(points[index], voxel_size);
+    if (grid.contains(voxel)) {
+      continue;
+    }
+    grid.insert(
+      {voxel, {points[index], have_intensity ? intensities[index] : 0.0F}});
+  }
+  downsampled.points.reserve(grid.size());
+  downsampled.intensities.reserve(grid.size());
+  for (const auto & item : grid) {
+    downsampled.points.push_back(item.second.first);
+    downsampled.intensities.push_back(item.second.second);
+  }
+  return downsampled;
+}
+
+std::vector<float> intensities_for_downsampled(
+  const std::vector<Eigen::Vector3d> & cropped, const std::vector<float> & cropped_intensities,
+  const std::vector<Eigen::Vector3d> & downsampled, const double voxel_size)
+{
+  std::vector<float> intensities(downsampled.size(), 0.0F);
+  if (cropped.empty() || downsampled.empty() || !(voxel_size > 0.0)) {
+    return intensities;
+  }
+  const bool have_intensity = cropped_intensities.size() == cropped.size();
+  tsl::robin_map<kiss_icp::Voxel, float> grid;
+  grid.reserve(cropped.size());
+  for (std::size_t index = 0; index < cropped.size(); ++index) {
+    const kiss_icp::Voxel voxel = kiss_icp::PointToVoxel(cropped[index], voxel_size);
+    if (grid.contains(voxel)) {
+      continue;
+    }
+    grid.insert({voxel, have_intensity ? cropped_intensities[index] : 0.0F});
+  }
+  for (std::size_t index = 0; index < downsampled.size(); ++index) {
+    const auto found = grid.find(kiss_icp::PointToVoxel(downsampled[index], voxel_size));
+    if (found != grid.end()) {
+      intensities[index] = found->second;
+    }
+  }
+  return intensities;
 }
 
 std::vector<Eigen::Vector3d> deskew_to_scan_end(

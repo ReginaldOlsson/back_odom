@@ -40,6 +40,13 @@ struct ProcessorParams
   double max_dt{0.1};
   double max_speed{20.0};
   double max_acceleration{5.0};
+  /// Seconds of integrated IMU poses kept for lidar deskew/pairing. Must stay large enough
+  /// that a slow ICP still finds the pose nearest the scan time.
+  double trajectory_horizon{30.0};
+  /// Hard cap on buffered poses (e.g. ~200 Hz × 30 s). Oldest samples drop first.
+  std::size_t max_trajectory_poses{20000};
+  /// Max |t_imu - t_scan| when pairing a lidar scan to the IMU buffer.
+  double max_pair_dt{0.05};
 };
 
 enum class ProcessorPhase { Collecting, Tracking };

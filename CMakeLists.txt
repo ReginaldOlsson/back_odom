@@ -64,6 +64,7 @@ ament_export_dependencies(Sophus)
 ament_auto_add_library(lidar_imu_matcher SHARED
   src/lidar/lidar_preprocess.cpp
   src/lidar/lidar_imu_matcher.cpp
+  src/lidar/ndt_health.cpp
   src/lidar/scan_window.cpp
 )
 target_link_libraries(

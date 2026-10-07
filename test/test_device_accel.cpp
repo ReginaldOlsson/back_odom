@@ -193,7 +193,7 @@ TEST(DeviceAccel, plane_align_stays_within_one_millimetre)
     GTEST_SKIP() << "CUDA is not available";
   }
   const std::vector<Eigen::Vector3d> points = scene_points();
-  kiss_icp::VoxelHashMap map(0.5, 1.0e6, 7);
+  kiss_icp::VoxelHashMap map(0.5, 1.0e6, 20);
   map.AddPoints(points);
   std::vector<Eigen::Vector3d> frame;
   frame.reserve(points.size() / 2);

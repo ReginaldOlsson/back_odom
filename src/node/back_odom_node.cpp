@@ -205,6 +205,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("stationary_accel_dev_thresh", 0.5);
   const double gravity = this->declare_parameter<double>("gravity", 9.81);
   const double max_dt = this->declare_parameter<double>("max_dt", 0.1);
+  const double imu_trajectory_horizon =
+    this->declare_parameter<double>("imu_trajectory_horizon", 30.0);
+  const int imu_max_trajectory_poses =
+    this->declare_parameter<int>("imu_max_trajectory_poses", 20000);
+  imu_max_pair_dt_ = this->declare_parameter<double>("imu_max_pair_dt", 0.05);
   path_min_dt_ = this->declare_parameter<double>("path_min_dt", 0.1);
   const int path_max_poses = this->declare_parameter<int>("path_max_poses", 1000);
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
@@ -218,12 +223,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.convergence_criterion =
     this->declare_parameter<double>("convergence_criterion", 1.0e-4);
   lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
+  lidar_params.align_rate_hz = this->declare_parameter<double>("align_rate_hz", 10.0);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
   lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
   lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
   lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
   lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);
+  lidar_params.apply_imu_correction =
+    this->declare_parameter<bool>("apply_imu_correction", false);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
   lidar_params.speed_correction_gain =
@@ -236,11 +244,25 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.limits.max_acceleration = this->declare_parameter<double>("max_acceleration", 5.0);
   lidar_params.limits.max_yaw_rate = this->declare_parameter<double>("max_yaw_rate", 1.0);
   lidar_params.limits.max_match_rejects = this->declare_parameter<int>("max_match_rejects", 5);
+  lidar_params.max_ndt_cost = this->declare_parameter<double>("max_ndt_cost", 7.81);
+  lidar_params.ndt_cov_regularization =
+    this->declare_parameter<double>("ndt_cov_regularization", 1.0e-3);
+  lidar_params.min_ndt_correspondences =
+    this->declare_parameter<int>("min_ndt_correspondences", 20);
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
   }
   if (path_max_poses <= 0) {
     throw std::invalid_argument("path_max_poses must be positive");
+  }
+  if (imu_max_trajectory_poses < 2) {
+    throw std::invalid_argument("imu_max_trajectory_poses must be at least 2");
+  }
+  if (!(imu_trajectory_horizon > 0.0) || !std::isfinite(imu_trajectory_horizon)) {
+    throw std::invalid_argument("imu_trajectory_horizon must be positive and finite");
+  }
+  if (!(imu_max_pair_dt_ > 0.0) || !std::isfinite(imu_max_pair_dt_)) {
+    throw std::invalid_argument("imu_max_pair_dt must be positive and finite");
   }
 
   alignment_sample_count_ = static_cast<std::size_t>(alignment_sample_count);
@@ -254,6 +276,9 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   params.max_dt = max_dt;
   params.max_speed = lidar_params.limits.max_speed;
   params.max_acceleration = lidar_params.limits.max_acceleration;
+  params.trajectory_horizon = imu_trajectory_horizon;
+  params.max_trajectory_poses = static_cast<std::size_t>(imu_max_trajectory_poses);
+  params.max_pair_dt = imu_max_pair_dt_;
   imu_processor_ = std::make_unique<ImuProcessor>(params);
   lidar_matcher_ = std::make_unique<LidarImuMatcher>(lidar_params);
 
@@ -415,6 +440,8 @@ void BackOdomNode::match_pending_scan(const bool force)
   if (!pending_scan_.has_value() || !aligned_ || !imu_processor_->aligned()) {
     return;
   }
+  const double scan_start = *std::min_element(
+    pending_scan_->scan.timestamps.cbegin(), pending_scan_->scan.timestamps.cend());
   const double scan_end =
     *std::max_element(pending_scan_->scan.timestamps.cbegin(), pending_scan_->scan.timestamps.cend());
   const double imu_stamp = imu_processor_->latest_stamp();
@@ -428,18 +455,47 @@ void BackOdomNode::match_pending_scan(const bool force)
       return;
     }
   }
+  // Pair against the closest buffered IMU sample, not the live tip. A slow ICP must still
+  // recover the pose nearest the scan time from the long trajectory buffer.
+  const StampedPose closest_end = imu_processor_->closest_pose(scan_end);
+  const double pair_dt = std::abs(closest_end.stamp - scan_end);
+  if (!force && pair_dt > imu_max_pair_dt_) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Waiting for IMU near scan end. closest dt %.3f s (limit %.3f s), scan_end %.3f, closest %.3f",
+      pair_dt, imu_max_pair_dt_, scan_end, closest_end.stamp);
+    return;
+  }
+  if (
+    !imu_processor_->trajectory().empty() &&
+    imu_processor_->trajectory().front().stamp > scan_start + imu_max_pair_dt_) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "IMU buffer no longer covers scan start (buffer front %.3f, scan_start %.3f). "
+      "Increase imu_trajectory_horizon.",
+      imu_processor_->trajectory().front().stamp, scan_start);
+    if (!force) {
+      pending_scan_.reset();
+      return;
+    }
+  }
   PendingScan pending = std::move(*pending_scan_);
   pending_scan_.reset();
   LidarScan scan = std::move(pending.scan);
   const rclcpp::Time stamp = pending.header_stamp;
   const ProcessorOutput prior = imu_processor_->output_at(
     ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
+  RCLCPP_DEBUG(
+    this->get_logger(),
+    "Pairing lidar scan_end %.3f with closest IMU %.3f (dt %.4f s), buffer [%.3f, %.3f] n=%zu",
+    scan_end, closest_end.stamp, pair_dt, imu_processor_->trajectory().front().stamp,
+    imu_processor_->trajectory().back().stamp, imu_processor_->trajectory().size());
   const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
   RCLCPP_DEBUG(
     this->get_logger(),
-    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f",
+    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f timed_out %s",
     matched.deskew_ms, matched.voxel_ms, matched.align_ms, matched.cost_ms, matched.refine_ms,
-    matched.map_ms);
+    matched.map_ms, matched.align_timed_out ? "yes" : "no");
   last_match_ = matched;
   has_last_match_ = true;
   publish_debug_odometry(matched, stamp);
@@ -448,15 +504,21 @@ void BackOdomNode::match_pending_scan(const bool force)
     if (lidar_matcher_->has_reference()) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "ICP correction rejected. health %s, lidar cost %.3f pass %s, translation %.3f m, "
+        "ICP correction rejected. health %s, lidar cost %.3f ndt %.3f pass %s, translation %.3f m, "
         "rotation %.3f rad",
-        health_name(matched.health), matched.lidar_cost, matched.lidar_passed ? "yes" : "no",
-        matched.translation_error, matched.rotation_error);
+        health_name(matched.health), matched.lidar_cost,
+        std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
+        matched.lidar_passed ? "yes" : "no", matched.translation_error, matched.rotation_error);
     }
     publish_health(stamp);
     return;
   }
-  if (!matched.first_scan) {
+  if (matched.align_timed_out) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "ICP abandoned for align_rate budget. Inserted scan at latest IMU pose. align %.2f ms",
+      matched.align_ms);
+  } else if (!matched.first_scan) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "ICP correction applied. lidar cost %.3f, translation %.3f m, rotation %.4f rad, health %s",
@@ -509,7 +571,14 @@ void BackOdomNode::publish_health(const rclcpp::Time & stamp)
   add_value("reject_streak", std::to_string(lidar_matcher_->reject_streak()));
   if (has_last_match_) {
     add_value("lidar_cost", last_match_.has_lidar_debug ? std::to_string(last_match_.lidar_cost) : "none");
+    add_value(
+      "ndt_cost",
+      last_match_.has_lidar_debug && std::isfinite(last_match_.ndt_cost)
+        ? std::to_string(last_match_.ndt_cost)
+        : "none");
     add_value("lidar_passed", last_match_.lidar_passed ? "true" : "false");
+    add_value("align_timed_out", last_match_.align_timed_out ? "true" : "false");
+    add_value("align_ms", std::to_string(last_match_.align_ms));
     add_value("translation_error_m", std::to_string(last_match_.translation_error));
     add_value("rotation_error_rad", std::to_string(last_match_.rotation_error));
   }
@@ -607,6 +676,19 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
       }
     }
   }
+  auto intensity_field = std::find_if(
+    cloud.fields.cbegin(), cloud.fields.cend(),
+    [](const sensor_msgs::msg::PointField & field) { return field.name == "intensity"; });
+  if (intensity_field == cloud.fields.cend()) {
+    for (const char * fallback : {"i", "reflectivity"}) {
+      intensity_field = std::find_if(
+        cloud.fields.cbegin(), cloud.fields.cend(),
+        [fallback](const sensor_msgs::msg::PointField & field) { return field.name == fallback; });
+      if (intensity_field != cloud.fields.cend()) {
+        break;
+      }
+    }
+  }
   if (
     x_field == cloud.fields.cend() || y_field == cloud.fields.cend() ||
     z_field == cloud.fields.cend() || time_field == cloud.fields.cend()) {
@@ -628,10 +710,47 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     }
     return std::numeric_limits<double>::quiet_NaN();
   };
+  const auto read_intensity = [&cloud](
+                                const sensor_msgs::msg::PointField & field, const std::size_t index) {
+    const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
+    switch (field.datatype) {
+      case sensor_msgs::msg::PointField::FLOAT32: {
+        float value = 0.0F;
+        std::memcpy(&value, pointer, sizeof(float));
+        return value;
+      }
+      case sensor_msgs::msg::PointField::FLOAT64: {
+        double value = 0.0;
+        std::memcpy(&value, pointer, sizeof(double));
+        return static_cast<float>(value);
+      }
+      case sensor_msgs::msg::PointField::UINT8:
+        return static_cast<float>(*pointer);
+      case sensor_msgs::msg::PointField::UINT16: {
+        std::uint16_t value = 0;
+        std::memcpy(&value, pointer, sizeof(std::uint16_t));
+        return static_cast<float>(value);
+      }
+      case sensor_msgs::msg::PointField::INT16: {
+        std::int16_t value = 0;
+        std::memcpy(&value, pointer, sizeof(std::int16_t));
+        return static_cast<float>(value);
+      }
+      case sensor_msgs::msg::PointField::UINT32: {
+        std::uint32_t value = 0;
+        std::memcpy(&value, pointer, sizeof(std::uint32_t));
+        return static_cast<float>(value);
+      }
+      default:
+        return 0.0F;
+    }
+  };
 
   const std::size_t count = static_cast<std::size_t>(cloud.width) * cloud.height;
   scan.points.reserve(count);
   scan.timestamps.reserve(count);
+  scan.intensities.reserve(count);
+  const bool have_intensity = intensity_field != cloud.fields.cend();
   double max_abs_time = 0.0;
   for (std::size_t index = 0; index < count; ++index) {
     const double x = read_float(*x_field, index);
@@ -643,6 +762,7 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     }
     scan.points.emplace_back(x, y, z);
     scan.timestamps.push_back(time);
+    scan.intensities.push_back(have_intensity ? read_intensity(*intensity_field, index) : 0.0F);
     max_abs_time = std::max(max_abs_time, std::abs(time));
   }
   const double header = scan.stamp;

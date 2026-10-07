@@ -16,6 +16,7 @@
 
 #include "back_odom/lidar/device_accel.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/ndt_health.hpp"
 #include "back_odom/lidar/scan_window.hpp"
 
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
@@ -165,6 +166,19 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
     params_.refine_min_travel < 0.0) {
     throw std::invalid_argument("vehicle limits must be non-negative and allow one rejected scan");
   }
+  if (!(params_.max_ndt_cost > 0.0) || !std::isfinite(params_.max_ndt_cost)) {
+    throw std::invalid_argument("max_ndt_cost must be positive and finite");
+  }
+  if (params_.ndt_cov_regularization < 0.0 || params_.min_ndt_correspondences < 1) {
+    throw std::invalid_argument(
+      "ndt_cov_regularization must be non-negative and min_ndt_correspondences positive");
+  }
+  if (!(params_.align_rate_hz > 0.0) || !std::isfinite(params_.align_rate_hz)) {
+    throw std::invalid_argument("align_rate_hz must be positive and finite");
+  }
+  ndt_map_.voxel_size = params_.voxel_size;
+  ndt_map_.cov_regularization = params_.ndt_cov_regularization;
+  ndt_map_.min_points = 5;
 }
 
 void LidarImuMatcher::set_body_from_lidar(const Sophus::SE3d & body_from_lidar)
@@ -194,16 +208,14 @@ std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
 
 std::vector<LocalMapPoint> LidarImuMatcher::annotated_local_map() const
 {
-  const int settle_passes = std::max(1, params_.refine_settle_passes);
   std::vector<LocalMapPoint> annotated;
   annotated.reserve(visible_scan_point_count());
   for (const HorizonScan & scan : horizon_) {
-    const bool frozen = scan.collective_passes >= settle_passes;
-    const float intensity = frozen ? 255.0F : 30.0F;
-    for (const Eigen::Vector3d & point : scan.points) {
+    const bool have_intensity = scan.intensities.size() == scan.points.size();
+    for (std::size_t index = 0; index < scan.points.size(); ++index) {
       LocalMapPoint annotated_point;
-      annotated_point.position = scan.pose * point;
-      annotated_point.intensity = intensity;
+      annotated_point.position = scan.pose * scan.points[index];
+      annotated_point.intensity = have_intensity ? scan.intensities[index] : 0.0F;
       annotated_point.scan_id = static_cast<float>(scan.scan_id);
       annotated_point.collective_passes = static_cast<float>(scan.collective_passes);
       annotated.push_back(annotated_point);
@@ -233,13 +245,16 @@ std::size_t LidarImuMatcher::visible_scan_point_count() const
 
 void LidarImuMatcher::record_horizon_scan(
   const Sophus::SE3d & pose, const double stamp, const std::vector<Eigen::Vector3d> & points,
-  const ImuProcessor & imu)
+  const std::vector<float> & intensities, const ImuProcessor & imu)
 {
   HorizonScan scan;
   scan.stamp = stamp;
   scan.pose = pose;
   scan.prior = pose;
   scan.points = points;
+  scan.intensities = intensities.size() == points.size()
+                       ? intensities
+                       : std::vector<float>(points.size(), 0.0F);
   scan.scan_id = next_scan_id_++;
   if (!horizon_.empty()) {
     const HorizonScan & previous = horizon_.back();
@@ -398,25 +413,30 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
   if (!imu.aligned()) {
     return result;
   }
-  const auto prepared_clouds = prepare_scan(scan, imu.trajectory(), result);
-  const std::vector<Eigen::Vector3d> & map_points = prepared_clouds.first;
-  const std::vector<Eigen::Vector3d> & source = prepared_clouds.second;
-  if (source.empty()) {
+  const PreparedClouds prepared_clouds = prepare_scan(scan, imu.trajectory(), result);
+  if (prepared_clouds.source.empty()) {
     return result;
   }
 
   const double scan_end = *std::max_element(scan.timestamps.cbegin(), scan.timestamps.cend());
+  // Deskew/guess come from the buffered pose nearest the scan time, not imu.pose() (live tip).
+  if (!imu.has_pose_near(scan_end, imu.max_pair_dt())) {
+    return result;
+  }
   const Sophus::SE3d predicted = imu.interpolate_pose(scan_end);
   result.imu_pose = predicted;
-  PreparedScan prepared{scan_end, map_points, source, predicted};
+  PreparedScan prepared{
+    scan_end, prepared_clouds.map_points, prepared_clouds.map_intensities, prepared_clouds.source,
+    predicted};
 
   if (!has_reference_) {
-    window_.push_back(WindowScan{scan_end, map_points, source, predicted});
+    window_.push_back(
+      WindowScan{scan_end, prepared.map_points, prepared.source, predicted});
     has_reference_ = true;
     last_correction_stamp_ = scan.stamp;
     last_correction_position_ = predicted.translation();
     rebuild_map(predicted);
-    record_horizon_scan(predicted, scan_end, map_points, imu);
+    record_horizon_scan(predicted, scan_end, prepared.map_points, prepared.map_intensities, imu);
     result.applied = true;
     result.inserted_scan = true;
     result.first_scan = true;
@@ -427,13 +447,33 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     return result;
   }
 
+  // Budget covers ICP only (target align_rate_hz). Deskew/voxel stay outside the gate.
+  const auto align_deadline =
+    std::chrono::steady_clock::now() +
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(1.0 / params_.align_rate_hz));
   const Sophus::SE3d imu_guess = predicted;
-  const MatchCandidate imu_candidate = score_alignment(source, imu_guess, predicted, true, result);
+  const MatchCandidate imu_candidate =
+    score_alignment(prepared.source, imu_guess, predicted, true, result, &align_deadline);
 
   result.has_lidar_debug = imu_candidate.present;
-  result.lidar_pose = imu_candidate.pose;
+  result.lidar_pose = imu_candidate.timed_out ? predicted : imu_candidate.pose;
   result.lidar_cost = imu_candidate.cost;
+  result.ndt_cost = imu_candidate.ndt_cost;
   result.lidar_passed = imu_candidate.passes;
+  result.align_timed_out = imu_candidate.timed_out;
+
+  if (imu_candidate.timed_out) {
+    // Keep the scan cadence: insert at the latest IMU pose and skip ICP/bias/refine.
+    finish_accepted_scan(
+      result, prepared, predicted, 0.0, imu, last_correction_stamp_, false, std::nullopt, false);
+    note_health(imu, HealthEvent::Accepted);
+    remember_healthy(result.corrected_pose, imu.velocity(), scan_end);
+    result.health = health_.health;
+    result.gyro_bias = imu.gyro_bias();
+    result.accel_bias = imu.accel_bias();
+    return result;
+  }
 
   if (!(imu_candidate.present && imu_candidate.passes)) {
     const Sophus::SE3d failed = imu_candidate.present ? imu_candidate.pose : predicted;
@@ -443,14 +483,16 @@ MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
     result.translation_error = vehicle_delta.translation().norm();
     result.rotation_error = vehicle_delta.so3().log().norm();
     result.iterations = imu_candidate.iterations;
+    note_health(imu, HealthEvent::Rejected);
     result.health = health_.health;
     return result;
   }
 
   result.iterations = imu_candidate.iterations;
+  const bool allow_refine = std::chrono::steady_clock::now() < align_deadline;
   finish_accepted_scan(
-    result, prepared, imu_candidate.pose, imu_candidate.iterations, imu, last_correction_stamp_, true,
-    std::nullopt);
+    result, prepared, imu_candidate.pose, imu_candidate.iterations, imu, last_correction_stamp_,
+    true, std::nullopt, allow_refine);
   note_health(imu, HealthEvent::Accepted);
   remember_healthy(result.corrected_pose, imu.velocity(), scan_end);
   result.health = health_.health;
@@ -509,13 +551,14 @@ void LidarImuMatcher::apply_correction(
 void LidarImuMatcher::finish_accepted_scan(
   MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
   const double iterations, ImuProcessor & imu, const double since_stamp, const bool update_bias,
-  const std::optional<Eigen::Vector3d> & velocity_override)
+  const std::optional<Eigen::Vector3d> & velocity_override, const bool allow_refine)
 {
   const Sophus::SE3d limited = limit_longitudinal_correction(
     prepared.predicted, aligned_pose, params_.max_longitudinal_correction);
   const auto map_start = std::chrono::steady_clock::now();
   map_.Update(prepared.map_points, limited);
-  record_horizon_scan(limited, prepared.scan_end, prepared.map_points, imu);
+  record_horizon_scan(
+    limited, prepared.scan_end, prepared.map_points, prepared.map_intensities, imu);
   window_.push_back(
     WindowScan{prepared.scan_end, std::move(prepared.map_points), std::move(prepared.source), limited});
   while (static_cast<int>(window_.size()) > params_.backward_match_stride) {
@@ -524,20 +567,28 @@ void LidarImuMatcher::finish_accepted_scan(
   cull_local_map(map_, limited);
   result.map_ms += elapsed_ms(map_start);
   Sophus::SE3d committed = limited;
-  const auto refine_start = std::chrono::steady_clock::now();
-  refine_window_if_due(result, committed);
-  result.refine_ms += elapsed_ms(refine_start);
+  if (allow_refine) {
+    const auto refine_start = std::chrono::steady_clock::now();
+    refine_window_if_due(result, committed);
+    result.refine_ms += elapsed_ms(refine_start);
+  }
   window_.back().pose = committed;
 
   const Sophus::SE3d vehicle_delta = prepared.predicted.inverse() * committed;
   result.correction = window_.back().pose * prepared.predicted.inverse();
   result.translation_error = vehicle_delta.translation().norm();
   result.rotation_error = vehicle_delta.so3().log().norm();
-  result.corrected_pose = imu.pose() * vehicle_delta;
   result.inserted_scan = true;
   result.applied = true;
   result.iterations = iterations;
-  apply_correction(imu, vehicle_delta, prepared.scan_end, since_stamp, update_bias, velocity_override);
+  if (params_.apply_imu_correction) {
+    result.corrected_pose = imu.pose() * vehicle_delta;
+    apply_correction(
+      imu, vehicle_delta, prepared.scan_end, since_stamp, update_bias, velocity_override);
+  } else {
+    last_correction_stamp_ = imu.latest_stamp();
+    last_correction_position_ = imu.pose().translation();
+  }
   result.corrected_pose = imu.pose();
   result.gyro_bias = imu.gyro_bias();
   result.accel_bias = imu.accel_bias();
@@ -593,15 +644,25 @@ Sophus::SE3d LidarImuMatcher::recovery_pose(const double scan_end, const ImuProc
 
 MatchCandidate LidarImuMatcher::score_alignment(
   const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess,
-  const Sophus::SE3d & imu_reference, const bool check_imu_gate, MatchResult & timing)
+  const Sophus::SE3d & imu_reference, const bool check_imu_gate, MatchResult & timing,
+  const std::chrono::steady_clock::time_point * const deadline)
 {
   MatchCandidate candidate;
   candidate.present = true;
   double iterations = 0.0;
   double device_cost = 0.0;
+  bool timed_out = false;
   const auto align_start = std::chrono::steady_clock::now();
-  const kiss_icp::PlaneAlignResult aligned = align(source, guess, iterations, &device_cost);
+  const kiss_icp::PlaneAlignResult aligned =
+    align(source, guess, iterations, &device_cost, deadline, timed_out);
   timing.align_ms += elapsed_ms(align_start);
+  if (timed_out) {
+    candidate.timed_out = true;
+    candidate.pose = imu_reference;
+    candidate.iterations = 0.0;
+    candidate.passes = false;
+    return candidate;
+  }
   candidate.pose = aligned.pose;
   candidate.iterations = iterations;
   candidate.saturated = iterations + 0.5 >= static_cast<double>(params_.max_iterations);
@@ -615,7 +676,11 @@ MatchCandidate LidarImuMatcher::score_alignment(
   timing.cost_ms += elapsed_ms(cost_start);
   const Sophus::SE3d imu_delta = imu_reference.inverse() * aligned.pose;
   const bool imu_ok = !check_imu_gate || accept_vehicle_delta(iterations, imu_delta);
-  candidate.passes = iterations > 0.0 && imu_ok && std::isfinite(candidate.cost);
+  candidate.ndt_cost =
+    ndt_mean_mahalanobis(source, aligned.pose, ndt_map_, params_.min_ndt_correspondences);
+  const bool ndt_ok =
+    !std::isfinite(candidate.ndt_cost) || candidate.ndt_cost < params_.max_ndt_cost;
+  candidate.passes = iterations > 0.0 && imu_ok && std::isfinite(candidate.cost) && ndt_ok;
   return candidate;
 }
 
@@ -678,22 +743,40 @@ void LidarImuMatcher::rebuild_map(const Sophus::SE3d & cull_pose)
 void LidarImuMatcher::note_map_edit()
 {
   ++map_epoch_;
+  ndt_map_.voxel_size = params_.voxel_size;
+  ndt_map_.cov_regularization = params_.ndt_cov_regularization;
+  ndt_map_.rebuild_from(map_);
 }
 
-std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> LidarImuMatcher::prepare_scan(
+LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
   const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing)
 {
-  const auto cpu_prepare = [&](const std::vector<Eigen::Vector3d> & cropped) {
-    const std::vector<Eigen::Vector3d> map_points =
-      kiss_icp::VoxelDownsample(cropped, params_.voxel_size * 0.5);
+  const double fine_voxel = params_.voxel_size * 0.5;
+  const double coarse_voxel = params_.voxel_size * 1.5;
+  const std::vector<float> & scan_intensities = scan.intensities;
+  const auto cpu_prepare = [&](const IntensityCloud & cropped) {
+    const IntensityCloud map_cloud =
+      voxel_downsample_with_intensity(cropped.points, cropped.intensities, fine_voxel);
     const std::vector<Eigen::Vector3d> source =
-      kiss_icp::VoxelDownsample(map_points, params_.voxel_size * 1.5);
-    return std::make_pair(map_points, source);
+      kiss_icp::VoxelDownsample(map_cloud.points, coarse_voxel);
+    return PreparedClouds{map_cloud.points, map_cloud.intensities, source};
   };
+  const auto deskew_crop = [&]() {
+    return crop_lidar_box(
+      deskew_to_scan_end(scan.points, scan.timestamps, trajectory, body_from_lidar_),
+      scan_intensities, half_longitudinal_, half_lateral_);
+  };
+  const auto attach_device_intensities =
+    [&](std::vector<Eigen::Vector3d> map_points, std::vector<Eigen::Vector3d> source) {
+      const IntensityCloud cropped = deskew_crop();
+      std::vector<float> intensities = intensities_for_downsampled(
+        cropped.points, cropped.intensities, map_points, fine_voxel);
+      return PreparedClouds{std::move(map_points), std::move(intensities), std::move(source)};
+    };
   const auto run_device = [&]() {
     return device_downsample_scan(
       scan.points, scan.timestamps, trajectory, body_from_lidar_, half_longitudinal_, half_lateral_,
-      params_.voxel_size * 0.5, params_.voxel_size * 1.5);
+      fine_voxel, coarse_voxel);
   };
   if (!device_prepare_decided_ && scan.points.size() >= 1000 && device_available() && !trajectory.empty()) {
     device_prepare_decided_ = true;
@@ -702,20 +785,19 @@ std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> LidarImuMa
     const std::optional<DeviceScanClouds> device = run_device();
     const double device_ms = elapsed_ms(device_start);
     const auto cpu_deskew_start = std::chrono::steady_clock::now();
-    const std::vector<Eigen::Vector3d> cpu_cropped = crop_lidar_box(
-      deskew_to_scan_end(scan.points, scan.timestamps, trajectory, body_from_lidar_),
-      half_longitudinal_, half_lateral_);
+    const IntensityCloud cpu_cropped = deskew_crop();
     const double cpu_deskew_ms = elapsed_ms(cpu_deskew_start);
     const auto cpu_voxel_start = std::chrono::steady_clock::now();
-    const auto cpu_clouds = cpu_prepare(cpu_cropped);
+    const PreparedClouds cpu_clouds = cpu_prepare(cpu_cropped);
     const double cpu_voxel_ms = elapsed_ms(cpu_voxel_start);
-    device_front_use_ = device.has_value() && same_sequence(device->map_points, cpu_clouds.first) &&
-                        same_sequence(device->source, cpu_clouds.second) &&
+    device_front_use_ = device.has_value() && same_sequence(device->map_points, cpu_clouds.map_points) &&
+                        same_sequence(device->source, cpu_clouds.source) &&
                         device_ms < cpu_deskew_ms + cpu_voxel_ms;
     if (device_front_use_) {
       timing.deskew_ms += device->deskew_ms;
       timing.voxel_ms += device->voxel_ms;
-      return {device->map_points, device->source};
+      // Device xyz matches CPU order here, so reuse CPU intensities.
+      return PreparedClouds{device->map_points, cpu_clouds.map_intensities, device->source};
     }
     timing.deskew_ms += cpu_deskew_ms;
     timing.voxel_ms += cpu_voxel_ms;
@@ -725,55 +807,72 @@ std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> LidarImuMa
     if (const std::optional<DeviceScanClouds> device = run_device()) {
       timing.deskew_ms += device->deskew_ms;
       timing.voxel_ms += device->voxel_ms;
-      return {device->map_points, device->source};
+      return attach_device_intensities(device->map_points, device->source);
     }
     device_front_use_ = false;
   }
   const auto deskew_start = std::chrono::steady_clock::now();
-  const std::vector<Eigen::Vector3d> cropped = crop_lidar_box(
-    deskew_to_scan_end(scan.points, scan.timestamps, trajectory, body_from_lidar_),
-    half_longitudinal_, half_lateral_);
+  const IntensityCloud cropped = deskew_crop();
   timing.deskew_ms += elapsed_ms(deskew_start);
   const auto voxel_start = std::chrono::steady_clock::now();
-  const auto clouds = cpu_prepare(cropped);
+  PreparedClouds clouds = cpu_prepare(cropped);
   timing.voxel_ms += elapsed_ms(voxel_start);
   return clouds;
 }
 
 kiss_icp::PlaneAlignResult LidarImuMatcher::align(
   const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations,
-  double * const robust_cost)
+  double * const robust_cost, const std::chrono::steady_clock::time_point * const deadline,
+  bool & timed_out)
 {
+  timed_out = false;
+  const auto abandoned = [&]() {
+    timed_out = true;
+    iterations = 0.0;
+    if (robust_cost != nullptr) {
+      *robust_cost = std::numeric_limits<double>::quiet_NaN();
+    }
+    kiss_icp::PlaneAlignResult result;
+    result.pose = guess;
+    result.correction = Sophus::SE3d();
+    return result;
+  };
+  if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) {
+    return abandoned();
+  }
   const auto cpu_align = [&]() {
     if (robust_cost != nullptr) {
       *robust_cost = std::numeric_limits<double>::quiet_NaN();
     }
     return registration_.AlignPointsToPlane(
-      scan, map_, guess, params_.max_correspondence_distance, params_.kernel_scale, iterations);
+      scan, map_, guess, params_.max_correspondence_distance, params_.kernel_scale, iterations,
+      deadline, &timed_out);
   };
   const auto accept_device = [&](const DeviceAlignResult & device) {
+    timed_out = device.timed_out;
     iterations = device.iterations;
     if (robust_cost != nullptr) {
       *robust_cost = device.robust_cost;
     }
     kiss_icp::PlaneAlignResult accepted;
-    accepted.pose = device.pose;
-    accepted.correction = device.correction;
+    accepted.pose = device.timed_out ? guess : device.pose;
+    accepted.correction = device.timed_out ? Sophus::SE3d() : device.correction;
     return accepted;
   };
   if (!device_available() || scan.size() < 256) {
     return cpu_align();
   }
   if (!device_align_decided_) {
+    // One-time device vs CPU bake-off ignores the live rate budget.
     device_align_decided_ = true;
     const auto time_device = [&](const bool float_rank) {
       (void)align_points_on_device(
         scan, map_, map_epoch_, guess, params_.max_correspondence_distance, params_.kernel_scale,
-        params_.max_iterations, params_.convergence_criterion, float_rank);
+        params_.max_iterations, params_.convergence_criterion, float_rank, nullptr);
       const auto device_start = std::chrono::steady_clock::now();
       const std::optional<DeviceAlignResult> device = align_points_on_device(
         scan, map_, map_epoch_, guess, params_.max_correspondence_distance, params_.kernel_scale,
-        params_.max_iterations, params_.convergence_criterion, float_rank);
+        params_.max_iterations, params_.convergence_criterion, float_rank, nullptr);
       return std::make_pair(device, elapsed_ms(device_start));
     };
     const auto double_trial = time_device(false);
@@ -821,19 +920,12 @@ kiss_icp::PlaneAlignResult LidarImuMatcher::align(
   }
   const std::optional<DeviceAlignResult> device = align_points_on_device(
     scan, map_, map_epoch_, guess, params_.max_correspondence_distance, params_.kernel_scale,
-    params_.max_iterations, params_.convergence_criterion, device_align_float_);
+    params_.max_iterations, params_.convergence_criterion, device_align_float_, deadline);
   if (!device) {
     device_align_use_ = false;
     return cpu_align();
   }
-  iterations = device->iterations;
-  if (robust_cost != nullptr) {
-    *robust_cost = device->robust_cost;
-  }
-  kiss_icp::PlaneAlignResult result;
-  result.pose = device->pose;
-  result.correction = device->correction;
-  return result;
+  return accept_device(*device);
 }
 
 }  // namespace back_odom

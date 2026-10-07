@@ -262,4 +262,59 @@ TEST(ImuProcessor, full_window_of_motion_stays_unaligned)
   EXPECT_EQ(output.phase, ProcessorPhase::Collecting);
 }
 
+TEST(ImuProcessor, trajectory_buffer_keeps_poses_across_a_long_horizon)
+{
+  ProcessorParams params;
+  params.alignment_sample_count = 5;
+  params.trajectory_horizon = 30.0;
+  params.max_trajectory_poses = 20000;
+  ImuProcessor processor(params);
+  ProcessorOutput output;
+  for (int i = 0; i < 5; ++i) {
+    output = processor.process(
+      make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+  }
+  ASSERT_TRUE(output.aligned);
+  const double align_stamp = processor.latest_stamp();
+  for (int i = 1; i <= 500; ++i) {
+    output = processor.process(make_sample(
+      align_stamp + 0.02 * i, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+  }
+  EXPECT_TRUE(output.aligned);
+  ASSERT_GE(processor.trajectory().size(), 400U);
+  EXPECT_LT(processor.latest_stamp() - processor.trajectory().front().stamp, 30.5);
+  EXPECT_GE(processor.latest_stamp() - processor.trajectory().front().stamp, 5.0);
+
+  const double old_stamp = align_stamp + 1.0;
+  const StampedPose closest = processor.closest_pose(old_stamp);
+  EXPECT_NEAR(closest.stamp, old_stamp, 0.02);
+  EXPECT_TRUE(processor.has_pose_near(old_stamp, 0.05));
+  EXPECT_TRUE(processor.interpolate_pose(old_stamp).translation().allFinite());
+}
+
+TEST(ImuProcessor, closest_pose_picks_nearest_sample_not_the_live_tip)
+{
+  ProcessorParams params;
+  params.alignment_sample_count = 5;
+  params.trajectory_horizon = 30.0;
+  ImuProcessor processor(params);
+  ProcessorOutput output;
+  for (int i = 0; i < 5; ++i) {
+    output = processor.process(
+      make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+  }
+  ASSERT_TRUE(output.aligned);
+  const double target = processor.latest_stamp();
+  for (int i = 1; i <= 100; ++i) {
+    output = processor.process(
+      make_sample(target + 0.05 * i, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+  }
+  EXPECT_TRUE(output.aligned);
+  const double query = target + 0.5;
+  const StampedPose closest = processor.closest_pose(query);
+  EXPECT_NEAR(closest.stamp, query, 0.05);
+  EXPECT_LT(std::abs(closest.stamp - query), std::abs(processor.latest_stamp() - query));
+  EXPECT_TRUE(processor.has_pose_near(query, 0.05));
+}
+
 }  // namespace back_odom

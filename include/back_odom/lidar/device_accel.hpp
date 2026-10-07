@@ -21,6 +21,7 @@
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
 #include <sophus/se3.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -65,15 +66,18 @@ struct DeviceAlignResult
   double iterations{0.0};
   /// Robust plane cost at `pose`, the same quantity as robust_plane_cost.
   double robust_cost{0.0};
+  /// True when the align loop hit `deadline` and returned the initial guess.
+  bool timed_out{false};
 };
 
 /// Point-to-plane align. The 6x6 step stays in Eigen on the CPU.
 /// `float_rank` ranks the 20 neighbors in float; the plane, residual, and Jacobian stay double.
-/// Empty when CUDA cannot run it.
+/// Empty when CUDA cannot run it. When `deadline` is reached mid-loop, returns the initial guess.
 [[nodiscard]] std::optional<DeviceAlignResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   std::uint64_t map_epoch, const Sophus::SE3d & initial_guess, double max_distance,
-  double kernel_scale, int max_iterations,   double convergence_criterion, bool float_rank = false);
+  double kernel_scale, int max_iterations, double convergence_criterion, bool float_rank = false,
+  const std::chrono::steady_clock::time_point * deadline = nullptr);
 
 }  // namespace back_odom
 

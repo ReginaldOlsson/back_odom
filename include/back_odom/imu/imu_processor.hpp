@@ -39,7 +39,13 @@ public:
   [[nodiscard]] Eigen::Vector3d velocity() const;
   [[nodiscard]] double latest_stamp() const;
   [[nodiscard]] const std::vector<StampedPose> & trajectory() const;
+  [[nodiscard]] double max_pair_dt() const;
+  /// Linear interpolation between the two buffered poses that bracket `stamp`.
   [[nodiscard]] Sophus::SE3d interpolate_pose(double stamp) const;
+  /// Nearest buffered IMU pose to `stamp` (no interpolation). Used to pair lidar scans.
+  [[nodiscard]] StampedPose closest_pose(double stamp) const;
+  /// True when the buffer contains a pose within `max_dt` of `stamp`.
+  [[nodiscard]] bool has_pose_near(double stamp, double max_dt) const;
   void reset_state(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity_world, double stamp);
   void set_velocity(const Eigen::Vector3d & velocity_world);
 

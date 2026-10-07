@@ -14,25 +14,37 @@
     stationary_accel_dev_thresh: 0.5
     gravity: 9.81
     max_dt: 0.1
+    # Keep a long IMU pose history so a slow ICP can still pair a lidar scan to the
+    # nearest IMU sample instead of the live tip of the integrator.
+    imu_trajectory_horizon: 30.0
+    imu_max_trajectory_poses: 20000
+    # Max |t_closest_imu - t_scan_end| when accepting a lidar/IMU pair.
+    imu_max_pair_dt: 0.05
     path_min_dt: 0.1
     path_max_poses: 1000
     time_field: "time"
     voxel_size: 0.5
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 150.0
-    crop_lateral: 150.0
+    crop_longitudinal: 50.0
+    crop_lateral: 30.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     convergence_criterion: 0.0001
     max_iterations: 50
-    max_points_per_voxel: 7
-    max_visible_scans: 30
+    # Target ICP rate. Align budget is 1/hz (100 ms at 10). Over budget aborts ICP
+    # mid-iteration and inserts the scan at the latest IMU pose. Drop toward 8.0
+    # if diagnostics show many align_timed_out events.
+    align_rate_hz: 10.0
+    max_points_per_voxel: 20
+    max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
     refine_window: true
     refine_settle_passes: 2
+    # Off: ICP still builds the local map; IMU pose/velocity/biases stay open-loop.
+    apply_imu_correction: false
     # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
@@ -45,6 +57,10 @@
     max_acceleration: 5.0
     max_yaw_rate: 1.0
     max_match_rejects: 5
+    # NDT Mahalanobis health gate (mean D_M^2; χ² 3-DoF ~95% heuristic).
+    max_ndt_cost: 7.81
+    ndt_cov_regularization: 0.001
+    min_ndt_correspondences: 20
     # Diagonal entries of the twist and pose messages sent to the EKF.
     twist_variance_vx: 0.05
     twist_variance_wz: 0.01

@@ -17,8 +17,9 @@
 #include "back_odom/imu/kinematic_limits.hpp"
 #include "back_odom/lidar/lidar_imu_matcher.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
-#include "back_odom/lidar/scan_window.hpp"
 #include "back_odom/lidar/match_candidate.hpp"
+#include "back_odom/lidar/ndt_health.hpp"
+#include "back_odom/lidar/scan_window.hpp"
 
 #include <kiss_icp_cpp/core/Registration.hpp>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
@@ -152,6 +153,7 @@ LidarScan corner_scan(const double stamp)
       scan.points.emplace_back(0.0, a, b);
       scan.points.emplace_back(a, 0.0, b);
       scan.timestamps.insert(scan.timestamps.end(), 3, stamp);
+      scan.intensities.insert(scan.intensities.end(), 3, 42.0F + static_cast<float>(i + j));
     }
   }
   return scan;
@@ -179,6 +181,7 @@ LidarMatchParams match_params()
   params.voxel_size = 0.25;
   params.backward_match_stride = 3;
   params.max_correspondence_distance = 2.0;
+  params.apply_imu_correction = true;
   return params;
 }
 
@@ -198,6 +201,27 @@ TEST(BackwardMatch, drifted_imu_is_corrected_when_the_next_scan_is_aligned)
   EXPECT_NEAR(imu.pose().translation().x(), 0.0, 0.15);
   EXPECT_NEAR(imu.pose().translation().y(), 0.0, 0.15);
   EXPECT_NEAR(imu.pose().translation().z(), 0.0, 0.15);
+}
+
+TEST(BackwardMatch, align_rate_budget_inserts_scan_at_imu_pose)
+{
+  ImuProcessor imu = aligned_imu();
+  ASSERT_TRUE(imu.aligned());
+  LidarMatchParams params = match_params();
+  // Near-zero ICP budget: the second scan must abandon before any iteration.
+  params.align_rate_hz = 1.0e12;
+  LidarImuMatcher matcher(params);
+  const LidarScan scan = corner_scan(imu.latest_stamp());
+  ASSERT_TRUE(matcher.on_scan(scan, imu).first_scan);
+
+  const Sophus::SE3d drifted(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0));
+  imu.reset_state(drifted, Eigen::Vector3d::Zero(), imu.latest_stamp());
+  const MatchResult matched = matcher.on_scan(scan, imu);
+  ASSERT_TRUE(matched.applied);
+  EXPECT_TRUE(matched.align_timed_out);
+  EXPECT_FALSE(matched.lidar_passed);
+  EXPECT_NEAR(imu.pose().translation().x(), 0.3, 1.0e-6);
+  EXPECT_NEAR(matched.lidar_pose.translation().x(), 0.3, 1.0e-6);
 }
 
 TEST(BackwardMatch, imu_motion_between_scans_is_kept)
@@ -390,21 +414,30 @@ TEST(VehicleLimits, fast_scan_step_does_not_change_bias)
   EXPECT_NEAR(imu.accel_bias().norm(), 0.0, 1.0e-9);
 }
 
-TEST(LocalizationHealth, rejected_scans_keep_matching_and_do_not_rewrite_speed)
+TEST(LocalizationHealth, rejected_scans_degrade_then_diverge)
 {
   ImuProcessor imu = aligned_imu();
-  LidarImuMatcher matcher(match_params());
+  LidarMatchParams params = match_params();
+  params.limits.max_match_rejects = 3;
+  LidarImuMatcher matcher(params);
   ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
-  for (int step = 0; step < 5; ++step) {
+  for (int step = 0; step < 2; ++step) {
     const double stamp = imu.latest_stamp() + 0.5;
     imu.reset_state(
       Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
       stamp);
     const MatchResult matched = matcher.on_scan(corner_scan(stamp), imu);
     EXPECT_FALSE(matched.applied);
+    EXPECT_EQ(matcher.health(), LocalizationHealth::Degraded);
   }
-  EXPECT_EQ(matcher.health(), LocalizationHealth::Healthy);
-  EXPECT_NEAR(imu.velocity().x(), 40.0, 1.0e-6);
+  const double stamp = imu.latest_stamp() + 0.5;
+  imu.reset_state(
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
+    stamp);
+  ASSERT_FALSE(matcher.on_scan(corner_scan(stamp), imu).applied);
+  EXPECT_EQ(matcher.health(), LocalizationHealth::Diverged);
+  // Matcher stays available for further scans after divergence.
+  EXPECT_TRUE(matcher.has_reference());
 }
 
 TEST(ImuIntegration, body_speed_stays_inside_the_vehicle_limit)
@@ -467,7 +500,7 @@ TEST(ScanPoses, map_points_carry_scan_id_and_collective_pass_count)
   ASSERT_FALSE(first.empty());
   EXPECT_FLOAT_EQ(first.front().scan_id, 0.0F);
   EXPECT_FLOAT_EQ(first.front().collective_passes, 0.0F);
-  EXPECT_FLOAT_EQ(first.front().intensity, 30.0F);
+  EXPECT_GE(first.front().intensity, 42.0F);
   imu.reset_state(
     Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0)), Eigen::Vector3d::Zero(),
     imu.latest_stamp());
@@ -478,7 +511,7 @@ TEST(ScanPoses, map_points_carry_scan_id_and_collective_pass_count)
     saw_first = saw_first || point.scan_id == 0.0F;
     saw_second = saw_second || point.scan_id == 1.0F;
     EXPECT_FLOAT_EQ(point.collective_passes, 0.0F);
-    EXPECT_FLOAT_EQ(point.intensity, 30.0F);
+    EXPECT_GE(point.intensity, 42.0F);
   }
   EXPECT_TRUE(saw_first);
   EXPECT_TRUE(saw_second);
@@ -603,7 +636,7 @@ TEST(LidarMatch, stage_times_without_coarse_guess)
   params.crop_longitudinal = 50.0;
   params.crop_lateral = 50.0;
   params.max_iterations = 50;
-  params.max_points_per_voxel = 7;
+  params.max_points_per_voxel = 20;
   params.refine_window = true;
   params.refine_min_travel = 2.0;
   params.convergence_criterion = 1.0e-4;
@@ -649,6 +682,87 @@ TEST(LidarMatch, stage_times_without_coarse_guess)
   }
   std::cout << "median ms deskew " << median(deskew) << " voxel " << median(voxel) << " align "
             << median(align) << " refine " << median(refine) << " map " << median(map) << std::endl;
+}
+
+namespace
+{
+
+kiss_icp::VoxelHashMap make_planar_ndt_map(const double voxel_size)
+{
+  // Keep every sample inside voxel (0,0,0) and past kiss's per-voxel spacing.
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  std::vector<Eigen::Vector3d> points;
+  points.reserve(20);
+  for (int x = 0; x < 5; ++x) {
+    for (int y = 0; y < 4; ++y) {
+      points.emplace_back(
+        0.05 + 0.09 * static_cast<double>(x), 0.05 + 0.09 * static_cast<double>(y),
+        0.001 * static_cast<double>((x + y) % 3));
+    }
+  }
+  map.AddPoints(points);
+  return map;
+}
+
+}  // namespace
+
+TEST(NdtHealth, inlier_pose_has_low_mahalanobis_cost)
+{
+  constexpr double voxel_size = 0.5;
+  const kiss_icp::VoxelHashMap map = make_planar_ndt_map(voxel_size);
+  NdtVoxelMap ndt;
+  ndt.cov_regularization = 1.0e-3;
+  ndt.min_points = 5;
+  ndt.rebuild_from(map);
+  ASSERT_FALSE(ndt.voxels.empty());
+
+  std::vector<Eigen::Vector3d> query;
+  for (const auto & item : map.map_) {
+    for (const Eigen::Vector3d & point : item.second) {
+      query.push_back(point);
+    }
+  }
+  const double cost = ndt_mean_mahalanobis(query, Sophus::SE3d{}, ndt, 10);
+  ASSERT_TRUE(std::isfinite(cost)) << "query=" << query.size() << " ndt=" << ndt.voxels.size();
+  EXPECT_LT(cost, 7.81);
+}
+
+TEST(NdtHealth, offset_points_raise_mahalanobis_above_threshold)
+{
+  constexpr double voxel_size = 0.5;
+  const kiss_icp::VoxelHashMap map = make_planar_ndt_map(voxel_size);
+  NdtVoxelMap ndt;
+  ndt.cov_regularization = 1.0e-3;
+  ndt.min_points = 5;
+  ndt.rebuild_from(map);
+
+  std::vector<Eigen::Vector3d> query;
+  for (const auto & item : map.map_) {
+    for (const Eigen::Vector3d & point : item.second) {
+      query.push_back(point);
+    }
+  }
+  const double inlier_cost = ndt_mean_mahalanobis(query, Sophus::SE3d{}, ndt, 10);
+  ASSERT_TRUE(std::isfinite(inlier_cost));
+
+  // Stay inside the same 0.5 m voxel but sit far from the fitted mean (z is thin).
+  std::vector<Eigen::Vector3d> offset_query = query;
+  for (Eigen::Vector3d & point : offset_query) {
+    point += Eigen::Vector3d(0.0, 0.0, 0.2);
+  }
+  const double offset_cost = ndt_mean_mahalanobis(offset_query, Sophus::SE3d{}, ndt, 10);
+  ASSERT_TRUE(std::isfinite(offset_cost));
+  EXPECT_GT(offset_cost, inlier_cost);
+  EXPECT_GT(offset_cost, 7.81);
+}
+
+TEST(NdtHealth, sparse_map_skips_gate_with_nan)
+{
+  NdtVoxelMap ndt;
+  ndt.voxel_size = 0.5;
+  const std::vector<Eigen::Vector3d> query = {{0.0, 0.0, 0.0}, {0.1, 0.0, 0.0}};
+  const double cost = ndt_mean_mahalanobis(query, Sophus::SE3d{}, ndt, 20);
+  EXPECT_TRUE(std::isnan(cost));
 }
 
 }  // namespace back_odom

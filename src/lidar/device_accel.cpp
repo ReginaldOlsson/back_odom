@@ -374,10 +374,22 @@ std::optional<DeviceAlignResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   const std::uint64_t map_epoch, const Sophus::SE3d & initial_guess, const double max_distance,
   const double kernel_scale, const int max_iterations, const double convergence_criterion,
-  const bool float_rank)
+  const bool float_rank, const std::chrono::steady_clock::time_point * const deadline)
 {
   if (!cuda_available() || frame.empty() || map.Empty() || !(kernel_scale > 0.0) || max_iterations < 1) {
     return std::nullopt;
+  }
+  const auto past_deadline = [deadline]() {
+    return deadline != nullptr && std::chrono::steady_clock::now() >= *deadline;
+  };
+  if (past_deadline()) {
+    DeviceAlignResult result;
+    result.pose = initial_guess;
+    result.correction = Sophus::SE3d();
+    result.iterations = 0.0;
+    result.robust_cost = std::numeric_limits<double>::quiet_NaN();
+    result.timed_out = true;
+    return result;
   }
   if (!upload_map(map, map_epoch)) {
     return std::nullopt;
@@ -396,6 +408,14 @@ std::optional<DeviceAlignResult> align_points_on_device(
   bool upload_frame = true;
   double robust_cost = 0.0;
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    if (past_deadline()) {
+      result.pose = initial_guess;
+      result.correction = Sophus::SE3d();
+      result.iterations = 0.0;
+      result.robust_cost = std::numeric_limits<double>::quiet_NaN();
+      result.timed_out = true;
+      return result;
+    }
     Matrix6d hessian = Matrix6d::Zero();
     Vector6d gradient = Vector6d::Zero();
     int correspondences = 0;

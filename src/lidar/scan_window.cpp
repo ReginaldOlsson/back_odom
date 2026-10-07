@@ -319,6 +319,9 @@ struct VoxelEntry
   std::vector<IndexedPoint> points;
   Eigen::Vector3d mean{Eigen::Vector3d::Zero()};
   Eigen::Vector3d normal{Eigen::Vector3d::UnitZ()};
+  Eigen::Matrix3d covariance{Eigen::Matrix3d::Zero()};
+  Eigen::Matrix3d inv_covariance{Eigen::Matrix3d::Zero()};
+  bool valid_distribution{false};
   bool planar{false};
   std::uint16_t dominant{0};
   int dominant_count{0};
@@ -348,9 +351,13 @@ struct IndexedCloud
 
   void compute_planes()
   {
+    constexpr double k_cov_regularization = 1.0e-3;
     for (auto & item : voxels) {
       VoxelEntry & entry = item.second;
       entry.planar = false;
+      entry.valid_distribution = false;
+      entry.covariance.setZero();
+      entry.inv_covariance.setZero();
       if (static_cast<int>(entry.points.size()) < k_plane_neighbors) {
         continue;
       }
@@ -364,6 +371,7 @@ struct IndexedCloud
         const Eigen::Vector3d delta = point.position - entry.mean;
         covariance += delta * delta.transpose();
       }
+      // Eigenvectors are scale-invariant; keep the unnormalized matrix for the plane test.
       const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
       if (solver.info() != Eigen::Success) {
         continue;
@@ -378,6 +386,16 @@ struct IndexedCloud
         continue;
       }
       entry.normal.normalize();
+      entry.covariance = covariance / static_cast<double>(entry.points.size());
+      const Eigen::Matrix3d regularized =
+        entry.covariance + Eigen::Matrix3d::Identity() * k_cov_regularization;
+      Eigen::Matrix3d inverse = Eigen::Matrix3d::Zero();
+      bool invertible = false;
+      regularized.computeInverseWithCheck(inverse, invertible);
+      if (invertible && inverse.allFinite()) {
+        entry.inv_covariance = inverse;
+        entry.valid_distribution = true;
+      }
       entry.dominant = entry.points.front().scan;
       entry.dominant_count = 0;
       for (const IndexedPoint & point : entry.points) {

@@ -26,10 +26,13 @@ struct MatchCandidate
 {
   Sophus::SE3d pose{};
   double cost{std::numeric_limits<double>::infinity()};
+  double ndt_cost{std::numeric_limits<double>::quiet_NaN()};
   double iterations{0.0};
   bool passes{false};
   bool present{false};
   bool saturated{false};
+  /// ICP abandoned the solve to keep the align-rate budget; pose is unused.
+  bool timed_out{false};
 };
 
 }  // namespace back_odom

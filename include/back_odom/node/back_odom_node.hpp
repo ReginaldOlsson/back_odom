@@ -112,6 +112,7 @@ private:
   bool has_previous_angular_velocity_{false};
   std::size_t alignment_sample_count_{100};
   std::size_t path_max_poses_{1000};
+  double imu_max_pair_dt_{0.05};
   double path_min_dt_{0.1};
   bool publish_tf_{true};
   bool initial_pose_sent_{false};
