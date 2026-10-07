@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "back_odom/lidar_imu_matcher.hpp"
+#include "back_odom/lidar/lidar_imu_matcher.hpp"
 
-#include "back_odom/device_accel.hpp"
-#include "back_odom/lidar_preprocess.hpp"
-#include "back_odom/scan_window.hpp"
+#include "back_odom/lidar/device_accel.hpp"
+#include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/scan_window.hpp"
 
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 

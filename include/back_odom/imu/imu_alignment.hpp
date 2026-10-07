@@ -15,7 +15,7 @@
 #ifndef BACK_ODOM__IMU_ALIGNMENT_HPP_
 #define BACK_ODOM__IMU_ALIGNMENT_HPP_
 
-#include "back_odom/imu_types.hpp"
+#include "back_odom/imu/imu_types.hpp"
 
 #include <Eigen/Core>
 #include <sophus/se3.hpp>

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "back_odom/back_odom_node.hpp"
+#include "back_odom/node/back_odom_node.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 

@@ -15,9 +15,9 @@
 #ifndef BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 #define BACK_ODOM__LIDAR_IMU_MATCHER_HPP_
 
-#include "back_odom/imu_processor.hpp"
-#include "back_odom/kinematic_limits.hpp"
-#include "back_odom/match_candidate.hpp"
+#include "back_odom/imu/imu_processor.hpp"
+#include "back_odom/imu/kinematic_limits.hpp"
+#include "back_odom/lidar/match_candidate.hpp"
 
 #include <Eigen/Core>
 #include <kiss_icp_cpp/core/Registration.hpp>

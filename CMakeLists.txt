@@ -32,25 +32,43 @@ if(CMAKE_CUDA_COMPILER)
   find_package(CUDAToolkit REQUIRED)
 endif()
 
-ament_auto_add_library(imu_processor SHARED
-  src/imu_alignment.cpp
-  src/imu_dead_reckoning.cpp
-  src/imu_processor.cpp
+# Standalone IMU library exported for external ROS 2 packages as back_odom::imu_processor.
+# Built outside ament_auto_add_library so ament_auto_package does not double-install it.
+add_library(imu_processor SHARED
+  src/imu/imu_alignment.cpp
+  src/imu/imu_dead_reckoning.cpp
+  src/imu/imu_processor.cpp
 )
-target_link_libraries(imu_processor Sophus::Sophus)
-if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
-  target_compile_options(imu_processor PRIVATE ${BACK_ODOM_SIMD_FLAGS})
-  target_compile_definitions(imu_processor PRIVATE ${BACK_ODOM_SIMD_DEFINES})
+add_library(back_odom::imu_processor ALIAS imu_processor)
+target_include_directories(imu_processor PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+target_link_libraries(imu_processor PUBLIC Sophus::Sophus)
+if(BACK_ODOM_ENABLE_SIMD)
+  if(BACK_ODOM_SIMD_FLAGS)
+    target_compile_options(imu_processor PRIVATE ${BACK_ODOM_SIMD_FLAGS})
+  endif()
+  # PUBLIC so external dependents share the same Eigen ABI.
+  target_compile_definitions(imu_processor PUBLIC ${BACK_ODOM_SIMD_DEFINES})
 endif()
+install(
+  TARGETS imu_processor
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+  INCLUDES DESTINATION include/${PROJECT_NAME})
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(Sophus)
 
 ament_auto_add_library(lidar_imu_matcher SHARED
-  src/lidar_preprocess.cpp
-  src/lidar_imu_matcher.cpp
-  src/scan_window.cpp
+  src/lidar/lidar_preprocess.cpp
+  src/lidar/lidar_imu_matcher.cpp
+  src/lidar/scan_window.cpp
 )
 target_link_libraries(
   lidar_imu_matcher imu_processor kiss_icp_cpp::kiss_icp_cpp TBB::tbb OpenMP::OpenMP_CXX)
-target_sources(lidar_imu_matcher PRIVATE src/device_accel.cpp)
+target_sources(lidar_imu_matcher PRIVATE src/lidar/device_accel.cpp)
 if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
   target_compile_options(lidar_imu_matcher PRIVATE ${BACK_ODOM_SIMD_FLAGS})
   target_compile_definitions(lidar_imu_matcher PRIVATE ${BACK_ODOM_SIMD_DEFINES})
@@ -58,7 +76,7 @@ endif()
 if(CMAKE_CUDA_COMPILER)
   # Own target so nvcc's -Werror all-warnings does not see GNU line markers.
   # The C++ library keeps warnings as errors.
-  add_library(back_odom_cuda STATIC src/device_kernels.cu)
+  add_library(back_odom_cuda STATIC src/lidar/device_kernels.cu)
   target_include_directories(
     back_odom_cuda PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   set_target_properties(
@@ -69,12 +87,13 @@ if(CMAKE_CUDA_COMPILER)
   target_link_libraries(back_odom_cuda PUBLIC CUDA::cudart)
   target_link_libraries(lidar_imu_matcher back_odom_cuda)
 else()
-  target_sources(lidar_imu_matcher PRIVATE src/device_kernels_stub.cpp)
+  target_sources(lidar_imu_matcher PRIVATE src/lidar/device_kernels_stub.cpp)
 endif()
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
-  src/back_odom_node.cpp
+  src/node/back_odom_node.cpp
 )
+target_link_libraries(${PROJECT_NAME} imu_processor lidar_imu_matcher)
 if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
   target_compile_options(${PROJECT_NAME} PRIVATE ${BACK_ODOM_SIMD_FLAGS})
   target_compile_definitions(${PROJECT_NAME} PRIVATE ${BACK_ODOM_SIMD_DEFINES})
@@ -131,6 +150,7 @@ install(
 )
 
 ament_auto_package(
+  USE_SCOPED_HEADER_INSTALL_DIR
   INSTALL_TO_SHARE
   launch
   config

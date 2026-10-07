@@ -15,8 +15,8 @@
 #ifndef BACK_ODOM__BACK_ODOM_NODE_HPP_
 #define BACK_ODOM__BACK_ODOM_NODE_HPP_
 
-#include "back_odom/imu_processor.hpp"
-#include "back_odom/lidar_imu_matcher.hpp"
+#include "back_odom/imu/imu_processor.hpp"
+#include "back_odom/lidar/lidar_imu_matcher.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.hpp>

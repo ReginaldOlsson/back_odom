@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "back_odom/imu_dead_reckoning.hpp"
-#include "back_odom/imu_processor.hpp"
-#include "back_odom/kinematic_limits.hpp"
-#include "back_odom/lidar_imu_matcher.hpp"
-#include "back_odom/lidar_preprocess.hpp"
-#include "back_odom/scan_window.hpp"
-#include "back_odom/match_candidate.hpp"
+#include "back_odom/imu/imu_dead_reckoning.hpp"
+#include "back_odom/imu/imu_processor.hpp"
+#include "back_odom/imu/kinematic_limits.hpp"
+#include "back_odom/lidar/lidar_imu_matcher.hpp"
+#include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/scan_window.hpp"
+#include "back_odom/lidar/match_candidate.hpp"
 
 #include <kiss_icp_cpp/core/Registration.hpp>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>

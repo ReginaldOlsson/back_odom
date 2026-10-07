@@ -15,8 +15,8 @@
 #ifndef BACK_ODOM__IMU_PROCESSOR_HPP_
 #define BACK_ODOM__IMU_PROCESSOR_HPP_
 
-#include "back_odom/imu_dead_reckoning.hpp"
-#include "back_odom/imu_types.hpp"
+#include "back_odom/imu/imu_dead_reckoning.hpp"
+#include "back_odom/imu/imu_types.hpp"
 
 #include <Eigen/Core>
 #include <sophus/se3.hpp>

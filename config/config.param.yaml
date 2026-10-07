@@ -20,14 +20,14 @@
     voxel_size: 0.5
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 90.0
-    crop_lateral: 50.0
+    crop_longitudinal: 150.0
+    crop_lateral: 150.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     convergence_criterion: 0.0001
     max_iterations: 50
     max_points_per_voxel: 7
-    max_visible_scans: 10
+    max_visible_scans: 30
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.

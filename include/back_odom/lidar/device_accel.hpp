@@ -15,7 +15,7 @@
 #ifndef BACK_ODOM__DEVICE_ACCEL_HPP_
 #define BACK_ODOM__DEVICE_ACCEL_HPP_
 
-#include "back_odom/imu_types.hpp"
+#include "back_odom/imu/imu_types.hpp"
 
 #include <Eigen/Core>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "back_odom/imu_processor.hpp"
+#include "back_odom/imu/imu_processor.hpp"
 
-#include "back_odom/imu_alignment.hpp"
-#include "back_odom/kinematic_limits.hpp"
+#include "back_odom/imu/imu_alignment.hpp"
+#include "back_odom/imu/kinematic_limits.hpp"
 
 #include <algorithm>
 #include <cmath>

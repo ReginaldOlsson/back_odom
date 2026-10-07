@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "back_odom/device_kernels.hpp"
+#include "back_odom/lidar/device_kernels.hpp"
 
 namespace back_odom
 {
