@@ -182,6 +182,12 @@ LidarMatchParams match_params()
   params.backward_match_stride = 3;
   params.max_correspondence_distance = 2.0;
   params.apply_imu_correction = true;
+  // The synthetic scans sit at the same place; insert every accepted scan so the horizon
+  // tests can count them.
+  params.keyframe_min_translation = 0.0;
+  params.keyframe_min_rotation = 0.0;
+  // Keep the bake-off out of the unit tests: deterministic CPU path.
+  params.device_bakeoff_scan = 0;
   return params;
 }
 
@@ -203,7 +209,7 @@ TEST(BackwardMatch, drifted_imu_is_corrected_when_the_next_scan_is_aligned)
   EXPECT_NEAR(imu.pose().translation().z(), 0.0, 0.15);
 }
 
-TEST(BackwardMatch, align_rate_budget_inserts_scan_at_imu_pose)
+TEST(BackwardMatch, align_rate_budget_skips_the_scan_and_degrades_health)
 {
   ImuProcessor imu = aligned_imu();
   ASSERT_TRUE(imu.aligned());
@@ -213,15 +219,44 @@ TEST(BackwardMatch, align_rate_budget_inserts_scan_at_imu_pose)
   LidarImuMatcher matcher(params);
   const LidarScan scan = corner_scan(imu.latest_stamp());
   ASSERT_TRUE(matcher.on_scan(scan, imu).first_scan);
+  const std::size_t points_before = matcher.visible_scan_point_count();
 
   const Sophus::SE3d drifted(Sophus::SO3d(), Eigen::Vector3d(0.3, 0.0, 0.0));
   imu.reset_state(drifted, Eigen::Vector3d::Zero(), imu.latest_stamp());
   const MatchResult matched = matcher.on_scan(scan, imu);
-  ASSERT_TRUE(matched.applied);
+  // A scan whose pose was never verified must not be written into the map or move the IMU.
+  EXPECT_FALSE(matched.applied);
+  EXPECT_FALSE(matched.inserted_scan);
   EXPECT_TRUE(matched.align_timed_out);
+  EXPECT_FALSE(matched.partial_used);
   EXPECT_FALSE(matched.lidar_passed);
+  EXPECT_EQ(matcher.visible_scan_poses().size(), 1U);
+  EXPECT_EQ(matcher.visible_scan_point_count(), points_before);
   EXPECT_NEAR(imu.pose().translation().x(), 0.3, 1.0e-6);
-  EXPECT_NEAR(matched.lidar_pose.translation().x(), 0.3, 1.0e-6);
+  EXPECT_EQ(matcher.health(), LocalizationHealth::Degraded);
+  EXPECT_EQ(matcher.timeout_streak(), 1);
+  EXPECT_EQ(matcher.reject_streak(), 0);
+}
+
+TEST(BackwardMatch, stationary_scans_are_matched_but_not_inserted)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarMatchParams params = match_params();
+  params.keyframe_min_translation = 0.5;
+  params.keyframe_min_rotation = 0.05;
+  LidarImuMatcher matcher(params);
+  const LidarScan scan = corner_scan(imu.latest_stamp());
+  ASSERT_TRUE(matcher.on_scan(scan, imu).first_scan);
+  const std::size_t points_before = matcher.visible_scan_point_count();
+  imu.reset_state(
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.1, 0.0, 0.0)), Eigen::Vector3d::Zero(),
+    imu.latest_stamp());
+  const MatchResult matched = matcher.on_scan(scan, imu);
+  ASSERT_TRUE(matched.applied);
+  EXPECT_FALSE(matched.inserted_scan);
+  EXPECT_EQ(matcher.visible_scan_point_count(), points_before);
+  // The correction still reaches the IMU.
+  EXPECT_NEAR(imu.pose().translation().x(), 0.0, 0.1);
 }
 
 TEST(BackwardMatch, imu_motion_between_scans_is_kept)
@@ -763,6 +798,152 @@ TEST(NdtHealth, sparse_map_skips_gate_with_nan)
   const std::vector<Eigen::Vector3d> query = {{0.0, 0.0, 0.0}, {0.1, 0.0, 0.0}};
   const double cost = ndt_mean_mahalanobis(query, Sophus::SE3d{}, ndt, 20);
   EXPECT_TRUE(std::isnan(cost));
+}
+
+TEST(NdtHealth, inlier_fraction_separates_a_half_offset_scan)
+{
+  constexpr double voxel_size = 0.5;
+  const kiss_icp::VoxelHashMap map = make_planar_ndt_map(voxel_size);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = voxel_size;
+  surface.rebuild_from(map);
+  std::vector<Eigen::Vector3d> query;
+  for (const auto & item : map.map_) {
+    for (const Eigen::Vector3d & point : item.second) {
+      query.push_back(point);
+    }
+  }
+  const NdtScore clean = ndt_score(query, Sophus::SE3d{}, surface, 7.81, 10);
+  ASSERT_TRUE(std::isfinite(clean.inlier_fraction));
+  EXPECT_GT(clean.inlier_fraction, 0.9);
+  // Lift half the points off the plane: the mean may still pass but the fraction must not.
+  for (std::size_t index = 0; index < query.size(); index += 2) {
+    query[index] += Eigen::Vector3d(0.0, 0.0, 0.2);
+  }
+  const NdtScore half = ndt_score(query, Sophus::SE3d{}, surface, 7.81, 10);
+  ASSERT_TRUE(std::isfinite(half.inlier_fraction));
+  EXPECT_LT(half.inlier_fraction, 0.6);
+  EXPECT_GT(half.inlier_fraction, 0.3);
+}
+
+TEST(SurfaceVoxelMap, incremental_update_matches_a_full_rebuild)
+{
+  constexpr double voxel_size = 0.5;
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  const std::vector<Eigen::Vector3d> first = corner_scan(0.0).points;
+  map.AddPoints(first);
+  SurfaceVoxelMap incremental;
+  incremental.voxel_size = voxel_size;
+  incremental.rebuild_from(map);
+  const std::size_t voxels_before = incremental.voxels.size();
+  ASSERT_GT(voxels_before, 0U);
+
+  // Second scan shifted so it touches new voxels and adds points to existing ones.
+  std::vector<Eigen::Vector3d> second;
+  std::vector<kiss_icp::Voxel> touched;
+  for (const Eigen::Vector3d & point : first) {
+    const Eigen::Vector3d moved = point + Eigen::Vector3d(0.6, 0.35, 0.0);
+    second.push_back(moved);
+    touched.push_back(kiss_icp::PointToVoxel(moved, voxel_size));
+  }
+  map.AddPoints(second);
+  incremental.update_voxels(map, touched);
+
+  SurfaceVoxelMap full;
+  full.voxel_size = voxel_size;
+  full.rebuild_from(map);
+  ASSERT_EQ(incremental.voxels.size(), full.voxels.size());
+  EXPECT_GT(incremental.voxels.size(), voxels_before);
+  for (const auto & item : full.voxels) {
+    const SurfaceVoxel * entry = incremental.find(item.first);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->point_count, item.second.point_count);
+    EXPECT_EQ(entry->planar, item.second.planar);
+    EXPECT_EQ(entry->own_fit, item.second.own_fit);
+    EXPECT_LT((entry->mean - item.second.mean).norm(), 1.0e-9);
+    if (item.second.planar) {
+      EXPECT_GT(std::abs(entry->normal.dot(item.second.normal)), 0.999);
+    }
+  }
+
+  // Culling the map must leave no stale voxels behind after prune_missing.
+  const Sophus::SE3d far_away(Sophus::SO3d(), Eigen::Vector3d(500.0, 0.0, 0.0));
+  map.RemovePointsOutsideBox(far_away.inverse(), 10.0, 10.0);
+  incremental.prune_missing(map);
+  EXPECT_TRUE(map.Empty());
+  EXPECT_TRUE(incremental.voxels.empty());
+}
+
+TEST(PlaneIcp, align_to_surface_recovers_a_shifted_corner)
+{
+  constexpr double voxel_size = 0.25;
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  const std::vector<Eigen::Vector3d> points = corner_scan(0.0).points;
+  map.AddPoints(points);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = voxel_size;
+  surface.rebuild_from(map);
+  const Sophus::SE3d guess(
+    Sophus::SO3d::exp(Eigen::Vector3d(0.0, 0.0, 0.02)), Eigen::Vector3d(0.15, -0.1, 0.05));
+  PlaneIcpParams params;
+  params.max_iterations = 30;
+  params.convergence_criterion = 1.0e-4;
+  const PlaneIcpResult result = align_to_surface(points, map, surface, guess, params);
+  EXPECT_FALSE(result.timed_out);
+  EXPECT_GT(result.correspondences, static_cast<int>(points.size() / 2));
+  EXPECT_LT(result.pose.translation().norm(), 0.03);
+  EXPECT_LT(result.pose.so3().log().norm(), 0.01);
+  EXPECT_LT(result.robust_cost, 0.05);
+  // correction * guess == pose
+  EXPECT_LT(((result.correction * guess).inverse() * result.pose).log().norm(), 1.0e-9);
+}
+
+TEST(PlaneIcp, deadline_returns_the_partial_pose_not_the_seed)
+{
+  constexpr double voxel_size = 0.25;
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  const std::vector<Eigen::Vector3d> points = corner_scan(0.0).points;
+  map.AddPoints(points);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = voxel_size;
+  surface.rebuild_from(map);
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(0.15, 0.0, 0.0));
+  PlaneIcpParams params;
+  params.max_iterations = 50;
+  // A step is never "< 0": the solver can only stop on the cap or the deadline.
+  params.convergence_criterion = 0.0;
+  // Deadline already passed: zero iterations, pose == seed, flagged.
+  const auto now = std::chrono::steady_clock::now();
+  const PlaneIcpResult none = align_to_surface(points, map, surface, guess, params, &now);
+  EXPECT_TRUE(none.timed_out);
+  EXPECT_DOUBLE_EQ(none.iterations, 0.0);
+  EXPECT_LT((none.pose.inverse() * guess).log().norm(), 1.0e-12);
+  // Generous deadline but an impossible criterion: saturated, not timed out.
+  const PlaneIcpResult saturated = align_to_surface(points, map, surface, guess, params);
+  EXPECT_FALSE(saturated.timed_out);
+  EXPECT_TRUE(saturated.saturated);
+  EXPECT_DOUBLE_EQ(saturated.iterations, 50.0);
+}
+
+TEST(LocalizationHealth, timeouts_degrade_without_counting_as_rejects)
+{
+  HealthState state;
+  state = advance_localization_health(state, HealthEvent::TimedOut, 3);
+  EXPECT_EQ(state.health, LocalizationHealth::Degraded);
+  EXPECT_EQ(state.timeout_streak, 1);
+  EXPECT_EQ(state.reject_streak, 0);
+  EXPECT_FALSE(state.update_bias);
+  state = advance_localization_health(state, HealthEvent::TimedOut, 3);
+  EXPECT_EQ(state.timeout_streak, 2);
+  EXPECT_EQ(state.health, LocalizationHealth::Degraded);
+  // One accepted scan clears the streak and recovers.
+  state = advance_localization_health(state, HealthEvent::Accepted, 3);
+  EXPECT_EQ(state.timeout_streak, 0);
+  EXPECT_EQ(state.health, LocalizationHealth::Healthy);
+  EXPECT_TRUE(state.update_bias);
+  // Saturated is accepted but must not feed the biases.
+  state = advance_localization_health(state, HealthEvent::Saturated, 3);
+  EXPECT_FALSE(state.update_bias);
 }
 
 }  // namespace back_odom

@@ -38,6 +38,15 @@ BACK_ODOM_HD inline std::uint64_t pack_voxel_key(int x, int y, int z)
   return (ux << 42) | (uy << 21) | uz;
 }
 
+BACK_ODOM_HD inline void unpack_voxel_key(std::uint64_t key, int & x, int & y, int & z)
+{
+  constexpr int bias = 1 << 20;
+  const std::uint64_t mask = (1ULL << 21) - 1ULL;
+  x = static_cast<int>((key >> 42) & mask) - bias;
+  y = static_cast<int>((key >> 21) & mask) - bias;
+  z = static_cast<int>(key & mask) - bias;
+}
+
 struct CudaSegment
 {
   double start_stamp{0.0};
@@ -45,6 +54,16 @@ struct CudaSegment
   double rotation[9]{};
   double translation[3]{};
   double tangent[6]{};
+};
+
+/// Per-voxel plane for the device map, one per unique voxel key in sorted key order.
+struct CudaVoxelPlane
+{
+  float nx{0.0F};
+  float ny{0.0F};
+  float nz{1.0F};
+  /// 1 when the voxel has a usable normal.
+  int planar{0};
 };
 
 struct CudaPlaneSystem
@@ -60,26 +79,31 @@ struct CudaPlaneSystem
 
 [[nodiscard]] bool cuda_map_current(const void * owner, std::uint64_t epoch, double voxel_size);
 
+/// Upload the map points, sort them by voxel key on the device and build the per-voxel offsets
+/// there. `unique_keys` receives the sorted unique keys so the host can attach normals.
 [[nodiscard]] bool cuda_upload_map(
   const void * owner, std::uint64_t epoch, double voxel_size, const double * xyz,
-  const std::uint64_t * keys, int count);
+  const std::uint64_t * keys, int count, std::vector<std::uint64_t> & unique_keys);
 
+/// Attach one plane per unique key (same order as returned by cuda_upload_map).
+[[nodiscard]] bool cuda_upload_planes(const CudaVoxelPlane * planes, int unique_count);
+
+/// One Gauss-Newton system. Neighbour ranking in float, residual/Jacobian/accumulation in double.
 [[nodiscard]] bool cuda_plane_system(
   const double * frame_xyz, int frame_count, const double rotation[9], const double translation[3],
-  double max_distance, double kernel_scale, bool float_rank, bool upload_frame,
-  CudaPlaneSystem & system);
+  double max_distance, double kernel_scale, bool upload_frame, CudaPlaneSystem & system);
 
-/// Deskew, crop, and keep the first point in each voxel. The full cloud stays on the device.
-/// `kept_xyz` / `kept_index` are that downsample, in input order. `cropped_count` is the number of
-/// points inside the box, which the CPU hash needs so its iteration order matches kiss-icp.
+/// Deskew, crop, then build the fine and coarse voxel levels on the device. Fine points come
+/// back with their original input index (for intensity lookup); coarse points come back as xyz.
 [[nodiscard]] bool cuda_front_downsample(
   const double * points_xyz, const double * stamps, int count, const CudaSegment * segments,
   int segment_count, double front_stamp, double back_stamp, const double front_rotation[9],
   const double front_translation[3], const double back_rotation[9],
   const double back_translation[3], const double end_inverse_rotation[9],
   const double end_inverse_translation[3], const double body_rotation[9],
-  const double body_translation[3], double half_longitudinal, double half_lateral, double voxel_size,
-  std::vector<double> & kept_xyz, std::vector<int> & kept_index, int & cropped_count);
+  const double body_translation[3], double half_longitudinal, double half_lateral,
+  double fine_voxel, double coarse_voxel, std::vector<double> & fine_xyz,
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz);
 
 [[nodiscard]] bool cuda_deskew(
   const double * points_xyz, const double * stamps, int count, const CudaSegment * segments,

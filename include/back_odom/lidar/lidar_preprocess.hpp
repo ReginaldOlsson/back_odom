@@ -48,6 +48,12 @@ struct IntensityCloud
   const std::vector<Eigen::Vector3d> & cropped, const std::vector<float> & cropped_intensities,
   const std::vector<Eigen::Vector3d> & downsampled, double voxel_size);
 
+/// The slice of `trajectory` that brackets [from_stamp, to_stamp], with one pose of margin on
+/// each side. Deskew only needs these; building motion segments for a 30 s buffer per scan is
+/// wasted work.
+[[nodiscard]] std::vector<StampedPose> trajectory_window(
+  const std::vector<StampedPose> & trajectory, double from_stamp, double to_stamp);
+
 /// Put each lidar point in the integrator frame with `body_from_lidar`, then move it from its
 /// timestamp to the scan-end pose. The trajectory and the extrinsic must share that frame.
 [[nodiscard]] std::vector<Eigen::Vector3d> deskew_to_scan_end(

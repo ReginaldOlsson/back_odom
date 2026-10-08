@@ -14,9 +14,8 @@
 
 #include "back_odom/lidar/device_accel.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
-#include "back_odom/lidar/scan_window.hpp"
+#include "back_odom/lidar/plane_icp.hpp"
 
-#include <kiss_icp_cpp/core/Registration.hpp>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 #include <sophus/se3.hpp>
@@ -145,27 +144,36 @@ TEST(DeviceAccel, downsample_copies_back_only_the_kept_points)
   trajectory.push_back(
     StampedPose{10.08, Sophus::SE3d(Sophus::SO3d::exp(Eigen::Vector3d(0.0, 0.0, 0.02)), Eigen::Vector3d(0.3, 0.0, 0.0))});
   const Sophus::SE3d body_from_lidar(Sophus::SO3d(), Eigen::Vector3d(0.2, 0.0, 0.1));
-  (void)device_downsample_scan(points, stamps, trajectory, body_from_lidar, 20.0, 20.0, 0.25, 0.75);
+  // Intensity encodes the input index so the fine cloud can be checked for carrying it through.
+  std::vector<float> intensities(points.size());
+  for (std::size_t index = 0; index < points.size(); ++index) {
+    intensities[index] = static_cast<float>(index);
+  }
+  (void)device_downsample_scan(
+    points, stamps, intensities, trajectory, body_from_lidar, 20.0, 20.0, 0.25, 0.75);
   const auto device_start = std::chrono::steady_clock::now();
-  const std::optional<DeviceScanClouds> device =
-    device_downsample_scan(points, stamps, trajectory, body_from_lidar, 20.0, 20.0, 0.25, 0.75);
+  const std::optional<DeviceScanClouds> device = device_downsample_scan(
+    points, stamps, intensities, trajectory, body_from_lidar, 20.0, 20.0, 0.25, 0.75);
   const double device_ms = elapsed_ms(device_start);
   const auto cpu_start = std::chrono::steady_clock::now();
-  const std::vector<Eigen::Vector3d> cropped = crop_lidar_box(
-    deskew_to_scan_end(points, stamps, trajectory, body_from_lidar), 20.0, 20.0);
+  const std::vector<Eigen::Vector3d> deskewed =
+    deskew_to_scan_end(points, stamps, trajectory, body_from_lidar);
+  const std::vector<Eigen::Vector3d> cropped = crop_lidar_box(deskewed, 20.0, 20.0);
   const std::vector<Eigen::Vector3d> fine = kiss_icp::VoxelDownsample(cropped, 0.25);
-  const std::vector<Eigen::Vector3d> coarse = kiss_icp::VoxelDownsample(fine, 0.75);
   const double cpu_ms = elapsed_ms(cpu_start);
   std::cout << "front device " << device_ms << " ms, cpu " << cpu_ms << " ms, raw " << points.size()
             << ", kept " << (device ? device->map_points.size() : 0) << std::endl;
   ASSERT_TRUE(device.has_value());
-  ASSERT_EQ(device->map_points.size(), fine.size());
-  ASSERT_EQ(device->source.size(), coarse.size());
-  for (std::size_t index = 0; index < fine.size(); ++index) {
-    EXPECT_LT((device->map_points[index] - fine[index]).norm(), 1.0e-6);
-  }
-  for (std::size_t index = 0; index < coarse.size(); ++index) {
-    EXPECT_LT((device->source[index] - coarse[index]).norm(), 1.0e-6);
+  // Same voxels survive on both sides (first point per voxel); order follows the voxel key.
+  EXPECT_TRUE(same_set(device->map_points, fine));
+  // The coarse level is one grid over the fine survivors.
+  EXPECT_EQ(device->source.size(), kiss_icp::VoxelDownsample(device->map_points, 0.75).size());
+  ASSERT_EQ(device->map_intensities.size(), device->map_points.size());
+  // Each kept fine point must carry the intensity of the raw return it came from.
+  for (std::size_t index = 0; index < device->map_points.size(); ++index) {
+    const std::size_t raw = static_cast<std::size_t>(std::lround(device->map_intensities[index]));
+    ASSERT_LT(raw, deskewed.size());
+    EXPECT_LT((deskewed[raw] - device->map_points[index]).norm(), 1.0e-6);
   }
   EXPECT_LT(device->map_points.size(), points.size());
 }
@@ -200,37 +208,65 @@ TEST(DeviceAccel, plane_align_stays_within_one_millimetre)
   for (std::size_t index = 0; index < points.size(); index += 2) {
     frame.push_back(points[index]);
   }
+  SurfaceVoxelMap surface;
+  surface.voxel_size = 0.5;
+  surface.rebuild_from(map);
   const Sophus::SE3d guess(
     Sophus::SO3d::exp(Eigen::Vector3d(0.0, 0.0, -0.02)), Eigen::Vector3d(-0.15, 0.05, 0.02));
-  (void)align_points_on_device(frame, map, 1, guess, 2.0, 0.5, 15, 1.0e-4);
+  PlaneIcpParams params;
+  params.max_correspondence_distance = 2.0;
+  params.kernel_scale = 0.5;
+  params.max_iterations = 15;
+  params.convergence_criterion = 1.0e-4;
+  // First call uploads the map; time the warm path like the live node sees it.
+  (void)align_points_on_device(frame, map, surface, 1, guess, params);
   const auto device_start = std::chrono::steady_clock::now();
-  const std::optional<DeviceAlignResult> device =
-    align_points_on_device(frame, map, 1, guess, 2.0, 0.5, 15, 1.0e-4);
+  const std::optional<PlaneIcpResult> device =
+    align_points_on_device(frame, map, surface, 1, guess, params);
   const double device_ms = elapsed_ms(device_start);
-  kiss_icp::Registration registration(15, 1.0e-4, 0);
-  double iterations = 0.0;
   const auto cpu_start = std::chrono::steady_clock::now();
-  const kiss_icp::PlaneAlignResult cpu =
-    registration.AlignPointsToPlane(frame, map, guess, 2.0, 0.5, iterations);
-  const double cpu_cost = robust_plane_cost(frame, cpu.pose, map, 2.0, 0.5);
+  const PlaneIcpResult cpu = align_to_surface(frame, map, surface, guess, params);
   const double cpu_ms = elapsed_ms(cpu_start);
-  (void)align_points_on_device(frame, map, 1, guess, 2.0, 0.5, 15, 1.0e-4, true);
-  const auto float_start = std::chrono::steady_clock::now();
-  const std::optional<DeviceAlignResult> ranked =
-    align_points_on_device(frame, map, 1, guess, 2.0, 0.5, 15, 1.0e-4, true);
-  const double float_ms = elapsed_ms(float_start);
-  std::cout << "align double " << device_ms << " ms, float rank " << float_ms << " ms, cpu " << cpu_ms
-            << " ms, frame " << frame.size() << std::endl;
+  std::cout << "align device " << device_ms << " ms, cpu " << cpu_ms << " ms, frame " << frame.size()
+            << ", iterations device " << (device ? device->iterations : 0.0) << " cpu " << cpu.iterations
+            << std::endl;
   ASSERT_TRUE(device.has_value());
-  ASSERT_TRUE(ranked.has_value());
   const Sophus::SE3d delta = cpu.pose.inverse() * device->pose;
-  const Sophus::SE3d float_delta = cpu.pose.inverse() * ranked->pose;
   EXPECT_LT(delta.translation().norm(), 1.0e-3);
   EXPECT_LT(delta.so3().log().norm(), 1.0e-3);
-  EXPECT_LT(float_delta.translation().norm(), 1.0e-3);
-  EXPECT_LT(float_delta.so3().log().norm(), 1.0e-3);
-  EXPECT_NEAR(device->robust_cost, robust_plane_cost(frame, device->pose, map, 2.0, 0.5), 1.0e-4);
-  (void)cpu_cost;
+  // The float neighbour ranking must keep the same correspondences as the CPU path.
+  EXPECT_NEAR(device->correspondences, cpu.correspondences, std::max(2, cpu.correspondences / 200));
+  EXPECT_NEAR(device->robust_cost, cpu.robust_cost, 1.0e-3);
+  // Both converge to the scene the frame was cut from.
+  EXPECT_LT(device->pose.translation().norm(), 2.0e-2);
+  EXPECT_FALSE(device->timed_out);
+}
+
+TEST(DeviceAccel, plane_align_returns_partial_pose_on_deadline)
+{
+  if (!device_available()) {
+    GTEST_SKIP() << "CUDA is not available";
+  }
+  const std::vector<Eigen::Vector3d> points = scene_points();
+  kiss_icp::VoxelHashMap map(0.5, 1.0e6, 20);
+  map.AddPoints(points);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = 0.5;
+  surface.rebuild_from(map);
+  const Sophus::SE3d guess(Sophus::SO3d(), Eigen::Vector3d(-0.15, 0.05, 0.0));
+  PlaneIcpParams params;
+  params.max_iterations = 30;
+  params.convergence_criterion = 1.0e-9;
+  (void)align_points_on_device(points, map, surface, 2, guess, params);
+  const auto deadline = std::chrono::steady_clock::now();
+  const std::optional<PlaneIcpResult> device =
+    align_points_on_device(points, map, surface, 2, guess, params, &deadline);
+  ASSERT_TRUE(device.has_value());
+  EXPECT_TRUE(device->timed_out);
+  EXPECT_FALSE(device->saturated);
+  EXPECT_DOUBLE_EQ(device->iterations, 0.0);
+  // No step taken: the partial pose is the seed.
+  EXPECT_LT((device->pose.inverse() * guess).log().norm(), 1.0e-12);
 }
 
 }  // namespace back_odom

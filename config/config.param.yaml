@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # The EKF publishes map to base_link. Leave this false so both nodes do not publish that transform.
-    publish_tf: false
+    publish_tf: true
     # Bags exported before boreas converts imu_raw still contain left-handed samples
     # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
     # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
@@ -20,31 +20,56 @@
     imu_max_trajectory_poses: 20000
     # Max |t_closest_imu - t_scan_end| when accepting a lidar/IMU pair.
     imu_max_pair_dt: 0.05
+    # Wall-clock bound on waiting for the IMU to reach the end of a sweep before matching.
+    imu_wait_timeout: 0.5
+    # IMU subscription depth. 200 Hz x 10 s; a dropped sample is an integration hole.
+    imu_queue_depth: 2000
     path_min_dt: 0.1
     path_max_poses: 1000
+    # RViz-only outputs. Markers/health at most this often; the map on a timer, only with a subscriber.
+    marker_min_dt: 0.1
+    health_min_dt: 0.1
+    map_publish_period: 1.0
     time_field: "time"
+    # Returns closer than min_range are the ego vehicle. max_range 0 = no cap (the crop box applies).
+    min_range: 1.5
+    max_range: 0.0
     voxel_size: 0.5
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 50.0
-    crop_lateral: 30.0
+    crop_longitudinal: 75.0
+    crop_lateral: 75.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
-    convergence_criterion: 0.0001
-    max_iterations: 50
-    # Target ICP rate. Align budget is 1/hz (100 ms at 10). Over budget aborts ICP
-    # mid-iteration and inserts the scan at the latest IMU pose. Drop toward 8.0
-    # if diagnostics show many align_timed_out events.
+    # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
+    # lidar-anchored seed. Saturated solves are accepted but do not update biases.
+    convergence_criterion: 0.001
+    max_iterations: 20
+    # Target ICP rate. Align budget is 1/hz (100 ms at 10). Past budget the partial solve is
+    # used when it took >= partial_min_iterations and its last step is < partial_max_step;
+    # otherwise the scan is skipped (never inserted at the IMU pose) and health degrades.
     align_rate_hz: 10.0
-    max_points_per_voxel: 50
+    partial_min_iterations: 3
+    partial_max_step: 0.01
+    # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
+    # 27-voxel neighbour scan growing past the budget.
+    max_points_per_voxel: 20
     max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
-    refine_window: true
+    refine_window: false
     refine_settle_passes: 2
-    # Off: ICP still builds the local map; IMU pose/velocity/biases stay open-loop.
-    apply_imu_correction: false
+    # Scans are inserted only after moving this far since the last inserted scan. Stationary
+    # scans are matched for the correction but never pile into the map.
+    keyframe_min_translation: 0.5
+    keyframe_min_rotation: 0.05
+    # GPU vs CPU bake-off at this scan (map must be representative), re-run every N scans. 0 = CPU only.
+    device_bakeoff_scan: 10
+    device_recheck_scans: 200
+    # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
+    # and the EKF see the lidar-corrected trajectory.
+    apply_imu_correction: true
     # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
@@ -61,6 +86,10 @@
     max_ndt_cost: 7.81
     ndt_cov_regularization: 0.001
     min_ndt_correspondences: 20
+    # Acceptance gates: fraction of NDT hits under max_ndt_cost, and plane
+    # correspondences / source points. Below either the scan is rejected.
+    min_ndt_inlier_fraction: 0.5
+    min_inlier_ratio: 0.3
     # Diagonal entries of the twist and pose messages sent to the EKF.
     twist_variance_vx: 0.05
     twist_variance_wz: 0.01

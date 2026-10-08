@@ -33,14 +33,22 @@
 
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace back_odom
 {
 
+/// IMU integration runs on the executor thread; every scan is matched on a dedicated worker
+/// thread fed by a single-slot mailbox (the newest scan wins). `state_mutex_` guards the IMU
+/// integrator and the matcher's committed state; the heavy ICP runs on an IMU snapshot outside
+/// the lock.
 class BackOdomNode : public rclcpp::Node
 {
 public:
@@ -50,8 +58,12 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
-  void match_pending_scan(bool force);
-  void publish_health(const rclcpp::Time & stamp);
+  void worker_loop();
+  void process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
+  void publish_match(
+    const MatchResult & matched, const ProcessorOutput & prior, const ProcessorOutput & corrected,
+    const rclcpp::Time & stamp);
+  void publish_health(LocalizationHealth health, int reject_streak, int timeout_streak);
   void publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp);
   void publish_odometry(
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
@@ -63,15 +75,31 @@ private:
     const std::string & source_frame, Sophus::SE3d & target_from_source);
   void publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_tf(const ProcessorOutput & output, const rclcpp::Time & stamp);
-  void publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp);
-  void publish_scan_poses(const rclcpp::Time & stamp);
-  void publish_local_map(const rclcpp::Time & stamp);
+  void publish_markers(const ProcessorOutput & output, LocalizationHealth health, const rclcpp::Time & stamp);
+  void publish_scan_poses(const std::vector<StampedPose> & poses, const rclcpp::Time & stamp);
+  void publish_local_map();
 
+  /// Guards imu_processor_ and the committed matcher state (map, horizon, health).
+  std::mutex state_mutex_;
+  std::condition_variable imu_cv_;
   std::unique_ptr<ImuProcessor> imu_processor_;
   std::unique_ptr<LidarImuMatcher> lidar_matcher_;
 
+  /// Single-slot scan mailbox.
+  std::mutex scan_mutex_;
+  std::condition_variable scan_cv_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr pending_cloud_;
+  std::uint64_t dropped_scans_{0};
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+
+  /// Guards the publisher-side bookkeeping (paths, last match, throttles).
+  std::mutex publish_mutex_;
+  std::mutex extrinsics_mutex_;
+
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+  rclcpp::TimerBase::SharedPtr map_timer_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_odom_pub_;
@@ -96,14 +124,11 @@ private:
   bool has_last_match_{false};
   rclcpp::Time last_path_stamp_{0, 0, RCL_ROS_TIME};
   bool has_published_path_{false};
-  bool aligned_{false};
-  struct PendingScan
-  {
-    LidarScan scan;
-    rclcpp::Time header_stamp;
-    std::string source_frame;
-  };
-  std::optional<PendingScan> pending_scan_;
+  rclcpp::Time last_marker_stamp_{0, 0, RCL_ROS_TIME};
+  bool has_published_markers_{false};
+  rclcpp::Time last_health_stamp_{0, 0, RCL_ROS_TIME};
+  bool has_published_health_{false};
+  std::atomic<bool> aligned_{false};
 
   std::string parent_frame_;
   std::string child_frame_;
@@ -113,7 +138,13 @@ private:
   std::size_t alignment_sample_count_{100};
   std::size_t path_max_poses_{1000};
   double imu_max_pair_dt_{0.05};
+  double imu_wait_timeout_{0.5};
   double path_min_dt_{0.1};
+  double marker_min_dt_{0.1};
+  double health_min_dt_{0.1};
+  double map_publish_period_{1.0};
+  double min_range_{1.0};
+  double max_range_{0.0};
   bool publish_tf_{true};
   bool initial_pose_sent_{false};
   double twist_variance_vx_{0.05};

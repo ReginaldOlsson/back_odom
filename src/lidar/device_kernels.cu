@@ -14,10 +14,15 @@
 
 #include "back_odom/lidar/device_kernels.hpp"
 
-#include <thrust/count.h>
+#include <thrust/copy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
+#include <thrust/fill.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/reduce.h>
+#include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <thrust/transform.h>
 #include <thrust/unique.h>
 
 #include <cuda_runtime.h>
@@ -27,7 +32,6 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <type_traits>
 #include <vector>
 
 namespace back_odom
@@ -36,10 +40,9 @@ namespace
 {
 
 constexpr int k_threads = 128;
-constexpr int k_max_blocks = 64;
-constexpr int k_neighbor_keep = 20;
-constexpr int k_min_plane_neighbors = 5;
+constexpr int k_max_blocks = 1024;
 constexpr double k_sophus_epsilon_sq = 1.0e-20;
+constexpr std::uint64_t k_outside_key = ~0ULL;
 
 int g_failed = 0;
 
@@ -52,8 +55,10 @@ struct MapPoint
   float fx;
   float fy;
   float fz;
+  float pad;
 };
 
+/// Persistent device copy of the local map. Grown on demand, never shrunk.
 struct MapCache
 {
   const void * owner{nullptr};
@@ -61,9 +66,14 @@ struct MapCache
   double voxel_size{0.0};
   int count{0};
   int unique{0};
+  int point_capacity{0};
   MapPoint * points{nullptr};
+  std::uint64_t * all_keys{nullptr};
   std::uint64_t * keys{nullptr};
+  int * counts{nullptr};
   int * offsets{nullptr};
+  CudaVoxelPlane * planes{nullptr};
+  int plane_capacity{0};
 };
 
 MapCache g_map;
@@ -96,11 +106,31 @@ bool check(const char * what, cudaError_t status)
   return false;
 }
 
+template <typename T>
+bool ensure_capacity(T *& pointer, int & capacity, const int needed)
+{
+  if (needed <= capacity && pointer != nullptr) {
+    return true;
+  }
+  cudaFree(pointer);
+  pointer = nullptr;
+  capacity = 0;
+  const int grown = std::max(needed, capacity + capacity / 2);
+  if (!check("cudaMalloc", cudaMalloc(&pointer, static_cast<std::size_t>(grown) * sizeof(T)))) {
+    return false;
+  }
+  capacity = grown;
+  return true;
+}
+
 void release_map()
 {
   cudaFree(g_map.points);
+  cudaFree(g_map.all_keys);
   cudaFree(g_map.keys);
+  cudaFree(g_map.counts);
   cudaFree(g_map.offsets);
+  cudaFree(g_map.planes);
   g_map = MapCache{};
 }
 
@@ -110,6 +140,11 @@ struct ByKey
   {
     return left.key < right.key;
   }
+};
+
+struct KeyOf
+{
+  __host__ __device__ std::uint64_t operator()(const MapPoint & point) const { return point.key; }
 };
 
 __device__ void mat_vec(const double rotation[9], const double translation[3], const double point[3], double out[3])
@@ -307,200 +342,6 @@ __device__ int find_voxel(const std::uint64_t * keys, int count, std::uint64_t k
   return -1;
 }
 
-template <bool k_float_rank>
-__device__ auto neighbor_distance(const MapPoint & point, double qx, double qy, double qz)
-{
-  if constexpr (k_float_rank) {
-    const float dx = point.fx - static_cast<float>(qx);
-    const float dy = point.fy - static_cast<float>(qy);
-    const float dz = point.fz - static_cast<float>(qz);
-    return dx * dx + dy * dy + dz * dz;
-  } else {
-    const double dx = point.x - qx;
-    const double dy = point.y - qy;
-    const double dz = point.z - qz;
-    return dx * dx + dy * dy + dz * dz;
-  }
-}
-
-template <bool k_float_rank>
-__device__ int collect_neighbors(
-  const MapPoint * points, const std::uint64_t * keys, const int * offsets, int unique,
-  double voxel_size, double qx, double qy, double qz, double out_x[k_neighbor_keep],
-  double out_y[k_neighbor_keep], double out_z[k_neighbor_keep])
-{
-  const int base_x = static_cast<int>(floor(qx / voxel_size));
-  const int base_y = static_cast<int>(floor(qy / voxel_size));
-  const int base_z = static_cast<int>(floor(qz / voxel_size));
-  int total = 0;
-  for (int shift = 0; shift < 27; ++shift) {
-    const std::uint64_t key = pack_voxel_key(
-      base_x + c_shifts[shift][0], base_y + c_shifts[shift][1], base_z + c_shifts[shift][2]);
-    const int found = find_voxel(keys, unique, key);
-    if (found >= 0) {
-      total += offsets[found + 1] - offsets[found];
-    }
-  }
-  if (total <= 0) {
-    return 0;
-  }
-  if (total <= k_neighbor_keep) {
-    int filled = 0;
-    for (int shift = 0; shift < 27; ++shift) {
-      const std::uint64_t key = pack_voxel_key(
-        base_x + c_shifts[shift][0], base_y + c_shifts[shift][1], base_z + c_shifts[shift][2]);
-      const int found = find_voxel(keys, unique, key);
-      if (found < 0) {
-        continue;
-      }
-      for (int cursor = offsets[found]; cursor < offsets[found + 1]; ++cursor) {
-        out_x[filled] = points[cursor].x;
-        out_y[filled] = points[cursor].y;
-        out_z[filled] = points[cursor].z;
-        ++filled;
-      }
-    }
-    return filled;
-  }
-
-  using Distance = std::conditional_t<k_float_rank, float, double>;
-  Distance best_d[k_neighbor_keep];
-  int filled = 0;
-  for (int shift = 0; shift < 27; ++shift) {
-    const std::uint64_t key = pack_voxel_key(
-      base_x + c_shifts[shift][0], base_y + c_shifts[shift][1], base_z + c_shifts[shift][2]);
-    const int found = find_voxel(keys, unique, key);
-    if (found < 0) {
-      continue;
-    }
-    for (int cursor = offsets[found]; cursor < offsets[found + 1]; ++cursor) {
-      const Distance distance = neighbor_distance<k_float_rank>(points[cursor], qx, qy, qz);
-      if (filled < k_neighbor_keep) {
-        best_d[filled] = distance;
-        out_x[filled] = points[cursor].x;
-        out_y[filled] = points[cursor].y;
-        out_z[filled] = points[cursor].z;
-        ++filled;
-      } else {
-        int worst = 0;
-        for (int slot = 1; slot < k_neighbor_keep; ++slot) {
-          if (best_d[slot] > best_d[worst]) {
-            worst = slot;
-          }
-        }
-        if (distance < best_d[worst]) {
-          best_d[worst] = distance;
-          out_x[worst] = points[cursor].x;
-          out_y[worst] = points[cursor].y;
-          out_z[worst] = points[cursor].z;
-        }
-      }
-    }
-  }
-  return filled;
-}
-
-__device__ bool plane_normal(
-  const double * xs, const double * ys, const double * zs, int count, double normal[3])
-{
-  if (count < k_min_plane_neighbors) {
-    return false;
-  }
-  double mean_x = 0.0;
-  double mean_y = 0.0;
-  double mean_z = 0.0;
-  for (int index = 0; index < count; ++index) {
-    mean_x += xs[index];
-    mean_y += ys[index];
-    mean_z += zs[index];
-  }
-  const double scale = 1.0 / static_cast<double>(count);
-  mean_x *= scale;
-  mean_y *= scale;
-  mean_z *= scale;
-  double A[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
-  for (int index = 0; index < count; ++index) {
-    const double dx = xs[index] - mean_x;
-    const double dy = ys[index] - mean_y;
-    const double dz = zs[index] - mean_z;
-    A[0][0] += dx * dx;
-    A[0][1] += dx * dy;
-    A[0][2] += dx * dz;
-    A[1][1] += dy * dy;
-    A[1][2] += dy * dz;
-    A[2][2] += dz * dz;
-  }
-  A[1][0] = A[0][1];
-  A[2][0] = A[0][2];
-  A[2][1] = A[1][2];
-  double V[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
-  for (int sweep = 0; sweep < 8; ++sweep) {
-    const int pairs[3][2] = {{0, 1}, {0, 2}, {1, 2}};
-    for (int pair = 0; pair < 3; ++pair) {
-      const int p = pairs[pair][0];
-      const int q = pairs[pair][1];
-      if (fabs(A[p][q]) < 1.0e-18) {
-        continue;
-      }
-      const double tau = (A[q][q] - A[p][p]) / (2.0 * A[p][q]);
-      const double sign = tau >= 0.0 ? 1.0 : -1.0;
-      const double t = sign / (fabs(tau) + sqrt(1.0 + tau * tau));
-      const double c = 1.0 / sqrt(1.0 + t * t);
-      const double s = t * c;
-      const double app = A[p][p];
-      const double aqq = A[q][q];
-      const double apq = A[p][q];
-      A[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-      A[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-      A[p][q] = 0.0;
-      A[q][p] = 0.0;
-      for (int row = 0; row < 3; ++row) {
-        if (row == p || row == q) {
-          continue;
-        }
-        const double arp = A[row][p];
-        const double arq = A[row][q];
-        A[row][p] = c * arp - s * arq;
-        A[p][row] = A[row][p];
-        A[row][q] = s * arp + c * arq;
-        A[q][row] = A[row][q];
-      }
-      for (int row = 0; row < 3; ++row) {
-        const double vrp = V[row][p];
-        const double vrq = V[row][q];
-        V[row][p] = c * vrp - s * vrq;
-        V[row][q] = s * vrp + c * vrq;
-      }
-    }
-  }
-  int min_axis = 0;
-  int max_axis = 0;
-  for (int axis = 1; axis < 3; ++axis) {
-    if (A[axis][axis] < A[min_axis][min_axis]) {
-      min_axis = axis;
-    }
-    if (A[axis][axis] > A[max_axis][max_axis]) {
-      max_axis = axis;
-    }
-  }
-  const double lambda_min = A[min_axis][min_axis];
-  const double lambda_max = A[max_axis][max_axis];
-  if (lambda_max <= 1.0e-8 || lambda_min / lambda_max > 0.25) {
-    return false;
-  }
-  normal[0] = V[0][min_axis];
-  normal[1] = V[1][min_axis];
-  normal[2] = V[2][min_axis];
-  const double norm = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
-  if (norm < 1.0e-8) {
-    return false;
-  }
-  normal[0] /= norm;
-  normal[1] /= norm;
-  normal[2] /= norm;
-  return true;
-}
-
 __device__ int upper_index(int row, int col)
 {
   return row * 6 - (row * (row - 1)) / 2 + (col - row);
@@ -514,56 +355,73 @@ struct Partial
   double cost;
 };
 
-template <bool k_float_rank>
+/// Closest map point in the 27-voxel neighbourhood (float ranking), plane from that voxel's
+/// cached normal, residual and Jacobian in double. Same association as align_to_surface.
 __global__ void plane_kernel(
   const double * frame, int frame_count, const double * rotation, const double * translation,
-  const MapPoint * points, const std::uint64_t * keys, const int * offsets, int unique,
-  double voxel_size, double max_distance, double kernel_scale, Partial * partials)
+  const MapPoint * points, const std::uint64_t * keys, const int * offsets,
+  const CudaVoxelPlane * planes, int unique, double voxel_size, double max_distance,
+  double kernel_scale, Partial * partials)
 {
   Partial local{};
   const double kernel2 = kernel_scale * kernel_scale;
+  const float max_distance_sq = static_cast<float>(max_distance * max_distance);
   for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < frame_count;
        index += blockDim.x * gridDim.x) {
     const double body[3] = {frame[3 * index], frame[3 * index + 1], frame[3 * index + 2]};
     double world[3];
     mat_vec(rotation, translation, body, world);
-    double xs[k_neighbor_keep];
-    double ys[k_neighbor_keep];
-    double zs[k_neighbor_keep];
-    const int neighbors = collect_neighbors<k_float_rank>(
-      points, keys, offsets, unique, voxel_size, world[0], world[1], world[2], xs, ys, zs);
-    double residual = max_distance;
-    bool planar = false;
-    double normal[3] = {0.0, 0.0, 0.0};
-    double closest[3] = {0.0, 0.0, 0.0};
-    double best = 0.0;
-    if (neighbors > 0) {
-      best = (xs[0] - world[0]) * (xs[0] - world[0]) + (ys[0] - world[1]) * (ys[0] - world[1]) +
-             (zs[0] - world[2]) * (zs[0] - world[2]);
-      closest[0] = xs[0];
-      closest[1] = ys[0];
-      closest[2] = zs[0];
-      for (int neighbor = 1; neighbor < neighbors; ++neighbor) {
-        const double dx = xs[neighbor] - world[0];
-        const double dy = ys[neighbor] - world[1];
-        const double dz = zs[neighbor] - world[2];
-        const double distance = dx * dx + dy * dy + dz * dz;
+    const float qx = static_cast<float>(world[0]);
+    const float qy = static_cast<float>(world[1]);
+    const float qz = static_cast<float>(world[2]);
+    const int base_x = static_cast<int>(floor(world[0] / voxel_size));
+    const int base_y = static_cast<int>(floor(world[1] / voxel_size));
+    const int base_z = static_cast<int>(floor(world[2] / voxel_size));
+
+    float best = max_distance_sq;
+    int best_point = -1;
+    int best_voxel = -1;
+    for (int shift = 0; shift < 27; ++shift) {
+      const std::uint64_t key = pack_voxel_key(
+        base_x + c_shifts[shift][0], base_y + c_shifts[shift][1], base_z + c_shifts[shift][2]);
+      const int found = find_voxel(keys, unique, key);
+      if (found < 0) {
+        continue;
+      }
+      const int begin = offsets[found];
+      const int end = offsets[found + 1];
+      for (int cursor = begin; cursor < end; ++cursor) {
+        const MapPoint point = points[cursor];
+        const float dx = point.fx - qx;
+        const float dy = point.fy - qy;
+        const float dz = point.fz - qz;
+        const float distance = dx * dx + dy * dy + dz * dz;
         if (distance < best) {
           best = distance;
-          closest[0] = xs[neighbor];
-          closest[1] = ys[neighbor];
-          closest[2] = zs[neighbor];
+          best_point = cursor;
+          best_voxel = found;
         }
       }
-      planar = plane_normal(xs, ys, zs, neighbors, normal);
-      if (planar && sqrt(best) <= max_distance) {
-        residual = normal[0] * (world[0] - closest[0]) + normal[1] * (world[1] - closest[1]) +
-                   normal[2] * (world[2] - closest[2]);
+    }
+
+    double residual = max_distance;
+    bool usable = false;
+    double normal[3] = {0.0, 0.0, 0.0};
+    if (best_point >= 0) {
+      const CudaVoxelPlane plane = planes[best_voxel];
+      if (plane.planar != 0) {
+        const MapPoint closest = points[best_point];
+        normal[0] = plane.nx;
+        normal[1] = plane.ny;
+        normal[2] = plane.nz;
+        residual = normal[0] * (world[0] - closest.x) + normal[1] * (world[1] - closest.y) +
+                   normal[2] * (world[2] - closest.z);
+        usable = true;
       }
     }
     const double denom = kernel_scale + residual * residual;
     local.cost += kernel2 * residual * residual / denom;
-    if (!(planar && sqrt(best) < max_distance)) {
+    if (!usable) {
       continue;
     }
     const double normal_body[3] = {
@@ -632,8 +490,6 @@ int upper_host(int row, int col)
   return row * 6 - (row * (row - 1)) / 2 + (col - row);
 }
 
-constexpr std::uint64_t k_outside_key = ~0ULL;
-
 struct FrontPoint
 {
   std::uint64_t key;
@@ -641,6 +497,7 @@ struct FrontPoint
   double y;
   double z;
   int index;
+  int pad;
 };
 
 struct FrontScratch
@@ -649,6 +506,7 @@ struct FrontScratch
   double * stamps{nullptr};
   double * deskewed{nullptr};
   FrontPoint * tagged{nullptr};
+  FrontPoint * coarse{nullptr};
   CudaSegment * segments{nullptr};
   double * pose{nullptr};
   int point_capacity{0};
@@ -671,11 +529,6 @@ struct SameFrontKey
   {
     return left.key == right.key;
   }
-};
-
-struct InsideBox
-{
-  __host__ __device__ bool operator()(const FrontPoint & point) const { return point.key != k_outside_key; }
 };
 
 __global__ void tag_front_kernel(
@@ -703,6 +556,21 @@ __global__ void tag_front_kernel(
     static_cast<int>(floor(z / voxel_size)));
 }
 
+__global__ void retag_kernel(const FrontPoint * fine, int count, double voxel_size, FrontPoint * coarse)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  FrontPoint point = fine[index];
+  if (point.key != k_outside_key) {
+    point.key = pack_voxel_key(
+      static_cast<int>(floor(point.x / voxel_size)), static_cast<int>(floor(point.y / voxel_size)),
+      static_cast<int>(floor(point.z / voxel_size)));
+  }
+  coarse[index] = point;
+}
+
 bool ensure_front(const int count, const int segment_count)
 {
   if (g_front.pose == nullptr &&
@@ -714,21 +582,25 @@ bool ensure_front(const int count, const int segment_count)
     cudaFree(g_front.stamps);
     cudaFree(g_front.deskewed);
     cudaFree(g_front.tagged);
+    cudaFree(g_front.coarse);
     g_front.raw = nullptr;
     g_front.stamps = nullptr;
     g_front.deskewed = nullptr;
     g_front.tagged = nullptr;
+    g_front.coarse = nullptr;
     g_front.point_capacity = 0;
+    const int grown = count + count / 4;
     const bool allocated =
-      check("cudaMalloc", cudaMalloc(&g_front.raw, static_cast<std::size_t>(count) * 3 * sizeof(double))) &&
-      check("cudaMalloc", cudaMalloc(&g_front.stamps, static_cast<std::size_t>(count) * sizeof(double))) &&
+      check("cudaMalloc", cudaMalloc(&g_front.raw, static_cast<std::size_t>(grown) * 3 * sizeof(double))) &&
+      check("cudaMalloc", cudaMalloc(&g_front.stamps, static_cast<std::size_t>(grown) * sizeof(double))) &&
       check(
-        "cudaMalloc", cudaMalloc(&g_front.deskewed, static_cast<std::size_t>(count) * 3 * sizeof(double))) &&
-      check("cudaMalloc", cudaMalloc(&g_front.tagged, static_cast<std::size_t>(count) * sizeof(FrontPoint)));
+        "cudaMalloc", cudaMalloc(&g_front.deskewed, static_cast<std::size_t>(grown) * 3 * sizeof(double))) &&
+      check("cudaMalloc", cudaMalloc(&g_front.tagged, static_cast<std::size_t>(grown) * sizeof(FrontPoint))) &&
+      check("cudaMalloc", cudaMalloc(&g_front.coarse, static_cast<std::size_t>(grown) * sizeof(FrontPoint)));
     if (!allocated) {
       return false;
     }
-    g_front.point_capacity = count;
+    g_front.point_capacity = grown;
   }
   if (segment_count > g_front.segment_capacity) {
     cudaFree(g_front.segments);
@@ -784,38 +656,57 @@ bool cuda_map_current(const void * owner, const std::uint64_t epoch, const doubl
 
 bool cuda_upload_map(
   const void * owner, const std::uint64_t epoch, const double voxel_size, const double * xyz,
-  const std::uint64_t * keys, const int count)
+  const std::uint64_t * keys, const int count, std::vector<std::uint64_t> & unique_keys)
 {
+  unique_keys.clear();
   if (!cuda_available()) {
     return false;
   }
-  if (cuda_map_current(owner, epoch, voxel_size) && g_map.count == count) {
-    return true;
-  }
-  release_map();
-  g_map.owner = owner;
-  g_map.epoch = epoch;
-  g_map.voxel_size = voxel_size;
-  g_map.count = count;
   if (count <= 0) {
-    g_map.points = nullptr;
+    g_map.owner = owner;
+    g_map.epoch = epoch;
+    g_map.voxel_size = voxel_size;
+    g_map.count = 0;
     g_map.unique = 0;
     return true;
   }
   std::vector<MapPoint> host(static_cast<std::size_t>(count));
   for (int index = 0; index < count; ++index) {
-    host[static_cast<std::size_t>(index)].key = keys[index];
-    host[static_cast<std::size_t>(index)].x = xyz[3 * index];
-    host[static_cast<std::size_t>(index)].y = xyz[3 * index + 1];
-    host[static_cast<std::size_t>(index)].z = xyz[3 * index + 2];
-    host[static_cast<std::size_t>(index)].fx = static_cast<float>(xyz[3 * index]);
-    host[static_cast<std::size_t>(index)].fy = static_cast<float>(xyz[3 * index + 1]);
-    host[static_cast<std::size_t>(index)].fz = static_cast<float>(xyz[3 * index + 2]);
+    MapPoint & point = host[static_cast<std::size_t>(index)];
+    point.key = keys[index];
+    point.x = xyz[3 * index];
+    point.y = xyz[3 * index + 1];
+    point.z = xyz[3 * index + 2];
+    point.fx = static_cast<float>(point.x);
+    point.fy = static_cast<float>(point.y);
+    point.fz = static_cast<float>(point.z);
+    point.pad = 0.0F;
   }
-  if (!check("cudaMalloc", cudaMalloc(&g_map.points, static_cast<std::size_t>(count) * sizeof(MapPoint)))) {
+  // Persistent buffers sized to the map; all per-point arrays share one capacity.
+  if (count > g_map.point_capacity || g_map.points == nullptr) {
+    const int grown = std::max(count + count / 4, g_map.point_capacity);
+    CudaVoxelPlane * planes = g_map.planes;
+    const int plane_capacity = g_map.plane_capacity;
+    g_map.planes = nullptr;
     release_map();
-    return false;
+    g_map.planes = planes;
+    g_map.plane_capacity = plane_capacity;
+    const std::size_t capacity = static_cast<std::size_t>(grown) + 1;
+    if (
+      !check("cudaMalloc", cudaMalloc(&g_map.points, capacity * sizeof(MapPoint))) ||
+      !check("cudaMalloc", cudaMalloc(&g_map.all_keys, capacity * sizeof(std::uint64_t))) ||
+      !check("cudaMalloc", cudaMalloc(&g_map.keys, capacity * sizeof(std::uint64_t))) ||
+      !check("cudaMalloc", cudaMalloc(&g_map.counts, capacity * sizeof(int))) ||
+      !check("cudaMalloc", cudaMalloc(&g_map.offsets, capacity * sizeof(int)))) {
+      release_map();
+      return false;
+    }
+    g_map.point_capacity = grown;
   }
+  g_map.owner = owner;
+  g_map.epoch = epoch;
+  g_map.voxel_size = voxel_size;
+  g_map.count = count;
   if (!check(
         "cudaMemcpy",
         cudaMemcpy(
@@ -825,51 +716,61 @@ bool cuda_upload_map(
     return false;
   }
   try {
-    thrust::stable_sort(thrust::device, g_map.points, g_map.points + count, ByKey{});
+    thrust::device_ptr<MapPoint> points(g_map.points);
+    thrust::device_ptr<std::uint64_t> all_keys(g_map.all_keys);
+    thrust::device_ptr<std::uint64_t> keys_out(g_map.keys);
+    thrust::device_ptr<int> counts(g_map.counts);
+    thrust::device_ptr<int> offsets(g_map.offsets);
+    thrust::stable_sort(thrust::device, points, points + count, ByKey{});
+    thrust::transform(thrust::device, points, points + count, all_keys, KeyOf{});
+    const auto ends = thrust::reduce_by_key(
+      thrust::device, all_keys, all_keys + count, thrust::constant_iterator<int>(1), keys_out, counts);
+    const int unique = static_cast<int>(ends.first - keys_out);
+    thrust::exclusive_scan(thrust::device, counts, counts + unique, offsets);
+    // offsets[unique] = count
+    if (!check("cudaMemcpy", cudaMemcpy(g_map.offsets + unique, &count, sizeof(int), cudaMemcpyHostToDevice))) {
+      release_map();
+      return false;
+    }
+    g_map.unique = unique;
+    unique_keys.resize(static_cast<std::size_t>(unique));
+    if (!check(
+          "cudaMemcpy",
+          cudaMemcpy(
+            unique_keys.data(), g_map.keys, static_cast<std::size_t>(unique) * sizeof(std::uint64_t),
+            cudaMemcpyDeviceToHost))) {
+      release_map();
+      return false;
+    }
   } catch (const std::exception & error) {
     std::fprintf(stderr, "back_odom CUDA disabled after map sort: %s\n", error.what());
     g_failed = 1;
     release_map();
     return false;
   }
-  if (!check("cudaMemcpy", cudaMemcpy(
-                             host.data(), g_map.points, static_cast<std::size_t>(count) * sizeof(MapPoint),
-                             cudaMemcpyDeviceToHost))) {
-    release_map();
-    return false;
-  }
-  std::vector<std::uint64_t> unique;
-  std::vector<int> offsets;
-  unique.reserve(static_cast<std::size_t>(count));
-  offsets.reserve(static_cast<std::size_t>(count) + 1);
-  unique.push_back(host.front().key);
-  offsets.push_back(0);
-  for (int index = 1; index < count; ++index) {
-    if (host[static_cast<std::size_t>(index)].key != unique.back()) {
-      unique.push_back(host[static_cast<std::size_t>(index)].key);
-      offsets.push_back(index);
-    }
-  }
-  offsets.push_back(count);
-  g_map.unique = static_cast<int>(unique.size());
-  if (!check("cudaMalloc", cudaMalloc(&g_map.keys, unique.size() * sizeof(std::uint64_t))) ||
-      !check("cudaMalloc", cudaMalloc(&g_map.offsets, offsets.size() * sizeof(int)))) {
-    release_map();
-    return false;
-  }
-  if (!check(
-        "cudaMemcpy",
-        cudaMemcpy(
-          g_map.keys, unique.data(), unique.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice)) ||
-      !check(
-        "cudaMemcpy",
-        cudaMemcpy(
-          g_map.offsets, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice))) {
-    release_map();
-    return false;
-  }
   return true;
 }
+
+bool cuda_upload_planes(const CudaVoxelPlane * planes, const int unique_count)
+{
+  if (!cuda_available() || unique_count != g_map.unique) {
+    return false;
+  }
+  if (unique_count <= 0) {
+    return true;
+  }
+  if (!ensure_capacity(g_map.planes, g_map.plane_capacity, unique_count)) {
+    return false;
+  }
+  return check(
+    "cudaMemcpy",
+    cudaMemcpy(
+      g_map.planes, planes, static_cast<std::size_t>(unique_count) * sizeof(CudaVoxelPlane),
+      cudaMemcpyHostToDevice));
+}
+
+namespace
+{
 
 struct PlaneScratch
 {
@@ -877,17 +778,16 @@ struct PlaneScratch
   int frame_capacity{0};
   int frame_count{0};
   Partial * partials{nullptr};
-  double * rotation{nullptr};
-  double * translation{nullptr};
+  double * pose{nullptr};
+  std::vector<Partial> host_partials;
 };
 
 PlaneScratch g_plane;
 
-bool plane_scratch(const int frame_count, const int blocks)
+bool plane_scratch(const int frame_count)
 {
-  if (g_plane.rotation == nullptr) {
-    if (!check("cudaMalloc", cudaMalloc(&g_plane.rotation, 9 * sizeof(double))) ||
-        !check("cudaMalloc", cudaMalloc(&g_plane.translation, 3 * sizeof(double))) ||
+  if (g_plane.pose == nullptr) {
+    if (!check("cudaMalloc", cudaMalloc(&g_plane.pose, 12 * sizeof(double))) ||
         !check("cudaMalloc", cudaMalloc(&g_plane.partials, static_cast<std::size_t>(k_max_blocks) * sizeof(Partial)))) {
       return false;
     }
@@ -897,29 +797,37 @@ bool plane_scratch(const int frame_count, const int blocks)
     g_plane.frame = nullptr;
     g_plane.frame_capacity = 0;
     g_plane.frame_count = 0;
+    const int grown = frame_count + frame_count / 4;
     if (!check(
           "cudaMalloc",
-          cudaMalloc(&g_plane.frame, static_cast<std::size_t>(frame_count) * 3 * sizeof(double)))) {
+          cudaMalloc(&g_plane.frame, static_cast<std::size_t>(grown) * 3 * sizeof(double)))) {
       return false;
     }
-    g_plane.frame_capacity = frame_count;
+    g_plane.frame_capacity = grown;
   }
-  (void)blocks;
   return g_plane.frame != nullptr && g_plane.partials != nullptr;
 }
+
+}  // namespace
 
 bool cuda_plane_system(
   const double * frame_xyz, const int frame_count, const double rotation[9],
   const double translation[3], const double max_distance, const double kernel_scale,
-  const bool float_rank, const bool upload_frame, CudaPlaneSystem & system)
+  const bool upload_frame, CudaPlaneSystem & system)
 {
   system = CudaPlaneSystem{};
   system.point_count = frame_count;
-  if (!cuda_available() || frame_count <= 0 || g_map.points == nullptr || g_map.unique <= 0) {
-    return cuda_available() && frame_count > 0;
+  if (!cuda_available() || frame_count <= 0) {
+    return false;
+  }
+  if (g_map.unique <= 0) {
+    return true;  // empty map: no correspondences, zero system
+  }
+  if (g_map.points == nullptr || g_map.planes == nullptr) {
+    return false;
   }
   const int blocks = std::max(1, std::min(k_max_blocks, (frame_count + k_threads - 1) / k_threads));
-  if (!plane_scratch(frame_count, blocks)) {
+  if (!plane_scratch(frame_count)) {
     return false;
   }
   if (upload_frame || g_plane.frame_count != frame_count) {
@@ -933,34 +841,29 @@ bool cuda_plane_system(
     }
     g_plane.frame_count = frame_count;
   }
-  if (!check("cudaMemcpy", cudaMemcpy(g_plane.rotation, rotation, 9 * sizeof(double), cudaMemcpyHostToDevice)) ||
-      !check(
-        "cudaMemcpy",
-        cudaMemcpy(g_plane.translation, translation, 3 * sizeof(double), cudaMemcpyHostToDevice))) {
+  double pose[12];
+  std::memcpy(pose, rotation, 9 * sizeof(double));
+  std::memcpy(pose + 9, translation, 3 * sizeof(double));
+  if (!check("cudaMemcpy", cudaMemcpy(g_plane.pose, pose, 12 * sizeof(double), cudaMemcpyHostToDevice))) {
     return false;
   }
-  if (float_rank) {
-    plane_kernel<true><<<blocks, k_threads>>>(
-      g_plane.frame, frame_count, g_plane.rotation, g_plane.translation, g_map.points, g_map.keys,
-      g_map.offsets, g_map.unique, g_map.voxel_size, max_distance, kernel_scale, g_plane.partials);
-  } else {
-    plane_kernel<false><<<blocks, k_threads>>>(
-      g_plane.frame, frame_count, g_plane.rotation, g_plane.translation, g_map.points, g_map.keys,
-      g_map.offsets, g_map.unique, g_map.voxel_size, max_distance, kernel_scale, g_plane.partials);
-  }
-  if (!check("plane_kernel", cudaGetLastError()) || !check("cudaDeviceSynchronize", cudaDeviceSynchronize())) {
+  plane_kernel<<<blocks, k_threads>>>(
+    g_plane.frame, frame_count, g_plane.pose, g_plane.pose + 9, g_map.points, g_map.keys,
+    g_map.offsets, g_map.planes, g_map.unique, g_map.voxel_size, max_distance, kernel_scale,
+    g_plane.partials);
+  if (!check("plane_kernel", cudaGetLastError())) {
     return false;
   }
-  std::vector<Partial> host(static_cast<std::size_t>(blocks));
+  g_plane.host_partials.resize(static_cast<std::size_t>(blocks));
   if (!check(
         "cudaMemcpy",
         cudaMemcpy(
-          host.data(), g_plane.partials, static_cast<std::size_t>(blocks) * sizeof(Partial),
+          g_plane.host_partials.data(), g_plane.partials, static_cast<std::size_t>(blocks) * sizeof(Partial),
           cudaMemcpyDeviceToHost))) {
     return false;
   }
   double upper[21] = {};
-  for (const Partial & partial : host) {
+  for (const Partial & partial : g_plane.host_partials) {
     for (int item = 0; item < 21; ++item) {
       upper[item] += partial.jtj[item];
     }
@@ -992,51 +895,27 @@ bool cuda_deskew(
   if (!cuda_available() || count <= 0) {
     return cuda_available();
   }
-  double * points = nullptr;
-  double * stamp_device = nullptr;
-  double * deskewed = nullptr;
-  CudaSegment * segment_device = nullptr;
-  double * pose = nullptr;
-  const std::size_t pose_bytes = (9 + 3) * 4 * sizeof(double);
-  if (!check("cudaMalloc", cudaMalloc(&points, static_cast<std::size_t>(count) * 3 * sizeof(double))) ||
-      !check("cudaMalloc", cudaMalloc(&stamp_device, static_cast<std::size_t>(count) * sizeof(double))) ||
-      !check("cudaMalloc", cudaMalloc(&deskewed, static_cast<std::size_t>(count) * 3 * sizeof(double))) ||
-      !check("cudaMalloc", cudaMalloc(&pose, pose_bytes))) {
-    cudaFree(points);
-    cudaFree(stamp_device);
-    cudaFree(deskewed);
-    cudaFree(pose);
-    return false;
-  }
-  if (segment_count > 0 &&
-      !check("cudaMalloc", cudaMalloc(&segment_device, static_cast<std::size_t>(segment_count) * sizeof(CudaSegment)))) {
-    cudaFree(points);
-    cudaFree(stamp_device);
-    cudaFree(deskewed);
-    cudaFree(pose);
+  if (!ensure_front(count, segment_count)) {
     return false;
   }
   auto upload_pose = [&](const double rotation[9], const double translation[3], double * slot) {
     return check("cudaMemcpy", cudaMemcpy(slot, rotation, 9 * sizeof(double), cudaMemcpyHostToDevice)) &&
-           check(
-             "cudaMemcpy",
-             cudaMemcpy(slot + 9, translation, 3 * sizeof(double), cudaMemcpyHostToDevice));
+           check("cudaMemcpy", cudaMemcpy(slot + 9, translation, 3 * sizeof(double), cudaMemcpyHostToDevice));
   };
-  double * front = pose;
-  double * back = pose + 12;
-  double * end_inverse = pose + 24;
-  double * body = pose + 36;
+  double * front = g_front.pose;
+  double * back = g_front.pose + 12;
+  double * end_inverse = g_front.pose + 24;
+  double * body = g_front.pose + 36;
   const bool copied =
     check(
       "cudaMemcpy",
       cudaMemcpy(
-        points, points_xyz, static_cast<std::size_t>(count) * 3 * sizeof(double),
+        g_front.raw, points_xyz, static_cast<std::size_t>(count) * 3 * sizeof(double),
         cudaMemcpyHostToDevice)) &&
     check(
       "cudaMemcpy",
       cudaMemcpy(
-        stamp_device, stamps, static_cast<std::size_t>(count) * sizeof(double),
-        cudaMemcpyHostToDevice)) &&
+        g_front.stamps, stamps, static_cast<std::size_t>(count) * sizeof(double), cudaMemcpyHostToDevice)) &&
     upload_pose(front_rotation, front_translation, front) &&
     upload_pose(back_rotation, back_translation, back) &&
     upload_pose(end_inverse_rotation, end_inverse_translation, end_inverse) &&
@@ -1045,33 +924,22 @@ bool cuda_deskew(
      check(
        "cudaMemcpy",
        cudaMemcpy(
-         segment_device, segments, static_cast<std::size_t>(segment_count) * sizeof(CudaSegment),
+         g_front.segments, segments, static_cast<std::size_t>(segment_count) * sizeof(CudaSegment),
          cudaMemcpyHostToDevice)));
   if (!copied) {
-    cudaFree(points);
-    cudaFree(stamp_device);
-    cudaFree(deskewed);
-    cudaFree(segment_device);
-    cudaFree(pose);
     return false;
   }
   const int blocks = (count + k_threads - 1) / k_threads;
   deskew_kernel<<<blocks, k_threads>>>(
-    points, stamp_device, count, segment_device, segment_count, front_stamp, back_stamp, front,
-    front + 9, back, back + 9, end_inverse, end_inverse + 9, body, body + 9, deskewed);
+    g_front.raw, g_front.stamps, count, g_front.segments, segment_count, front_stamp, back_stamp, front,
+    front + 9, back, back + 9, end_inverse, end_inverse + 9, body, body + 9, g_front.deskewed);
   deskewed_xyz.resize(static_cast<std::size_t>(count) * 3);
   const bool ok = check("deskew_kernel", cudaGetLastError()) &&
-                  check("cudaDeviceSynchronize", cudaDeviceSynchronize()) &&
                   check(
                     "cudaMemcpy",
                     cudaMemcpy(
-                      deskewed_xyz.data(), deskewed,
+                      deskewed_xyz.data(), g_front.deskewed,
                       static_cast<std::size_t>(count) * 3 * sizeof(double), cudaMemcpyDeviceToHost));
-  cudaFree(points);
-  cudaFree(stamp_device);
-  cudaFree(deskewed);
-  cudaFree(segment_device);
-  cudaFree(pose);
   if (!ok) {
     deskewed_xyz.clear();
   }
@@ -1085,14 +953,14 @@ bool cuda_front_downsample(
   const double back_translation[3], const double end_inverse_rotation[9],
   const double end_inverse_translation[3], const double body_rotation[9],
   const double body_translation[3], const double half_longitudinal, const double half_lateral,
-  const double voxel_size, std::vector<double> & kept_xyz, std::vector<int> & kept_index,
-  int & cropped_count)
+  const double fine_voxel, const double coarse_voxel, std::vector<double> & fine_xyz,
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
 {
-  kept_xyz.clear();
-  kept_index.clear();
-  cropped_count = 0;
-  if (!cuda_available() || count <= 0 || !(voxel_size > 0.0)) {
-    return cuda_available() && count > 0 && voxel_size > 0.0;
+  fine_xyz.clear();
+  fine_index.clear();
+  coarse_xyz.clear();
+  if (!cuda_available() || count <= 0 || !(fine_voxel > 0.0) || !(coarse_voxel > 0.0)) {
+    return cuda_available() && count > 0 && fine_voxel > 0.0 && coarse_voxel > 0.0;
   }
   if (!ensure_front(count, segment_count)) {
     return false;
@@ -1133,48 +1001,72 @@ bool cuda_front_downsample(
     g_front.raw, g_front.stamps, count, g_front.segments, segment_count, front_stamp, back_stamp, front,
     front + 9, back, back + 9, end_inverse, end_inverse + 9, body, body + 9, g_front.deskewed);
   tag_front_kernel<<<blocks, k_threads>>>(
-    g_front.deskewed, count, voxel_size, half_longitudinal, half_lateral, g_front.tagged);
-  if (!check("front_kernels", cudaGetLastError()) ||
-      !check("cudaDeviceSynchronize", cudaDeviceSynchronize())) {
+    g_front.deskewed, count, fine_voxel, half_longitudinal, half_lateral, g_front.tagged);
+  if (!check("front_kernels", cudaGetLastError())) {
     return false;
   }
   try {
-    cropped_count = static_cast<int>(thrust::count_if(
-      thrust::device, g_front.tagged, g_front.tagged + count, InsideBox{}));
-    thrust::stable_sort(thrust::device, g_front.tagged, g_front.tagged + count, ByFrontKey{});
-    const FrontPoint * unique_end =
-      thrust::unique(thrust::device, g_front.tagged, g_front.tagged + count, SameFrontKey{});
-    const int unique_count = static_cast<int>(unique_end - g_front.tagged);
-    std::vector<FrontPoint> host(static_cast<std::size_t>(std::max(unique_count, 0)));
-    if (unique_count > 0 &&
+    thrust::device_ptr<FrontPoint> tagged(g_front.tagged);
+    thrust::device_ptr<FrontPoint> coarse(g_front.coarse);
+    // Fine level: stable sort keeps the first input point per voxel, like kiss VoxelDownsample.
+    thrust::stable_sort(thrust::device, tagged, tagged + count, ByFrontKey{});
+    const auto fine_end = thrust::unique(thrust::device, tagged, tagged + count, SameFrontKey{});
+    int fine_count = static_cast<int>(fine_end - tagged);
+    // Points outside the box share k_outside_key, which sorts last; one survivor is left.
+    std::vector<FrontPoint> host(static_cast<std::size_t>(std::max(fine_count, 0)));
+    if (fine_count > 0 &&
         !check(
           "cudaMemcpy",
           cudaMemcpy(
-            host.data(), g_front.tagged, static_cast<std::size_t>(unique_count) * sizeof(FrontPoint),
+            host.data(), g_front.tagged, static_cast<std::size_t>(fine_count) * sizeof(FrontPoint),
             cudaMemcpyDeviceToHost))) {
       return false;
     }
-    host.erase(
-      std::remove_if(
-        host.begin(), host.end(), [](const FrontPoint & point) { return point.key == k_outside_key; }),
-      host.end());
-    std::sort(host.begin(), host.end(), [](const FrontPoint & left, const FrontPoint & right) {
-      return left.index < right.index;
-    });
-    kept_xyz.reserve(host.size() * 3);
-    kept_index.reserve(host.size());
+    if (!host.empty() && host.back().key == k_outside_key) {
+      host.pop_back();
+      --fine_count;
+    }
+    fine_xyz.reserve(host.size() * 3);
+    fine_index.reserve(host.size());
     for (const FrontPoint & point : host) {
-      kept_xyz.push_back(point.x);
-      kept_xyz.push_back(point.y);
-      kept_xyz.push_back(point.z);
-      kept_index.push_back(point.index);
+      fine_xyz.push_back(point.x);
+      fine_xyz.push_back(point.y);
+      fine_xyz.push_back(point.z);
+      fine_index.push_back(point.index);
+    }
+    if (fine_count <= 0) {
+      return true;
+    }
+    // Coarse level from the fine survivors.
+    const int coarse_blocks = (fine_count + k_threads - 1) / k_threads;
+    retag_kernel<<<coarse_blocks, k_threads>>>(g_front.tagged, fine_count, coarse_voxel, g_front.coarse);
+    if (!check("retag_kernel", cudaGetLastError())) {
+      return false;
+    }
+    thrust::stable_sort(thrust::device, coarse, coarse + fine_count, ByFrontKey{});
+    const auto coarse_end = thrust::unique(thrust::device, coarse, coarse + fine_count, SameFrontKey{});
+    const int coarse_count = static_cast<int>(coarse_end - coarse);
+    std::vector<FrontPoint> coarse_host(static_cast<std::size_t>(std::max(coarse_count, 0)));
+    if (coarse_count > 0 &&
+        !check(
+          "cudaMemcpy",
+          cudaMemcpy(
+            coarse_host.data(), g_front.coarse, static_cast<std::size_t>(coarse_count) * sizeof(FrontPoint),
+            cudaMemcpyDeviceToHost))) {
+      return false;
+    }
+    coarse_xyz.reserve(coarse_host.size() * 3);
+    for (const FrontPoint & point : coarse_host) {
+      coarse_xyz.push_back(point.x);
+      coarse_xyz.push_back(point.y);
+      coarse_xyz.push_back(point.z);
     }
   } catch (const std::exception & error) {
     std::fprintf(stderr, "back_odom CUDA disabled after front downsample: %s\n", error.what());
     g_failed = 1;
-    kept_xyz.clear();
-    kept_index.clear();
-    cropped_count = 0;
+    fine_xyz.clear();
+    fine_index.clear();
+    coarse_xyz.clear();
     return false;
   }
   return true;

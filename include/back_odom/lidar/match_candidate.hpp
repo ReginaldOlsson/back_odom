@@ -27,12 +27,19 @@ struct MatchCandidate
   Sophus::SE3d pose{};
   double cost{std::numeric_limits<double>::infinity()};
   double ndt_cost{std::numeric_limits<double>::quiet_NaN()};
+  double ndt_inlier_fraction{std::numeric_limits<double>::quiet_NaN()};
   double iterations{0.0};
+  double last_step{0.0};
+  int correspondences{0};
+  double inlier_ratio{0.0};
+  int degenerate_axes{0};
   bool passes{false};
   bool present{false};
   bool saturated{false};
-  /// ICP abandoned the solve to keep the align-rate budget; pose is unused.
+  /// ICP hit the align-rate budget before converging.
   bool timed_out{false};
+  /// The partial solve had settled enough to be scored and used like a full solve.
+  bool partial_used{false};
 };
 
 }  // namespace back_odom

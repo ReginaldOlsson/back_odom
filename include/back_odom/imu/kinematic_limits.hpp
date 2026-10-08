@@ -39,13 +39,17 @@ enum class HealthEvent
   Saturated,
   Rejected,
   KinematicViolation,
-  SpeedClamped
+  SpeedClamped,
+  /// ICP ran out of its rate budget before settling. A compute problem, not a divergence:
+  /// the scan is skipped, nothing is inserted, and the IMU keeps dead reckoning.
+  TimedOut
 };
 
 struct HealthState
 {
   LocalizationHealth health{LocalizationHealth::Healthy};
   int reject_streak{0};
+  int timeout_streak{0};
   bool update_bias{true};
   bool restore_speed{false};
 };
@@ -118,6 +122,15 @@ struct HealthState
     next.reject_streak = state.reject_streak + 1;
     return next;
   }
+  if (event == HealthEvent::TimedOut) {
+    // Keep the reject streak as is: the map was not consulted, so nothing was learned.
+    next.timeout_streak = state.timeout_streak + 1;
+    next.update_bias = false;
+    next.health = state.health == LocalizationHealth::Diverged ? LocalizationHealth::Diverged
+                                                                : LocalizationHealth::Degraded;
+    return next;
+  }
+  next.timeout_streak = 0;
   if (event == HealthEvent::Rejected) {
     next.reject_streak = state.reject_streak + 1;
     next.update_bias = false;

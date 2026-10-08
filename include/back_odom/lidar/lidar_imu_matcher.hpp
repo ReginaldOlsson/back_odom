@@ -19,9 +19,9 @@
 #include "back_odom/imu/kinematic_limits.hpp"
 #include "back_odom/lidar/match_candidate.hpp"
 #include "back_odom/lidar/ndt_health.hpp"
+#include "back_odom/lidar/plane_icp.hpp"
 
 #include <Eigen/Core>
-#include <kiss_icp_cpp/core/Registration.hpp>
 #include <kiss_icp_cpp/core/VoxelHashMap.hpp>
 #include <sophus/se3.hpp>
 
@@ -56,10 +56,10 @@ struct LidarMatchParams
   int max_visible_scans{120};
   double max_correspondence_distance{2.0};
   double kernel_scale{0.5};
-  double convergence_criterion{1.0e-4};
-  int max_iterations{50};
+  double convergence_criterion{1.0e-3};
+  int max_iterations{20};
   int max_points_per_voxel{20};
-  /// Recent scans kept with their lidar poses. The live map is updated in place.
+  /// Kept for parameter compatibility; the live path no longer keeps a scan window.
   int backward_match_stride{4};
   /// Off on the live path: freezing each scan into the map duplicates a building once per pose.
   bool refine_window{false};
@@ -67,7 +67,7 @@ struct LidarMatchParams
   /// After this many collective passes a scan is trusted and left out of later solves.
   int refine_settle_passes{2};
   /// When false, ICP still builds the local map but does not move IMU pose/velocity/biases.
-  bool apply_imu_correction{false};
+  bool apply_imu_correction{true};
   // Fraction of the vehicle-frame residual turned into a bias step each accepted scan.
   double gyro_bias_gain{0.1};
   double accel_bias_gain{0.02};
@@ -78,14 +78,29 @@ struct LidarMatchParams
   double max_longitudinal_correction{0.15};
   double max_gyro_bias{0.05};
   double max_accel_bias{1.0};
-  /// Mean Mahalanobis D_M^2 threshold (χ² 3-DoF ~95% heuristic).
+  /// Mean Mahalanobis D_M^2 threshold (χ² 3-DoF ~95% heuristic). Also the per-point inlier cut.
   double max_ndt_cost{7.81};
   double ndt_cov_regularization{1.0e-3};
   /// Skip the NDT gate when fewer valid voxel hits than this are available.
   int min_ndt_correspondences{20};
-  /// Target scan match rate. ICP stops when the 1/hz budget is spent and the scan is
-  /// inserted at the latest IMU pose. Start at 10; drop toward 8 if many scans time out.
+  /// Minimum fraction of valid NDT hits below max_ndt_cost for a scan to be accepted.
+  double min_ndt_inlier_fraction{0.5};
+  /// Minimum plane correspondences / source points for a scan to be accepted.
+  double min_inlier_ratio{0.3};
+  /// Target scan match rate. ICP stops when the 1/hz budget is spent. A partial solve with at
+  /// least `partial_min_iterations` steps and a last step below `partial_max_step` is still used;
+  /// otherwise the scan is skipped (nothing is inserted).
   double align_rate_hz{10.0};
+  int partial_min_iterations{3};
+  double partial_max_step{0.01};
+  /// A scan is inserted into the map only when the vehicle moved this far since the last
+  /// inserted scan. Stationary scans are matched but not inserted.
+  double keyframe_min_translation{0.5};
+  double keyframe_min_rotation{0.05};
+  /// Scan index at which the GPU vs CPU bake-off runs (the map must be representative), and
+  /// how often it is re-run. 0 disables the device entirely.
+  int device_bakeoff_scan{10};
+  int device_recheck_scans{200};
   VehicleLimits limits{};
 };
 
@@ -132,6 +147,8 @@ struct MatchResult
   bool applied{false};
   bool inserted_scan{false};
   bool first_scan{false};
+  /// The scan could not be processed (IMU not aligned, no IMU pose near the scan, empty crop).
+  bool skipped{false};
   Sophus::SE3d imu_pose{};
   Sophus::SE3d corrected_pose{};
   /// World-frame left increment applied to the pose. `correction * predicted = aligned`.
@@ -147,9 +164,15 @@ struct MatchResult
   Sophus::SE3d lidar_pose{};
   double lidar_cost{0.0};
   double ndt_cost{std::numeric_limits<double>::quiet_NaN()};
+  double ndt_inlier_fraction{std::numeric_limits<double>::quiet_NaN()};
+  double inlier_ratio{0.0};
+  int correspondences{0};
+  int degenerate_axes{0};
   bool lidar_passed{false};
-  /// ICP was abandoned for the rate budget; scan was inserted at the IMU pose.
+  bool saturated{false};
+  /// ICP hit the rate budget. `partial_used` says whether the partial solve was good enough.
   bool align_timed_out{false};
+  bool partial_used{false};
   bool refined_window{false};
   double refine_shift{0.0};
   int refine_scans{0};
@@ -171,6 +194,23 @@ struct LocalMapPoint
   float collective_passes{0.0F};
 };
 
+/// Output of the heavy half of a scan match. Produced from a const IMU snapshot, consumed by
+/// commit_scan under the state lock.
+struct ScanAlignment
+{
+  MatchResult result;
+  double scan_end{0.0};
+  std::vector<Eigen::Vector3d> map_points;
+  std::vector<float> map_intensities;
+  std::vector<Eigen::Vector3d> source;
+  /// Seed pose used for ICP (lidar anchor + IMU relative motion).
+  Sophus::SE3d predicted{};
+  MatchCandidate candidate;
+  bool first_scan{false};
+  bool ready{false};
+  std::chrono::steady_clock::time_point deadline{};
+};
+
 class LidarImuMatcher
 {
 public:
@@ -189,8 +229,14 @@ public:
 
   [[nodiscard]] LocalizationHealth health() const;
   [[nodiscard]] int reject_streak() const;
+  [[nodiscard]] int timeout_streak() const;
 
-  /// Deskew, crop, and either store the first scan or match a new scan into the map.
+  /// Heavy half: deskew, crop, downsample, ICP, gates. Reads the IMU only; safe to run on a
+  /// snapshot while the live integrator keeps going on another thread.
+  [[nodiscard]] ScanAlignment align_scan(const LidarScan & scan, const ImuProcessor & imu);
+  /// Light half: insert into the map, apply the IMU correction, advance health.
+  [[nodiscard]] MatchResult commit_scan(ScanAlignment && alignment, ImuProcessor & imu);
+  /// align_scan followed by commit_scan.
   [[nodiscard]] MatchResult on_scan(const LidarScan & scan, ImuProcessor & imu);
 
   /// The integrator crossed the speed limit. Hold the last healthy speed.
@@ -201,23 +247,6 @@ public:
   [[nodiscard]] MatchResult on_imu(ImuProcessor & imu);
 
 private:
-  struct WindowScan
-  {
-    double stamp{0.0};
-    std::vector<Eigen::Vector3d> map_points;
-    std::vector<Eigen::Vector3d> source_points;
-    Sophus::SE3d pose{};
-  };
-
-  struct PreparedScan
-  {
-    double scan_end{0.0};
-    std::vector<Eigen::Vector3d> map_points;
-    std::vector<float> map_intensities;
-    std::vector<Eigen::Vector3d> source;
-    Sophus::SE3d predicted{};
-  };
-
   struct PreparedClouds
   {
     std::vector<Eigen::Vector3d> map_points;
@@ -228,44 +257,35 @@ private:
   void apply_correction(
     ImuProcessor & imu, const Sophus::SE3d & vehicle_delta, double scan_stamp, double since_stamp,
     bool update_bias, const std::optional<Eigen::Vector3d> & velocity_override);
-  void optimize_window(ImuProcessor & imu);
-  void freeze_oldest(const Sophus::SE3d & cull_pose);
-  void rebuild_map(const Sophus::SE3d & cull_pose);
-  [[nodiscard]] kiss_icp::PlaneAlignResult align(
-    const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess, double & iterations,
-    double * robust_cost, const std::chrono::steady_clock::time_point * deadline, bool & timed_out);
-  void note_map_edit();
+  [[nodiscard]] PlaneIcpResult align(
+    const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
+    const std::chrono::steady_clock::time_point * deadline);
   [[nodiscard]] PreparedClouds prepare_scan(
     const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing);
   void remember_healthy(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, double stamp);
   void restore_healthy_speed(ImuProcessor & imu);
   void note_health(ImuProcessor & imu, HealthEvent event);
-  [[nodiscard]] Sophus::SO3d imu_rotation_between(
-    const ImuProcessor & imu, double from_stamp, double to_stamp) const;
-  [[nodiscard]] Sophus::SE3d recovery_pose(double scan_end, const ImuProcessor & imu) const;
   [[nodiscard]] MatchCandidate score_alignment(
-    const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess,
-    const Sophus::SE3d & imu_reference, bool check_imu_gate, MatchResult & timing,
+    const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess, MatchResult & timing,
     const std::chrono::steady_clock::time_point * deadline);
-  void finish_accepted_scan(
-    MatchResult & result, PreparedScan prepared, const Sophus::SE3d & aligned_pose,
-    double iterations, ImuProcessor & imu, double since_stamp, bool update_bias,
-    const std::optional<Eigen::Vector3d> & velocity_override, bool allow_refine);
+  [[nodiscard]] bool should_insert(const Sophus::SE3d & pose) const;
+  void insert_scan(
+    const Sophus::SE3d & pose, double stamp, std::vector<Eigen::Vector3d> && points,
+    std::vector<float> && intensities, const ImuProcessor & imu, MatchResult & timing);
   void record_horizon_scan(
-    const Sophus::SE3d & pose, double stamp, const std::vector<Eigen::Vector3d> & points,
-    const std::vector<float> & intensities, const ImuProcessor & imu);
+    const Sophus::SE3d & pose, double stamp, std::vector<Eigen::Vector3d> && points,
+    std::vector<float> && intensities, const ImuProcessor & imu);
   bool refine_window_if_due(MatchResult & result, Sophus::SE3d & newest_pose);
   void rebuild_from_horizon(const Sophus::SE3d & cull_pose);
-  void cull_local_map(kiss_icp::VoxelHashMap & map, const Sophus::SE3d & pose) const;
+  void cull_local_map(const Sophus::SE3d & pose);
+  void rebuild_surface();
 
   Sophus::SE3d body_from_lidar_{};
   LidarMatchParams params_;
   double half_longitudinal_{37.5};
   double half_lateral_{25.0};
   kiss_icp::VoxelHashMap map_;
-  kiss_icp::VoxelHashMap frozen_;
-  NdtVoxelMap ndt_map_;
-  kiss_icp::Registration registration_;
+  SurfaceVoxelMap surface_;
   struct HorizonScan
   {
     double stamp{0.0};
@@ -279,12 +299,17 @@ private:
     std::uint32_t scan_id{0};
   };
 
-  std::deque<WindowScan> window_;
   std::deque<HorizonScan> horizon_;
   std::uint32_t next_scan_id_{0};
+  std::uint64_t scan_count_{0};
   bool has_refined_{false};
   Eigen::Vector3d last_refine_position_{Eigen::Vector3d::Zero()};
   bool has_reference_{false};
+  /// Last committed lidar pose and its scan-end stamp. Seeds the next ICP together with the
+  /// IMU motion since then, so open-loop IMU drift cannot walk the seed off the map.
+  Sophus::SE3d anchor_pose_{};
+  double anchor_stamp_{0.0};
+  Sophus::SE3d last_keyframe_pose_{};
   double last_correction_stamp_{0.0};
   Eigen::Vector3d last_correction_position_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d gyro_bias_prior_{Eigen::Vector3d::Zero()};
@@ -297,11 +322,15 @@ private:
   Eigen::Vector3d last_healthy_velocity_{Eigen::Vector3d::Zero()};
   double last_healthy_speed_{0.0};
   std::uint64_t map_epoch_{1};
-  bool device_prepare_decided_{false};
+  std::uint64_t culls_since_prune_{0};
+  Sophus::SE3d last_cull_pose_{};
+  bool has_cull_pose_{false};
+  bool device_front_decided_{false};
   bool device_front_use_{false};
+  std::uint64_t device_front_decided_at_{0};
   bool device_align_decided_{false};
   bool device_align_use_{false};
-  bool device_align_float_{false};
+  std::uint64_t device_align_decided_at_{0};
 };
 
 }  // namespace back_odom

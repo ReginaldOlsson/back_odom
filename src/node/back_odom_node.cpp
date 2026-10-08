@@ -15,6 +15,7 @@
 #include "back_odom/node/back_odom_node.hpp"
 
 #include "back_odom/imu/imu_alignment.hpp"
+#include "back_odom/lidar/device_accel.hpp"
 
 #include <Eigen/Geometry>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -29,6 +30,7 @@
 #include <sensor_msgs/msg/point_field.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -210,8 +212,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const int imu_max_trajectory_poses =
     this->declare_parameter<int>("imu_max_trajectory_poses", 20000);
   imu_max_pair_dt_ = this->declare_parameter<double>("imu_max_pair_dt", 0.05);
+  imu_wait_timeout_ = this->declare_parameter<double>("imu_wait_timeout", 0.5);
   path_min_dt_ = this->declare_parameter<double>("path_min_dt", 0.1);
+  marker_min_dt_ = this->declare_parameter<double>("marker_min_dt", 0.1);
+  health_min_dt_ = this->declare_parameter<double>("health_min_dt", 0.1);
+  map_publish_period_ = this->declare_parameter<double>("map_publish_period", 1.0);
+  min_range_ = this->declare_parameter<double>("min_range", 1.0);
+  max_range_ = this->declare_parameter<double>("max_range", 0.0);
   const int path_max_poses = this->declare_parameter<int>("path_max_poses", 1000);
+  const int imu_queue_depth = this->declare_parameter<int>("imu_queue_depth", 2000);
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
   LidarMatchParams lidar_params;
   lidar_params.voxel_size = this->declare_parameter<double>("voxel_size", 0.5);
@@ -221,17 +230,25 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("max_correspondence_distance", 2.0);
   lidar_params.kernel_scale = this->declare_parameter<double>("kernel_scale", 0.5);
   lidar_params.convergence_criterion =
-    this->declare_parameter<double>("convergence_criterion", 1.0e-4);
-  lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 50);
+    this->declare_parameter<double>("convergence_criterion", 1.0e-3);
+  lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 20);
   lidar_params.align_rate_hz = this->declare_parameter<double>("align_rate_hz", 10.0);
+  lidar_params.partial_min_iterations = this->declare_parameter<int>("partial_min_iterations", 3);
+  lidar_params.partial_max_step = this->declare_parameter<double>("partial_max_step", 0.01);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
   lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
   lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
   lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
   lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);
+  lidar_params.keyframe_min_translation =
+    this->declare_parameter<double>("keyframe_min_translation", 0.5);
+  lidar_params.keyframe_min_rotation =
+    this->declare_parameter<double>("keyframe_min_rotation", 0.05);
+  lidar_params.device_bakeoff_scan = this->declare_parameter<int>("device_bakeoff_scan", 10);
+  lidar_params.device_recheck_scans = this->declare_parameter<int>("device_recheck_scans", 200);
   lidar_params.apply_imu_correction =
-    this->declare_parameter<bool>("apply_imu_correction", false);
+    this->declare_parameter<bool>("apply_imu_correction", true);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
   lidar_params.speed_correction_gain =
@@ -249,6 +266,9 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("ndt_cov_regularization", 1.0e-3);
   lidar_params.min_ndt_correspondences =
     this->declare_parameter<int>("min_ndt_correspondences", 20);
+  lidar_params.min_ndt_inlier_fraction =
+    this->declare_parameter<double>("min_ndt_inlier_fraction", 0.5);
+  lidar_params.min_inlier_ratio = this->declare_parameter<double>("min_inlier_ratio", 0.3);
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
   }
@@ -263,6 +283,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   }
   if (!(imu_max_pair_dt_ > 0.0) || !std::isfinite(imu_max_pair_dt_)) {
     throw std::invalid_argument("imu_max_pair_dt must be positive and finite");
+  }
+  if (!(imu_wait_timeout_ >= 0.0) || !std::isfinite(imu_wait_timeout_)) {
+    throw std::invalid_argument("imu_wait_timeout must be non-negative and finite");
+  }
+  if (imu_queue_depth < 1) {
+    throw std::invalid_argument("imu_queue_depth must be positive");
+  }
+  if (min_range_ < 0.0 || max_range_ < 0.0) {
+    throw std::invalid_argument("min_range and max_range must be non-negative");
   }
 
   alignment_sample_count_ = static_cast<std::size_t>(alignment_sample_count);
@@ -282,11 +311,14 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   imu_processor_ = std::make_unique<ImuProcessor>(params);
   lidar_matcher_ = std::make_unique<LidarImuMatcher>(lidar_params);
 
+  // Deep IMU queue: a 200 Hz stream must survive a scan callback or TF stall without dropping
+  // samples, since a dropped sample becomes an integration hole (dt > max_dt).
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-    imu_topic, rclcpp::QoS(10),
+    imu_topic, rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(imu_queue_depth))).reliable(),
     [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) { this->callback_imu(msg); });
+  // Scans go through a single-slot mailbox; no point queueing more than the newest two.
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    pointcloud_topic, rclcpp::QoS(10),
+    pointcloud_topic, rclcpp::QoS(rclcpp::KeepLast(2)).best_effort(),
     [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
@@ -316,13 +348,25 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
 
+  if (map_publish_period_ > 0.0) {
+    map_timer_ = this->create_wall_timer(
+      std::chrono::duration<double>(map_publish_period_), [this]() { this->publish_local_map(); });
+  }
+  worker_ = std::thread([this]() { this->worker_loop(); });
+
   RCLCPP_INFO(
-    this->get_logger(), "BackOdomNode initialized. imu_left_handed=%s",
-    imu_left_handed_ ? "true" : "false");
+    this->get_logger(), "BackOdomNode initialized. imu_left_handed=%s device=%s",
+    imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu");
 }
 
 BackOdomNode::~BackOdomNode()
 {
+  stop_ = true;
+  scan_cv_.notify_all();
+  imu_cv_.notify_all();
+  if (worker_.joinable()) {
+    worker_.join();
+  }
   RCLCPP_INFO(this->get_logger(), "BackOdomNode destroyed.");
 }
 
@@ -357,9 +401,23 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   previous_angular_velocity_stamp_ = sample.stamp;
   has_previous_angular_velocity_ = true;
 
-  ProcessorOutput output = imu_processor_->process(sample);
+  ProcessorOutput output;
+  LocalizationHealth health = LocalizationHealth::Healthy;
+  int reject_streak = 0;
+  int timeout_streak = 0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    output = imu_processor_->process(sample);
+    if (output.speed_clamped) {
+      lidar_matcher_->notify_speed_limit(*imu_processor_);
+      output = imu_processor_->output_at(sample);
+    }
+    health = lidar_matcher_->health();
+    reject_streak = lidar_matcher_->reject_streak();
+    timeout_streak = lidar_matcher_->timeout_streak();
+  }
+  imu_cv_.notify_all();
   if (output.speed_clamped) {
-    output = imu_processor_->output_at(sample);
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "IMU speed was clamped to the vehicle limit.");
@@ -375,41 +433,35 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   }
   aligned_ = output.aligned;
   if (!output.aligned) {
-    publish_markers(output, stamp);
+    publish_markers(output, health, stamp);
     return;
-  }
-
-  const MatchResult backward = lidar_matcher_->on_imu(*imu_processor_);
-  if (backward.applied) {
-    publish_odometry(imu_odom_pub_, output, stamp);
-    output = imu_processor_->output_at(sample);
-    RCLCPP_INFO_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Backward IMU correction. translation error %.3f m",
-      backward.correction.translation().norm());
   }
 
   publish_odometry(odometry_pub_, output, stamp);
   publish_twist(output, stamp);
   publish_path(output, stamp);
-  publish_markers(output, stamp);
+  publish_markers(output, health, stamp);
   if (publish_tf_) {
     publish_tf(output, stamp);
   }
-  publish_health(stamp);
-  match_pending_scan(false);
+  bool health_due = false;
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    health_due = !has_published_health_ || (stamp - last_health_stamp_).seconds() >= health_min_dt_ ||
+                 (stamp - last_health_stamp_).seconds() < 0.0;
+    if (health_due) {
+      last_health_stamp_ = stamp;
+      has_published_health_ = true;
+    }
+  }
+  if (health_due) {
+    publish_health(health, reject_streak, timeout_streak);
+  }
 }
 
 void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
-  if (!aligned_ || !imu_processor_->aligned()) {
-    return;
-  }
-  LidarScan scan = scan_from_cloud(*msg);
-  if (scan.points.empty()) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 5000,
-      "Skipping lidar scan. Need xyz points and a timestamp field.");
+  if (!aligned_) {
     return;
   }
   if (msg->header.frame_id.empty()) {
@@ -418,142 +470,219 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
       "Point cloud frame_id is empty, so it cannot be looked up in the TF tree.");
     return;
   }
-  const std::string source_frame = msg->header.frame_id;
-  Sophus::SE3d base_from_lidar;
-  if (!base_from_frame(source_frame, base_from_lidar)) {
-    return;
+  // Hand the raw message to the worker. Parsing 200k points here would stall the IMU stream.
+  std::uint64_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    if (pending_cloud_) {
+      ++dropped_scans_;
+      dropped = dropped_scans_;
+    }
+    pending_cloud_ = msg;
   }
-  lidar_matcher_->set_body_from_lidar(base_from_lidar);
-  const rclcpp::Time stamp(msg->header.stamp);
-  if (pending_scan_.has_value()) {
+  scan_cv_.notify_one();
+  if (dropped > 0) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "Matching a lidar scan before IMU reached its last point.");
-    match_pending_scan(true);
+      "Scan matcher is behind: replaced an unprocessed scan (%lu dropped so far).",
+      static_cast<unsigned long>(dropped));  // NOLINT(runtime/int)
   }
-  pending_scan_ = PendingScan{std::move(scan), stamp, source_frame};
-  match_pending_scan(false);
 }
 
-void BackOdomNode::match_pending_scan(const bool force)
+void BackOdomNode::worker_loop()
 {
-  if (!pending_scan_.has_value() || !aligned_ || !imu_processor_->aligned()) {
+  while (!stop_) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
+    {
+      std::unique_lock<std::mutex> lock(scan_mutex_);
+      scan_cv_.wait(lock, [this]() { return stop_ || pending_cloud_ != nullptr; });
+      if (stop_) {
+        return;
+      }
+      cloud = std::move(pending_cloud_);
+      pending_cloud_.reset();
+    }
+    try {
+      process_cloud(cloud);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR(this->get_logger(), "Scan processing failed: %s", error.what());
+    }
+  }
+}
+
+void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg)
+{
+  LidarScan scan = scan_from_cloud(*msg);
+  if (scan.points.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Skipping lidar scan. Need xyz points and a timestamp field.");
     return;
   }
-  const double scan_start = *std::min_element(
-    pending_scan_->scan.timestamps.cbegin(), pending_scan_->scan.timestamps.cend());
-  const double scan_end =
-    *std::max_element(pending_scan_->scan.timestamps.cbegin(), pending_scan_->scan.timestamps.cend());
-  const double imu_stamp = imu_processor_->latest_stamp();
-  if (!force && imu_stamp + 1.0e-3 < scan_end) {
-    if (scan_end - imu_stamp > 0.25) {
+  Sophus::SE3d base_from_lidar;
+  if (!base_from_frame(msg->header.frame_id, base_from_lidar)) {
+    return;
+  }
+  const rclcpp::Time stamp(msg->header.stamp);
+  const double scan_start = *std::min_element(scan.timestamps.cbegin(), scan.timestamps.cend());
+  const double scan_end = *std::max_element(scan.timestamps.cbegin(), scan.timestamps.cend());
+
+  // Wait (bounded) until the IMU has integrated past the end of the sweep, then snapshot the
+  // integrator so ICP can run without holding up the IMU thread.
+  std::optional<ImuProcessor> snapshot;
+  const auto wall_deadline = std::chrono::steady_clock::now() +
+                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::duration<double>(imu_wait_timeout_));
+  {
+    std::unique_lock<std::mutex> lock(state_mutex_);
+    const auto imu_ready = [&]() {
+      if (!imu_processor_->aligned()) {
+        return false;
+      }
+      if (imu_processor_->latest_stamp() + 1.0e-3 < scan_end) {
+        return false;
+      }
+      return std::abs(imu_processor_->closest_pose(scan_end).stamp - scan_end) <= imu_max_pair_dt_;
+    };
+    const auto newer_scan_waiting = [this]() {
+      std::lock_guard<std::mutex> mailbox(scan_mutex_);
+      return pending_cloud_ != nullptr;
+    };
+    while (!stop_ && !imu_ready()) {
+      if (std::chrono::steady_clock::now() >= wall_deadline || newer_scan_waiting()) {
+        break;
+      }
+      imu_cv_.wait_for(lock, std::chrono::milliseconds(5));
+    }
+    if (stop_ || !imu_processor_->aligned()) {
+      return;
+    }
+    const double imu_stamp = imu_processor_->latest_stamp();
+    if (imu_stamp + 1.0e-3 < scan_end) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "Lidar scan end is %.3f s ahead of the newest IMU. Matching with the IMU pose in hand.",
         scan_end - imu_stamp);
-    } else {
+    }
+    if (
+      !imu_processor_->trajectory().empty() &&
+      imu_processor_->trajectory().front().stamp > scan_start + imu_max_pair_dt_) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "IMU buffer no longer covers scan start (buffer front %.3f, scan_start %.3f). "
+        "Increase imu_trajectory_horizon.",
+        imu_processor_->trajectory().front().stamp, scan_start);
       return;
     }
+    lidar_matcher_->set_body_from_lidar(base_from_lidar);
+    snapshot.emplace(*imu_processor_);
   }
-  // Pair against the closest buffered IMU sample, not the live tip. A slow ICP must still
-  // recover the pose nearest the scan time from the long trajectory buffer.
-  const StampedPose closest_end = imu_processor_->closest_pose(scan_end);
-  const double pair_dt = std::abs(closest_end.stamp - scan_end);
-  if (!force && pair_dt > imu_max_pair_dt_) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Waiting for IMU near scan end. closest dt %.3f s (limit %.3f s), scan_end %.3f, closest %.3f",
-      pair_dt, imu_max_pair_dt_, scan_end, closest_end.stamp);
-    return;
+
+  ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot);
+  snapshot.reset();
+
+  MatchResult matched;
+  ProcessorOutput prior;
+  ProcessorOutput corrected;
+  std::vector<StampedPose> scan_poses;
+  LocalizationHealth health = LocalizationHealth::Healthy;
+  int reject_streak = 0;
+  int timeout_streak = 0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    prior = imu_processor_->output_at(
+      ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
+    matched = lidar_matcher_->commit_scan(std::move(alignment), *imu_processor_);
+    corrected = imu_processor_->output_at(
+      ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
+    scan_poses = lidar_matcher_->visible_scan_poses();
+    health = lidar_matcher_->health();
+    reject_streak = lidar_matcher_->reject_streak();
+    timeout_streak = lidar_matcher_->timeout_streak();
   }
-  if (
-    !imu_processor_->trajectory().empty() &&
-    imu_processor_->trajectory().front().stamp > scan_start + imu_max_pair_dt_) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "IMU buffer no longer covers scan start (buffer front %.3f, scan_start %.3f). "
-      "Increase imu_trajectory_horizon.",
-      imu_processor_->trajectory().front().stamp, scan_start);
-    if (!force) {
-      pending_scan_.reset();
-      return;
-    }
-  }
-  PendingScan pending = std::move(*pending_scan_);
-  pending_scan_.reset();
-  LidarScan scan = std::move(pending.scan);
-  const rclcpp::Time stamp = pending.header_stamp;
-  const ProcessorOutput prior = imu_processor_->output_at(
-    ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
-  RCLCPP_DEBUG(
-    this->get_logger(),
-    "Pairing lidar scan_end %.3f with closest IMU %.3f (dt %.4f s), buffer [%.3f, %.3f] n=%zu",
-    scan_end, closest_end.stamp, pair_dt, imu_processor_->trajectory().front().stamp,
-    imu_processor_->trajectory().back().stamp, imu_processor_->trajectory().size());
-  const MatchResult matched = lidar_matcher_->on_scan(scan, *imu_processor_);
   RCLCPP_DEBUG(
     this->get_logger(),
     "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f timed_out %s",
     matched.deskew_ms, matched.voxel_ms, matched.align_ms, matched.cost_ms, matched.refine_ms,
     matched.map_ms, matched.align_timed_out ? "yes" : "no");
-  last_match_ = matched;
-  has_last_match_ = true;
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    last_match_ = matched;
+    has_last_match_ = true;
+    last_health_stamp_ = stamp;
+    has_published_health_ = true;
+  }
   publish_debug_odometry(matched, stamp);
-  publish_scan_poses(stamp);
-  if (!matched.applied) {
-    if (lidar_matcher_->has_reference()) {
-      RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "ICP correction rejected. health %s, lidar cost %.3f ndt %.3f pass %s, translation %.3f m, "
-        "rotation %.3f rad",
-        health_name(matched.health), matched.lidar_cost,
-        std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
-        matched.lidar_passed ? "yes" : "no", matched.translation_error, matched.rotation_error);
-    }
-    publish_health(stamp);
+  publish_scan_poses(scan_poses, stamp);
+  publish_match(matched, prior, corrected, stamp);
+  publish_health(health, reject_streak, timeout_streak);
+}
+
+void BackOdomNode::publish_match(
+  const MatchResult & matched, const ProcessorOutput & prior, const ProcessorOutput & corrected,
+  const rclcpp::Time & stamp)
+{
+  const double total_ms = matched.deskew_ms + matched.voxel_ms + matched.align_ms + matched.cost_ms +
+                          matched.refine_ms + matched.map_ms;
+  if (matched.skipped) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000, "Scan skipped: no usable points or IMU pose.");
     return;
   }
-  if (matched.align_timed_out) {
+  if (matched.align_timed_out && !matched.partial_used) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP abandoned for align_rate budget. Inserted scan at latest IMU pose. align %.2f ms",
-      matched.align_ms);
-  } else if (!matched.first_scan) {
+      "ICP hit the rate budget after %.0f iterations (deskew %.1f voxel %.1f align %.1f ms, "
+      "%.1f ms total). Scan not inserted; health %s.",
+      matched.iterations, matched.deskew_ms, matched.voxel_ms, matched.align_ms, total_ms,
+      health_name(matched.health));
+    return;
+  }
+  if (!matched.applied) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "ICP correction rejected. health %s, lidar cost %.3f ndt %.3f (inliers %.2f) ratio %.2f "
+      "pass %s, translation %.3f m, rotation %.3f rad, degenerate %d",
+      health_name(matched.health), matched.lidar_cost,
+      std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
+      std::isfinite(matched.ndt_inlier_fraction) ? matched.ndt_inlier_fraction : -1.0,
+      matched.inlier_ratio, matched.lidar_passed ? "yes" : "no", matched.translation_error,
+      matched.rotation_error, matched.degenerate_axes);
+    return;
+  }
+  if (matched.first_scan) {
+    RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
+  } else {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP correction applied. lidar cost %.3f, translation %.3f m, rotation %.4f rad, health %s",
-      matched.lidar_cost, matched.translation_error, matched.rotation_error,
-      health_name(matched.health));
+      "ICP %s. cost %.3f ndt %.3f ratio %.2f iters %.0f%s, translation %.3f m, rotation %.4f rad, "
+      "health %s, %s, %.1f ms (align %.1f)",
+      matched.saturated ? "saturated" : "applied", matched.lidar_cost,
+      std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0, matched.inlier_ratio,
+      matched.iterations, matched.partial_used ? " (partial)" : "", matched.translation_error,
+      matched.rotation_error, health_name(matched.health),
+      matched.inserted_scan ? "inserted" : "no keyframe", total_ms, matched.align_ms);
   }
   if (matched.refined_window) {
     RCLCPP_INFO(
-      this->get_logger(),       "Refined %d scan poses, %d already settled. largest shift %.3f m",
+      this->get_logger(), "Refined %d scan poses, %d already settled. largest shift %.3f m",
       matched.refine_scans, matched.refine_settled, matched.refine_shift);
   }
   publish_odometry(imu_odom_pub_, prior, stamp);
-  const ProcessorOutput corrected = imu_processor_->output_at(
-    ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
   publish_odometry(odometry_pub_, corrected, stamp);
   publish_pose(corrected, stamp);
   publish_path(corrected, stamp);
-  publish_markers(corrected, stamp);
-  publish_local_map(stamp);
   if (publish_tf_) {
     publish_tf(corrected, stamp);
   }
-  publish_health(stamp);
-  if (matched.first_scan) {
-    RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
-  }
 }
 
-
-void BackOdomNode::publish_health(const rclcpp::Time & stamp)
+void BackOdomNode::publish_health(
+  const LocalizationHealth health, const int reject_streak, const int timeout_streak)
 {
   diagnostic_msgs::msg::DiagnosticStatus status;
   status.name = "back_odom";
   status.hardware_id = "back_odom";
-  const LocalizationHealth health = lidar_matcher_->health();
   status.message = health_name(health);
   if (health == LocalizationHealth::Healthy) {
     status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
@@ -568,21 +697,37 @@ void BackOdomNode::publish_health(const rclcpp::Time & stamp)
     entry.value = value;
     status.values.push_back(entry);
   };
-  add_value("reject_streak", std::to_string(lidar_matcher_->reject_streak()));
-  if (has_last_match_) {
-    add_value("lidar_cost", last_match_.has_lidar_debug ? std::to_string(last_match_.lidar_cost) : "none");
-    add_value(
-      "ndt_cost",
-      last_match_.has_lidar_debug && std::isfinite(last_match_.ndt_cost)
-        ? std::to_string(last_match_.ndt_cost)
-        : "none");
-    add_value("lidar_passed", last_match_.lidar_passed ? "true" : "false");
-    add_value("align_timed_out", last_match_.align_timed_out ? "true" : "false");
-    add_value("align_ms", std::to_string(last_match_.align_ms));
-    add_value("translation_error_m", std::to_string(last_match_.translation_error));
-    add_value("rotation_error_rad", std::to_string(last_match_.rotation_error));
+  add_value("reject_streak", std::to_string(reject_streak));
+  add_value("timeout_streak", std::to_string(timeout_streak));
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    if (has_last_match_) {
+      const MatchResult & last = last_match_;
+      add_value("lidar_cost", last.has_lidar_debug ? std::to_string(last.lidar_cost) : "none");
+      add_value(
+        "ndt_cost",
+        last.has_lidar_debug && std::isfinite(last.ndt_cost) ? std::to_string(last.ndt_cost) : "none");
+      add_value(
+        "ndt_inlier_fraction",
+        std::isfinite(last.ndt_inlier_fraction) ? std::to_string(last.ndt_inlier_fraction) : "none");
+      add_value("inlier_ratio", std::to_string(last.inlier_ratio));
+      add_value("correspondences", std::to_string(last.correspondences));
+      add_value("degenerate_axes", std::to_string(last.degenerate_axes));
+      add_value("lidar_passed", last.lidar_passed ? "true" : "false");
+      add_value("saturated", last.saturated ? "true" : "false");
+      add_value("align_timed_out", last.align_timed_out ? "true" : "false");
+      add_value("partial_used", last.partial_used ? "true" : "false");
+      add_value("inserted_scan", last.inserted_scan ? "true" : "false");
+      add_value("iterations", std::to_string(last.iterations));
+      add_value("deskew_ms", std::to_string(last.deskew_ms));
+      add_value("voxel_ms", std::to_string(last.voxel_ms));
+      add_value("align_ms", std::to_string(last.align_ms));
+      add_value("cost_ms", std::to_string(last.cost_ms));
+      add_value("map_ms", std::to_string(last.map_ms));
+      add_value("translation_error_m", std::to_string(last.translation_error));
+      add_value("rotation_error_rad", std::to_string(last.rotation_error));
+    }
   }
-  (void)stamp;
   health_pub_->publish(status);
 }
 
@@ -607,6 +752,7 @@ void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcp
       geometry_msgs::msg::PoseStamped stamped;
       stamped.header = odometry.header;
       stamped.pose = odometry.pose.pose;
+      std::lock_guard<std::mutex> lock(publish_mutex_);
       path.header = odometry.header;
       path.poses.push_back(stamped);
       if (path.poses.size() > path_max_poses_) {
@@ -623,10 +769,13 @@ void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcp
 bool BackOdomNode::base_from_frame(
   const std::string & source_frame, Sophus::SE3d & target_from_source)
 {
-  const auto found = extrinsics_.find(source_frame);
-  if (found != extrinsics_.end()) {
-    target_from_source = found->second;
-    return true;
+  {
+    std::lock_guard<std::mutex> lock(extrinsics_mutex_);
+    const auto found = extrinsics_.find(source_frame);
+    if (found != extrinsics_.end()) {
+      target_from_source = found->second;
+      return true;
+    }
   }
 
   try {
@@ -646,6 +795,7 @@ bool BackOdomNode::base_from_frame(
     this->get_logger(), "TF %s <- %s xyz=(%.3f, %.3f, %.3f)", child_frame_.c_str(),
     source_frame.c_str(), target_from_source.translation().x(),
     target_from_source.translation().y(), target_from_source.translation().z());
+  std::lock_guard<std::mutex> lock(extrinsics_mutex_);
   extrinsics_.emplace(source_frame, target_from_source);
   return true;
 }
@@ -751,6 +901,11 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
   scan.timestamps.reserve(count);
   scan.intensities.reserve(count);
   const bool have_intensity = intensity_field != cloud.fields.cend();
+  // Returns off the ego vehicle and beyond the crop box never reach the map; drop them here so
+  // deskew and voxelisation do not pay for them.
+  const double min_range_sq = min_range_ * min_range_;
+  const double max_range_sq = max_range_ > 0.0 ? max_range_ * max_range_
+                                               : std::numeric_limits<double>::infinity();
   double max_abs_time = 0.0;
   for (std::size_t index = 0; index < count; ++index) {
     const double x = read_float(*x_field, index);
@@ -758,6 +913,10 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     const double z = read_float(*z_field, index);
     const double time = read_float(*time_field, index);
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(time)) {
+      continue;
+    }
+    const double range_sq = x * x + y * y + z * z;
+    if (range_sq < min_range_sq || range_sq > max_range_sq) {
       continue;
     }
     scan.points.emplace_back(x, y, z);
@@ -845,16 +1004,23 @@ void BackOdomNode::publish_pose(const ProcessorOutput & output, const rclcpp::Ti
   pose.pose.covariance[28] = pose_variance_yaw_;
   pose.pose.covariance[35] = pose_variance_yaw_;
   pose_pub_->publish(pose);
-  if (!initial_pose_sent_) {
-    initial_pose_pub_->publish(pose);
+  bool send_initial = false;
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    send_initial = !initial_pose_sent_;
     initial_pose_sent_ = true;
+  }
+  if (send_initial) {
+    initial_pose_pub_->publish(pose);
   }
 }
 
 void BackOdomNode::publish_path(const ProcessorOutput & output, const rclcpp::Time & stamp)
 {
-  const bool append_pose =
-    !has_published_path_ || (stamp - last_path_stamp_).seconds() >= path_min_dt_;
+  std::lock_guard<std::mutex> lock(publish_mutex_);
+  const bool append_pose = !has_published_path_ ||
+                           (stamp - last_path_stamp_).seconds() >= path_min_dt_ ||
+                           (stamp - last_path_stamp_).seconds() < 0.0;
   if (append_pose) {
     geometry_msgs::msg::PoseStamped pose;
     pose.header.stamp = stamp;
@@ -888,15 +1054,43 @@ void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time
   tf_broadcaster_->sendTransform(transform);
 }
 
-void BackOdomNode::publish_local_map(const rclcpp::Time & stamp)
+void BackOdomNode::publish_local_map()
 {
-  const std::vector<LocalMapPoint> shown =
-    thin_for_display(lidar_matcher_->annotated_local_map(), 0.5);
+  // The annotated cloud is a few hundred thousand points; build it only for a live subscriber.
+  if (!aligned_ || map_pub_->get_subscription_count() == 0) {
+    return;
+  }
+  std::vector<LocalMapPoint> points;
+  double stamp_seconds = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!lidar_matcher_->has_reference()) {
+      return;
+    }
+    points = lidar_matcher_->annotated_local_map();
+    stamp_seconds = imu_processor_->latest_stamp();
+  }
+  const std::vector<LocalMapPoint> shown = thin_for_display(points, 0.5);
+  const rclcpp::Time stamp(
+    static_cast<std::int64_t>(std::llround(stamp_seconds * 1.0e9)), RCL_ROS_TIME);
   map_pub_->publish(to_annotated_pointcloud(stamp, parent_frame_, shown));
 }
 
-void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp::Time & stamp)
+void BackOdomNode::publish_markers(
+  const ProcessorOutput & output, const LocalizationHealth health, const rclcpp::Time & stamp)
 {
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    const double since = (stamp - last_marker_stamp_).seconds();
+    if (has_published_markers_ && since >= 0.0 && since < marker_min_dt_) {
+      return;
+    }
+    last_marker_stamp_ = stamp;
+    has_published_markers_ = true;
+  }
+  if (marker_pub_->get_subscription_count() == 0) {
+    return;
+  }
   const Eigen::Vector3d origin = output.position;
   const Sophus::SO3d & rotation = output.orientation;
   visualization_msgs::msg::MarkerArray markers;
@@ -940,7 +1134,7 @@ void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp:
   std::ostringstream stream;
   stream << std::fixed << std::setprecision(2);
   if (output.aligned) {
-    stream << "tracking " << health_name(lidar_matcher_->health())
+    stream << "tracking " << health_name(health)
            << " |f|=" << output.specific_force_body.norm()
            << " |w|=" << output.angular_velocity_body.norm();
   } else {
@@ -951,9 +1145,12 @@ void BackOdomNode::publish_markers(const ProcessorOutput & output, const rclcpp:
   marker_pub_->publish(markers);
 }
 
-void BackOdomNode::publish_scan_poses(const rclcpp::Time & stamp)
+void BackOdomNode::publish_scan_poses(
+  const std::vector<StampedPose> & poses, const rclcpp::Time & stamp)
 {
-  const std::vector<StampedPose> poses = lidar_matcher_->visible_scan_poses();
+  if (scan_pose_pub_->get_subscription_count() == 0) {
+    return;
+  }
   visualization_msgs::msg::MarkerArray markers;
 
   const auto delete_namespace = [&](const std::string & ns) {

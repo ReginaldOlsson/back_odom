@@ -27,13 +27,21 @@ bool cuda_map_current(const void *, std::uint64_t, double)
   return false;
 }
 
-bool cuda_upload_map(const void *, std::uint64_t, double, const double *, const std::uint64_t *, int)
+bool cuda_upload_map(
+  const void *, std::uint64_t, double, const double *, const std::uint64_t *, int,
+  std::vector<std::uint64_t> & unique_keys)
+{
+  unique_keys.clear();
+  return false;
+}
+
+bool cuda_upload_planes(const CudaVoxelPlane *, int)
 {
   return false;
 }
 
 bool cuda_plane_system(
-  const double *, int frame_count, const double[9], const double[3], double, double, bool, bool,
+  const double *, int frame_count, const double[9], const double[3], double, double, bool,
   CudaPlaneSystem & system)
 {
   system = CudaPlaneSystem{};
@@ -44,12 +52,12 @@ bool cuda_plane_system(
 bool cuda_front_downsample(
   const double *, const double *, int, const CudaSegment *, int, double, double, const double[9],
   const double[3], const double[9], const double[3], const double[9], const double[3], const double[9],
-  const double[3], double, double, double, std::vector<double> & kept_xyz, std::vector<int> & kept_index,
-  int & cropped_count)
+  const double[3], double, double, double, double, std::vector<double> & fine_xyz,
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
 {
-  kept_xyz.clear();
-  kept_index.clear();
-  cropped_count = 0;
+  fine_xyz.clear();
+  fine_index.clear();
+  coarse_xyz.clear();
   return false;
 }
 

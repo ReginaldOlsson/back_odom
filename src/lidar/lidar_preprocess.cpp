@@ -169,15 +169,45 @@ std::vector<float> intensities_for_downsampled(
   return intensities;
 }
 
+std::vector<StampedPose> trajectory_window(
+  const std::vector<StampedPose> & trajectory, const double from_stamp, const double to_stamp)
+{
+  if (trajectory.size() <= 2) {
+    return trajectory;
+  }
+  const auto by_stamp = [](const StampedPose & sample, const double value) {
+    return sample.stamp < value;
+  };
+  auto first = std::lower_bound(trajectory.cbegin(), trajectory.cend(), from_stamp, by_stamp);
+  if (first != trajectory.cbegin()) {
+    --first;
+  }
+  auto last = std::lower_bound(first, trajectory.cend(), to_stamp, by_stamp);
+  if (last != trajectory.cend()) {
+    ++last;
+  }
+  if (last - first < 2) {
+    // Degenerate span: keep at least two poses so interpolation has a segment.
+    if (last != trajectory.cend()) {
+      ++last;
+    } else if (first != trajectory.cbegin()) {
+      --first;
+    }
+  }
+  return std::vector<StampedPose>(first, last);
+}
+
 std::vector<Eigen::Vector3d> deskew_to_scan_end(
   const std::vector<Eigen::Vector3d> & points, const std::vector<double> & timestamps,
-  const std::vector<StampedPose> & trajectory, const Sophus::SE3d & body_from_lidar)
+  const std::vector<StampedPose> & full_trajectory, const Sophus::SE3d & body_from_lidar)
 {
-  if (points.size() != timestamps.size() || points.empty() || trajectory.empty()) {
+  if (points.size() != timestamps.size() || points.empty() || full_trajectory.empty()) {
     return {};
   }
+  const auto [min_it, max_it] = std::minmax_element(timestamps.cbegin(), timestamps.cend());
+  const std::vector<StampedPose> trajectory = trajectory_window(full_trajectory, *min_it, *max_it);
   const std::vector<MotionSegment> segments = motion_segments(trajectory);
-  const double scan_end = *std::max_element(timestamps.cbegin(), timestamps.cend());
+  const double scan_end = *max_it;
   const Sophus::SE3d end_inverse = interpolate_pose(trajectory, segments, scan_end).inverse();
 
   std::vector<Eigen::Vector3d> deskewed(points.size());
