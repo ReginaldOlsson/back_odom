@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # The EKF publishes map to base_link. Leave this false so both nodes do not publish that transform.
-    publish_tf: true
+    publish_tf: false
     # Bags exported before boreas converts imu_raw still contain left-handed samples
     # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
     # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
@@ -24,6 +24,8 @@
     imu_wait_timeout: 0.5
     # IMU subscription depth. 200 Hz x 10 s; a dropped sample is an integration hole.
     imu_queue_depth: 2000
+    # rosbag2 and Autoware clouds are reliable. Set false only for live SensorDataQoS drivers.
+    pointcloud_reliable: true
     path_min_dt: 0.1
     path_max_poses: 1000
     # RViz-only outputs. Markers/health at most this often; the map on a timer, only with a subscriber.

@@ -33,10 +33,10 @@
   </node>
 
   <!-- predict_on_twist EKF; inputs remapped to back_odom publishers -->
-  <!-- <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
+  <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
     <arg name="param_file" value="$(var ekf_param_file)"/>
     <arg name="input_initial_pose_name" value="/back_odom/initialpose"/>
     <arg name="input_pose_with_cov_name" value="/back_odom/pose_with_covariance"/>
     <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
-  </include> -->
+  </include>
 </launch>

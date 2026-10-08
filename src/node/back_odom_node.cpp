@@ -184,9 +184,10 @@ sensor_msgs::msg::PointCloud2 to_annotated_pointcloud(
 
 BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odom_node", options)
 {
-  const auto imu_topic = this->declare_parameter<std::string>("imu_topic", "/imu/data");
-  const auto pointcloud_topic =
-    this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
+  imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu/data");
+  pointcloud_topic_ = this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
+  // Bags record PointCloud2 as reliable. Best-effort (SensorDataQoS) will never match them.
+  pointcloud_reliable_ = this->declare_parameter<bool>("pointcloud_reliable", true);
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
   twist_variance_vx_ = this->declare_parameter<double>("twist_variance_vx", 0.05);
   twist_variance_wz_ = this->declare_parameter<double>("twist_variance_wz", 0.01);
@@ -314,11 +315,18 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   // Deep IMU queue: a 200 Hz stream must survive a scan callback or TF stall without dropping
   // samples, since a dropped sample becomes an integration hole (dt > max_dt).
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-    imu_topic, rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(imu_queue_depth))).reliable(),
+    imu_topic_, rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(imu_queue_depth))).reliable(),
     [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) { this->callback_imu(msg); });
   // Scans go through a single-slot mailbox; no point queueing more than the newest two.
+  // Reliability must match the publisher: rosbag2 and most Autoware clouds are reliable.
+  auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(2));
+  if (pointcloud_reliable_) {
+    cloud_qos.reliable();
+  } else {
+    cloud_qos.best_effort();
+  }
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    pointcloud_topic, rclcpp::QoS(rclcpp::KeepLast(2)).best_effort(),
+    pointcloud_topic_, cloud_qos,
     [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
@@ -352,11 +360,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     map_timer_ = this->create_wall_timer(
       std::chrono::duration<double>(map_publish_period_), [this]() { this->publish_local_map(); });
   }
+  lidar_watch_timer_ = this->create_wall_timer(
+    std::chrono::seconds(2), [this]() { this->watch_lidar_start(); });
   worker_ = std::thread([this]() { this->worker_loop(); });
 
   RCLCPP_INFO(
-    this->get_logger(), "BackOdomNode initialized. imu_left_handed=%s device=%s",
-    imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu");
+    this->get_logger(),
+    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s",
+    imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
+    pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort");
 }
 
 BackOdomNode::~BackOdomNode()
@@ -461,8 +473,21 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 
 void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
+  clouds_received_.fetch_add(1, std::memory_order_relaxed);
+  if (!logged_first_cloud_.exchange(true)) {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "First lidar cloud: topic %s frame '%s' %ux%u stamp %.3f (IMU aligned=%s)",
+      pointcloud_topic_.c_str(), msg->header.frame_id.c_str(), msg->width, msg->height,
+      rclcpp::Time(msg->header.stamp).seconds(), aligned_ ? "yes" : "no");
+  }
   if (!aligned_) {
-    return;
+    clouds_before_align_.fetch_add(1, std::memory_order_relaxed);
+    // Keep the newest cloud so matching can start as soon as IMU alignment finishes.
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Holding lidar scan until IMU alignment finishes (%lu clouds so far).",
+      static_cast<unsigned long>(clouds_received_.load()));  // NOLINT(runtime/int)
   }
   if (msg->header.frame_id.empty()) {
     RCLCPP_WARN_THROTTLE(
@@ -481,12 +506,35 @@ void BackOdomNode::callback_pointcloud(const sensor_msgs::msg::PointCloud2::Cons
     pending_cloud_ = msg;
   }
   scan_cv_.notify_one();
-  if (dropped > 0) {
+  if (dropped > 0 && aligned_) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "Scan matcher is behind: replaced an unprocessed scan (%lu dropped so far).",
       static_cast<unsigned long>(dropped));  // NOLINT(runtime/int)
   }
+}
+
+void BackOdomNode::watch_lidar_start()
+{
+  if (scans_processed_.load(std::memory_order_relaxed) > 0) {
+    if (lidar_watch_timer_) {
+      lidar_watch_timer_->cancel();
+    }
+    return;
+  }
+  if (!aligned_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const std::size_t publishers = pointcloud_sub_ ? pointcloud_sub_->get_publisher_count() : 0;
+  RCLCPP_WARN(
+    this->get_logger(),
+    "IMU is aligned but lidar matching has not started. topic %s publishers=%zu clouds_received=%lu "
+    "(held_before_align=%lu) qos=%s. publishers=0 usually means the bag is not playing that topic, "
+    "or QoS does not match (set pointcloud_reliable:=false for best-effort drivers).",
+    pointcloud_topic_.c_str(), publishers,
+    static_cast<unsigned long>(clouds_received_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
+    static_cast<unsigned long>(clouds_before_align_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
+    pointcloud_reliable_ ? "reliable" : "best_effort");
 }
 
 void BackOdomNode::worker_loop()
@@ -554,7 +602,13 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
       }
       imu_cv_.wait_for(lock, std::chrono::milliseconds(5));
     }
-    if (stop_ || !imu_processor_->aligned()) {
+    if (stop_) {
+      return;
+    }
+    if (!imu_processor_->aligned()) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Lidar scan waiting for IMU alignment (scan_end %.3f).", scan_end);
       return;
     }
     const double imu_stamp = imu_processor_->latest_stamp();
@@ -600,11 +654,14 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     reject_streak = lidar_matcher_->reject_streak();
     timeout_streak = lidar_matcher_->timeout_streak();
   }
-  RCLCPP_DEBUG(
-    this->get_logger(),
-    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f timed_out %s",
+  scans_processed_.fetch_add(1, std::memory_order_relaxed);
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), 1000,
+    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f "
+    "timed_out %s skipped %s applied %s",
     matched.deskew_ms, matched.voxel_ms, matched.align_ms, matched.cost_ms, matched.refine_ms,
-    matched.map_ms, matched.align_timed_out ? "yes" : "no");
+    matched.map_ms, matched.align_timed_out ? "yes" : "no", matched.skipped ? "yes" : "no",
+    matched.applied ? "yes" : "no");
   {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     last_match_ = matched;
@@ -626,7 +683,8 @@ void BackOdomNode::publish_match(
                           matched.refine_ms + matched.map_ms;
   if (matched.skipped) {
     RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000, "Scan skipped: no usable points or IMU pose.");
+      this->get_logger(), *this->get_clock(), 2000, "Scan skipped: %s",
+      matched.skip_reason.empty() ? "no usable points or IMU pose" : matched.skip_reason.c_str());
     return;
   }
   if (matched.align_timed_out && !matched.partial_used) {

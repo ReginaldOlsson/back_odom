@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,6 +61,7 @@ private:
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void worker_loop();
   void process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
+  void watch_lidar_start();
   void publish_match(
     const MatchResult & matched, const ProcessorOutput & prior, const ProcessorOutput & corrected,
     const rclcpp::Time & stamp);
@@ -100,6 +102,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::TimerBase::SharedPtr map_timer_;
+  rclcpp::TimerBase::SharedPtr lidar_watch_timer_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_odom_pub_;
@@ -129,7 +132,14 @@ private:
   rclcpp::Time last_health_stamp_{0, 0, RCL_ROS_TIME};
   bool has_published_health_{false};
   std::atomic<bool> aligned_{false};
+  std::atomic<std::uint64_t> clouds_received_{0};
+  std::atomic<std::uint64_t> clouds_before_align_{0};
+  std::atomic<std::uint64_t> scans_processed_{0};
+  std::atomic<bool> logged_first_cloud_{false};
 
+  std::string imu_topic_;
+  std::string pointcloud_topic_;
+  bool pointcloud_reliable_{true};
   std::string parent_frame_;
   std::string child_frame_;
   Eigen::Vector3d previous_angular_velocity_{Eigen::Vector3d::Zero()};

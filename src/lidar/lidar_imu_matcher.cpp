@@ -486,20 +486,32 @@ ScanAlignment LidarImuMatcher::align_scan(const LidarScan & scan, const ImuProce
   ScanAlignment alignment;
   MatchResult & result = alignment.result;
   result.health = health_.health;
-  if (!imu.aligned() || scan.points.empty() || scan.timestamps.size() != scan.points.size()) {
+  if (!imu.aligned()) {
     result.skipped = true;
+    result.skip_reason = "IMU is not aligned yet";
+    return alignment;
+  }
+  if (scan.points.empty() || scan.timestamps.size() != scan.points.size()) {
+    result.skipped = true;
+    result.skip_reason = "scan has no xyz+time points";
     return alignment;
   }
   ++scan_count_;
   PreparedClouds clouds = prepare_scan(scan, imu.trajectory(), result);
   if (clouds.source.empty()) {
     result.skipped = true;
+    result.skip_reason = "deskew/crop/voxel left no source points";
     return alignment;
   }
   const double scan_end = *std::max_element(scan.timestamps.cbegin(), scan.timestamps.cend());
   // Deskew/guess come from the buffered pose nearest the scan time, not imu.pose() (live tip).
   if (!imu.has_pose_near(scan_end, imu.max_pair_dt())) {
     result.skipped = true;
+    const StampedPose closest = imu.closest_pose(scan_end);
+    result.skip_reason = "no IMU pose within " + std::to_string(imu.max_pair_dt()) +
+                         " s of scan_end " + std::to_string(scan_end) + " (closest " +
+                         std::to_string(closest.stamp) + ", imu_latest " +
+                         std::to_string(imu.latest_stamp()) + ")";
     return alignment;
   }
   const Sophus::SE3d imu_pose = imu.interpolate_pose(scan_end);

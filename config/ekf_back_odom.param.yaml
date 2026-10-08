@@ -22,7 +22,8 @@
       twist_additional_delay: 0.0
       # One application per IMU sample. A later cycle must not reuse the same twist.
       twist_smoothing_steps: 1
-      max_twist_queue_size: 200
+      # 200 Hz IMU twist. 2000 covers ~10 s while waiting for the first lidar pose.
+      max_twist_queue_size: 2000
       twist_gate_dist: 46.1
 
     process_noise:

@@ -32,6 +32,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,8 @@ struct MatchResult
   bool first_scan{false};
   /// The scan could not be processed (IMU not aligned, no IMU pose near the scan, empty crop).
   bool skipped{false};
+  /// Set when `skipped` is true so the node can log the reason at INFO.
+  std::string skip_reason;
   Sophus::SE3d imu_pose{};
   Sophus::SE3d corrected_pose{};
   /// World-frame left increment applied to the pose. `correction * predicted = aligned`.
