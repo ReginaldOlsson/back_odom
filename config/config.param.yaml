@@ -36,7 +36,7 @@
     # mid-iteration and inserts the scan at the latest IMU pose. Drop toward 8.0
     # if diagnostics show many align_timed_out events.
     align_rate_hz: 10.0
-    max_points_per_voxel: 20
+    max_points_per_voxel: 50
     max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
