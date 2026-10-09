@@ -25,11 +25,23 @@
 
   <!-- ICP pose + IMU twist. publish_tf is false in config; EKF owns map -> base_link. -->
   <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen"
-        ros_args="--log-level back_odom_node:=debug">
+        ros_args="--log-level back_odom_node:=info">
     <param from="$(var config_file)"/>
     <param name="imu_topic" value="$(var imu_topic)"/>
     <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
     <param name="use_sim_time" value="$(var use_sim_time)"/>
+  </node>
+
+  <node pkg="back_odom" exec="intensity_lane_node" name="intensity_lane_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="pointcloud_topic" value="/back_odom/map"/>
+    <param name="map_frame" value="map"/>
+    <param name="base_frame" value="base_link"/>
+    <param name="longitudinal_distance" value="15.0"/>
+    <param name="lateral_distance" value="15.0"/>
+    <param name="z_below" value="15.0"/>
+    <param name="voxel_size" value="0.5"/>
+    <param name="voxel_height" value="0.5"/>
   </node>
 
   <!-- predict_on_twist EKF; inputs remapped to back_odom publishers -->

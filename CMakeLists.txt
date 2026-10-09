@@ -107,6 +107,18 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTOR MultiThreadedExecutor
 )
 
+ament_auto_add_library(intensity_lane SHARED
+  src/lane/intensity_lane_node.cpp
+)
+ament_target_dependencies(
+  intensity_lane rclcpp rclcpp_components sensor_msgs geometry_msgs tf2_ros visualization_msgs)
+target_link_libraries(intensity_lane Eigen3::Eigen)
+
+rclcpp_components_register_node(intensity_lane
+  PLUGIN "back_odom::IntensityLaneNode"
+  EXECUTABLE intensity_lane_node
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
