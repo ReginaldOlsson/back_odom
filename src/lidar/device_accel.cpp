@@ -404,8 +404,9 @@ std::optional<PlaneIcpResult> align_points_on_device(
     int correspondences = 0;
     double robust_cost = 0.0;
     if (!plane_at(
-          xyz.data(), count, upload_frame, pose, params.max_correspondence_distance, params.kernel_scale,
-          hessian, gradient, correspondences, robust_cost)) {
+          xyz.data(), count, upload_frame, pose,
+          correspondence_distance_for_iteration(params, iteration), params.kernel_scale, hessian,
+          gradient, correspondences, robust_cost)) {
       return std::nullopt;
     }
     upload_frame = false;

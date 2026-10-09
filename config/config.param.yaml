@@ -39,20 +39,22 @@
     voxel_size: 0.5
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 75.0
-    crop_lateral: 75.0
+    crop_longitudinal: 150.0
+    crop_lateral: 100.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
     # lidar-anchored seed. Saturated solves are accepted but do not update biases.
     convergence_criterion: 0.001
-    max_iterations: 20
-    # Target ICP rate. Align budget is 1/hz (100 ms at 10). Past budget the partial solve is
-    # used when it took >= partial_min_iterations and its last step is < partial_max_step;
-    # otherwise the scan is skipped (never inserted at the IMU pose) and health degrades.
+    max_iterations: 200
+    # Target ICP rate. Align budget is wall-clock 1/hz (100 ms at 10), not bag/sim time.
+    # First 6 iterations search recovery_max_correspondence_distance, then this radius.
+    # A timeout with >= partial_min_iterations is still scored; a small step (≤0.25 m / 0.05
+    # rad) may pass even if mean NDT is up to 2*max_ndt_cost, so a slightly-off seed can
+    # pull back instead of freezing on the IMU prior. partial_max_step is logging only.
     align_rate_hz: 10.0
     partial_min_iterations: 3
-    partial_max_step: 0.01
+    partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
     # 27-voxel neighbour scan growing past the budget.
     max_points_per_voxel: 20
@@ -69,6 +71,10 @@
     # GPU vs CPU bake-off at this scan (map must be representative), re-run every N scans. 0 = CPU only.
     device_bakeoff_scan: 10
     device_recheck_scans: 200
+    # Coarse ICP neighbourhood (also used after a reject). Fine iterations use
+    # max_correspondence_distance. A strict NDT match may snap up to recovery_max_translation.
+    recovery_max_correspondence_distance: 4.0
+    recovery_max_translation: 3.0
     # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
     # and the EKF see the lidar-corrected trajectory.
     apply_imu_correction: true
@@ -89,7 +95,8 @@
     ndt_cov_regularization: 0.001
     min_ndt_correspondences: 20
     # Acceptance gates: fraction of NDT hits under max_ndt_cost, and plane
-    # correspondences / source points. Below either the scan is rejected.
+    # correspondences / source points. A small IMU-relative step may still pass when
+    # mean NDT is below 2*max_ndt_cost and inliers stay above min_ndt_inlier_fraction.
     min_ndt_inlier_fraction: 0.5
     min_inlier_ratio: 0.3
     # Diagonal entries of the twist and pose messages sent to the EKF.

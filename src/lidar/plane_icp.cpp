@@ -195,7 +195,8 @@ PlaneIcpResult align_to_surface(
       break;
     }
     const Accumulation system = build_system(
-      source, map, surface, pose, params.max_correspondence_distance, params.kernel_scale);
+      source, map, surface, pose, correspondence_distance_for_iteration(params, iteration),
+      params.kernel_scale);
     result.correspondences = system.correspondences;
     result.robust_cost = system.cost * inverse_count;
     result.hessian = system.jtj;

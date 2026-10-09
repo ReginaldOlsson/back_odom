@@ -30,10 +30,25 @@ namespace back_odom
 struct PlaneIcpParams
 {
   double max_correspondence_distance{2.0};
+  /// First `coarse_iterations` use this neighbourhood so a slightly-off seed can still see the
+  /// right plane. 0 disables the coarse stage (every iteration uses `max_correspondence_distance`).
+  double coarse_correspondence_distance{0.0};
+  int coarse_iterations{0};
   double kernel_scale{0.5};
   int max_iterations{20};
   double convergence_criterion{1.0e-3};
 };
+
+[[nodiscard]] inline double correspondence_distance_for_iteration(
+  const PlaneIcpParams & params, const int iteration)
+{
+  if (
+    iteration >= 0 && iteration < params.coarse_iterations &&
+    params.coarse_correspondence_distance > 0.0) {
+    return params.coarse_correspondence_distance;
+  }
+  return params.max_correspondence_distance;
+}
 
 struct PlaneIcpResult
 {

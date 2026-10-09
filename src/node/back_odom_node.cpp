@@ -235,7 +235,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.max_iterations = this->declare_parameter<int>("max_iterations", 20);
   lidar_params.align_rate_hz = this->declare_parameter<double>("align_rate_hz", 10.0);
   lidar_params.partial_min_iterations = this->declare_parameter<int>("partial_min_iterations", 3);
-  lidar_params.partial_max_step = this->declare_parameter<double>("partial_max_step", 0.01);
+  lidar_params.partial_max_step = this->declare_parameter<double>("partial_max_step", 0.05);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
   lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
@@ -248,6 +248,10 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("keyframe_min_rotation", 0.05);
   lidar_params.device_bakeoff_scan = this->declare_parameter<int>("device_bakeoff_scan", 10);
   lidar_params.device_recheck_scans = this->declare_parameter<int>("device_recheck_scans", 200);
+  lidar_params.recovery_max_correspondence_distance =
+    this->declare_parameter<double>("recovery_max_correspondence_distance", 4.0);
+  lidar_params.recovery_max_translation =
+    this->declare_parameter<double>("recovery_max_translation", 3.0);
   lidar_params.apply_imu_correction =
     this->declare_parameter<bool>("apply_imu_correction", true);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
@@ -450,6 +454,9 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   }
 
   publish_odometry(odometry_pub_, output, stamp);
+  // Keep /back_odom/imu moving at IMU rate. It used to update only on an accepted lidar
+  // scan, so a reject/timeout made the IMU path look frozen even though the integrator ran.
+  publish_odometry(imu_odom_pub_, output, stamp);
   publish_twist(output, stamp);
   publish_path(output, stamp);
   publish_markers(output, health, stamp);
@@ -649,11 +656,13 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     matched = lidar_matcher_->commit_scan(std::move(alignment), *imu_processor_);
     corrected = imu_processor_->output_at(
       ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
-    scan_poses = lidar_matcher_->visible_scan_poses();
     health = lidar_matcher_->health();
     reject_streak = lidar_matcher_->reject_streak();
     timeout_streak = lidar_matcher_->timeout_streak();
   }
+  // Map insert is 20-70 ms and does not touch the IMU. Keep the integrator publishing.
+  lidar_matcher_->flush_pending_insert(matched);
+  scan_poses = lidar_matcher_->visible_scan_poses();
   scans_processed_.fetch_add(1, std::memory_order_relaxed);
   RCLCPP_INFO_THROTTLE(
     this->get_logger(), *this->get_clock(), 1000,
@@ -687,25 +696,37 @@ void BackOdomNode::publish_match(
       matched.skip_reason.empty() ? "no usable points or IMU pose" : matched.skip_reason.c_str());
     return;
   }
-  if (matched.align_timed_out && !matched.partial_used) {
+  if (matched.align_timed_out && !matched.applied) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "ICP hit the rate budget after %.0f iterations (deskew %.1f voxel %.1f align %.1f ms, "
-      "%.1f ms total). Scan not inserted; health %s.",
+      "%.1f ms total). Holding IMU prior; health %s.",
       matched.iterations, matched.deskew_ms, matched.voxel_ms, matched.align_ms, total_ms,
       health_name(matched.health));
+    publish_odometry(imu_odom_pub_, prior, stamp);
+    publish_odometry(odometry_pub_, corrected, stamp);
+    publish_pose(corrected, stamp);
+    if (publish_tf_) {
+      publish_tf(corrected, stamp);
+    }
     return;
   }
   if (!matched.applied) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP correction rejected. health %s, lidar cost %.3f ndt %.3f (inliers %.2f) ratio %.2f "
-      "pass %s, translation %.3f m, rotation %.3f rad, degenerate %d",
+      "ICP correction rejected. Holding IMU prior (last lidar + IMU). health %s, lidar cost %.3f "
+      "ndt %.3f (inliers %.2f) ratio %.2f pass %s, icp step %.3f m / %.3f rad, degenerate %d",
       health_name(matched.health), matched.lidar_cost,
       std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
       std::isfinite(matched.ndt_inlier_fraction) ? matched.ndt_inlier_fraction : -1.0,
       matched.inlier_ratio, matched.lidar_passed ? "yes" : "no", matched.translation_error,
       matched.rotation_error, matched.degenerate_axes);
+    publish_odometry(imu_odom_pub_, prior, stamp);
+    publish_odometry(odometry_pub_, corrected, stamp);
+    publish_pose(corrected, stamp);
+    if (publish_tf_) {
+      publish_tf(corrected, stamp);
+    }
     return;
   }
   if (matched.first_scan) {

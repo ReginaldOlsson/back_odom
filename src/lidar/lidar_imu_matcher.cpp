@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -37,6 +38,11 @@ namespace
 
 constexpr double k_max_translation = 1.0;
 constexpr double k_max_rotation = 0.2;
+constexpr double k_small_step_translation = 0.25;
+constexpr double k_small_step_rotation = 0.05;
+constexpr double k_small_step_ndt_scale = 2.0;
+constexpr int k_coarse_iterations = 6;
+constexpr int k_bakeoff_max_iterations = 12;
 constexpr double k_max_gyro_bias_step = 0.002;
 constexpr double k_max_accel_bias_step = 0.05;
 constexpr double k_bias_leak = 0.01;
@@ -74,10 +80,12 @@ bool finite_gain(const double gain)
   return std::isfinite(gain) && gain >= 0.0 && gain <= 1.0;
 }
 
-bool accept_vehicle_delta(const double iteration_count, const Sophus::SE3d & vehicle_delta)
+bool accept_vehicle_delta(
+  const double iteration_count, const Sophus::SE3d & vehicle_delta, const double max_translation,
+  const double max_rotation)
 {
-  return iteration_count > 0.0 && vehicle_delta.translation().norm() <= k_max_translation &&
-         vehicle_delta.so3().log().norm() <= k_max_rotation;
+  return iteration_count > 0.0 && vehicle_delta.translation().norm() <= max_translation &&
+         vehicle_delta.so3().log().norm() <= max_rotation;
 }
 
 double elapsed_ms(const std::chrono::steady_clock::time_point start)
@@ -192,6 +200,11 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
   if (params_.keyframe_min_translation < 0.0 || params_.keyframe_min_rotation < 0.0) {
     throw std::invalid_argument("keyframe thresholds must be non-negative");
   }
+  if (
+    !(params_.recovery_max_correspondence_distance > 0.0) ||
+    !(params_.recovery_max_translation > 0.0)) {
+    throw std::invalid_argument("recovery correspondence distance and translation must be positive");
+  }
   if (params_.max_iterations < 1 || !(params_.convergence_criterion > 0.0)) {
     throw std::invalid_argument("max_iterations and convergence_criterion must be positive");
   }
@@ -227,13 +240,19 @@ bool LidarImuMatcher::has_reference() const
 
 std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
 {
+  std::lock_guard<std::mutex> lock(map_mutex_);
   return map_.Pointcloud();
 }
 
 std::vector<LocalMapPoint> LidarImuMatcher::annotated_local_map() const
 {
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  std::size_t count = 0;
+  for (const HorizonScan & scan : horizon_) {
+    count += scan.points.size();
+  }
   std::vector<LocalMapPoint> annotated;
-  annotated.reserve(visible_scan_point_count());
+  annotated.reserve(count);
   for (const HorizonScan & scan : horizon_) {
     const bool have_intensity = scan.intensities.size() == scan.points.size();
     for (std::size_t index = 0; index < scan.points.size(); ++index) {
@@ -250,6 +269,7 @@ std::vector<LocalMapPoint> LidarImuMatcher::annotated_local_map() const
 
 std::vector<StampedPose> LidarImuMatcher::visible_scan_poses() const
 {
+  std::lock_guard<std::mutex> lock(map_mutex_);
   std::vector<StampedPose> poses;
   poses.reserve(horizon_.size());
   for (const HorizonScan & scan : horizon_) {
@@ -260,6 +280,7 @@ std::vector<StampedPose> LidarImuMatcher::visible_scan_poses() const
 
 std::size_t LidarImuMatcher::visible_scan_point_count() const
 {
+  std::lock_guard<std::mutex> lock(map_mutex_);
   std::size_t count = 0;
   for (const HorizonScan & scan : horizon_) {
     count += scan.points.size();
@@ -269,7 +290,7 @@ std::size_t LidarImuMatcher::visible_scan_point_count() const
 
 void LidarImuMatcher::record_horizon_scan(
   const Sophus::SE3d & pose, const double stamp, std::vector<Eigen::Vector3d> && points,
-  std::vector<float> && intensities, const ImuProcessor & imu)
+  std::vector<float> && intensities)
 {
   HorizonScan scan;
   scan.stamp = stamp;
@@ -282,14 +303,7 @@ void LidarImuMatcher::record_horizon_scan(
   scan.intensities = std::move(intensities);
   scan.scan_id = next_scan_id_++;
   if (!horizon_.empty()) {
-    const HorizonScan & previous = horizon_.back();
-    const std::vector<StampedPose> & trajectory = imu.trajectory();
-    if (!trajectory.empty() && previous.stamp + 1.0e-6 >= trajectory.front().stamp) {
-      scan.imu_from_previous =
-        imu.interpolate_pose(previous.stamp).inverse() * imu.interpolate_pose(stamp);
-    } else {
-      scan.imu_from_previous = previous.pose.inverse() * pose;
-    }
+    scan.imu_from_previous = horizon_.back().pose.inverse() * pose;
   }
   horizon_.push_back(std::move(scan));
   const Sophus::SE3d latest = horizon_.back().pose;
@@ -444,6 +458,7 @@ void LidarImuMatcher::cull_local_map(const Sophus::SE3d & pose)
 
 bool LidarImuMatcher::should_insert(const Sophus::SE3d & pose) const
 {
+  std::lock_guard<std::mutex> lock(map_mutex_);
   if (horizon_.empty()) {
     return true;
   }
@@ -452,9 +467,38 @@ bool LidarImuMatcher::should_insert(const Sophus::SE3d & pose) const
          moved.so3().log().norm() >= params_.keyframe_min_rotation;
 }
 
+void LidarImuMatcher::queue_insert(
+  const Sophus::SE3d & pose, const double stamp, std::vector<Eigen::Vector3d> && points,
+  std::vector<float> && intensities)
+{
+  pending_insert_.ready = true;
+  pending_insert_.pose = pose;
+  pending_insert_.stamp = stamp;
+  pending_insert_.points = std::move(points);
+  pending_insert_.intensities = std::move(intensities);
+}
+
+void LidarImuMatcher::flush_pending_insert(MatchResult & timing)
+{
+  if (!pending_insert_.ready) {
+    return;
+  }
+  PendingInsert pending = std::move(pending_insert_);
+  pending_insert_ = PendingInsert{};
+  Sophus::SE3d pose = pending.pose;
+  insert_scan(
+    pose, pending.stamp, std::move(pending.points), std::move(pending.intensities), timing);
+  if (params_.refine_window) {
+    const auto refine_start = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    refine_window_if_due(timing, pose);
+    timing.refine_ms += elapsed_ms(refine_start);
+  }
+}
+
 void LidarImuMatcher::insert_scan(
   const Sophus::SE3d & pose, const double stamp, std::vector<Eigen::Vector3d> && points,
-  std::vector<float> && intensities, const ImuProcessor & imu, MatchResult & timing)
+  std::vector<float> && intensities, MatchResult & timing)
 {
   const auto map_start = std::chrono::steady_clock::now();
   std::vector<Eigen::Vector3d> world(points.size());
@@ -464,20 +508,23 @@ void LidarImuMatcher::insert_scan(
     world[index] = pose * points[index];
     touched.push_back(kiss_icp::PointToVoxel(world[index], params_.voxel_size));
   }
-  map_.AddPoints(world);
-  // RemovePointsOutsideBox walks the whole map; a few keyframes of slack past the crop box
-  // costs nothing, so cull on distance rather than every insert.
-  if (
-    !has_cull_pose_ ||
-    (last_cull_pose_.inverse() * pose).translation().norm() >= k_cull_every_metres) {
-    cull_local_map(pose);
-    last_cull_pose_ = pose;
-    has_cull_pose_ = true;
+  {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    map_.AddPoints(world);
+    // RemovePointsOutsideBox walks the whole map; a few keyframes of slack past the crop box
+    // costs nothing, so cull on distance rather than every insert.
+    if (
+      !has_cull_pose_ ||
+      (last_cull_pose_.inverse() * pose).translation().norm() >= k_cull_every_metres) {
+      cull_local_map(pose);
+      last_cull_pose_ = pose;
+      has_cull_pose_ = true;
+    }
+    surface_.update_voxels(map_, touched);
+    ++map_epoch_;
+    record_horizon_scan(pose, stamp, std::move(points), std::move(intensities));
+    last_keyframe_pose_ = pose;
   }
-  surface_.update_voxels(map_, touched);
-  ++map_epoch_;
-  record_horizon_scan(pose, stamp, std::move(points), std::move(intensities), imu);
-  last_keyframe_pose_ = pose;
   timing.map_ms += elapsed_ms(map_start);
 }
 
@@ -573,9 +620,8 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
   const double scan_end = alignment.scan_end;
 
   if (alignment.first_scan) {
-    insert_scan(
-      predicted, scan_end, std::move(alignment.map_points), std::move(alignment.map_intensities),
-      imu, result);
+    queue_insert(
+      predicted, scan_end, std::move(alignment.map_points), std::move(alignment.map_intensities));
     has_reference_ = true;
     anchor_pose_ = predicted;
     anchor_stamp_ = scan_end;
@@ -592,12 +638,15 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
   }
 
   const MatchCandidate & candidate = alignment.candidate;
-  if (candidate.timed_out && !candidate.partial_used) {
-    // Out of budget before the solve settled. Skip the scan: do not insert, do not correct.
+  if (candidate.timed_out && !candidate.passes) {
+    // Out of budget before the solve produced a usable pose. Skip: do not insert, do not correct.
     result.applied = false;
     result.lidar_pose = predicted;
+    result.has_lidar_debug = true;
     note_health(imu, HealthEvent::TimedOut);
+    hold_to_imu_prior(imu, predicted, scan_end);
     result.health = health_.health;
+    result.corrected_pose = imu.pose();
     result.gyro_bias = imu.gyro_bias();
     result.accel_bias = imu.accel_bias();
     return result;
@@ -610,29 +659,30 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
     result.correction = failed * predicted.inverse();
     result.translation_error = vehicle_delta.translation().norm();
     result.rotation_error = vehicle_delta.so3().log().norm();
+    // Keep publishing / matching against the IMU-propagated last lidar pose, not the failed basin.
+    result.lidar_pose = predicted;
+    result.has_lidar_debug = true;
     note_health(imu, HealthEvent::Rejected);
+    hold_to_imu_prior(imu, predicted, scan_end);
     result.health = health_.health;
+    result.corrected_pose = imu.pose();
     result.gyro_bias = imu.gyro_bias();
     result.accel_bias = imu.accel_bias();
     return result;
   }
 
-  note_health(imu, candidate.saturated ? HealthEvent::Saturated : HealthEvent::Accepted);
+  note_health(
+    imu, (candidate.timed_out || candidate.saturated) ? HealthEvent::Saturated
+                                                      : HealthEvent::Accepted);
   const bool update_bias = health_.update_bias;
 
   const Sophus::SE3d limited =
     limit_longitudinal_correction(predicted, candidate.pose, params_.max_longitudinal_correction);
   Sophus::SE3d committed = limited;
   if (should_insert(committed)) {
-    insert_scan(
-      committed, scan_end, std::move(alignment.map_points), std::move(alignment.map_intensities),
-      imu, result);
+    queue_insert(
+      committed, scan_end, std::move(alignment.map_points), std::move(alignment.map_intensities));
     result.inserted_scan = true;
-    if (params_.refine_window && std::chrono::steady_clock::now() < alignment.deadline) {
-      const auto refine_start = std::chrono::steady_clock::now();
-      refine_window_if_due(result, committed);
-      result.refine_ms += elapsed_ms(refine_start);
-    }
   }
 
   // Residual against the seed (lidar anchor + IMU motion since): what the IMU step got wrong.
@@ -663,7 +713,9 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
 
 MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
 {
-  return commit_scan(align_scan(scan, imu), imu);
+  MatchResult result = commit_scan(align_scan(scan, imu), imu);
+  flush_pending_insert(result);
+  return result;
 }
 
 MatchResult LidarImuMatcher::on_imu(ImuProcessor & /*imu*/)
@@ -732,6 +784,19 @@ void LidarImuMatcher::restore_healthy_speed(ImuProcessor & imu)
   imu.set_velocity(last_healthy_velocity_);
 }
 
+void LidarImuMatcher::hold_to_imu_prior(
+  ImuProcessor & imu, const Sophus::SE3d & predicted, const double /*scan_end*/)
+{
+  if (!params_.apply_imu_correction) {
+    return;
+  }
+  // A rejected ICP pose is never applied. Restore last healthy body speed so a bad lidar
+  // velocity cannot walk the IMU (and the next seed) off the frozen map.
+  const Eigen::Vector3d body_speed =
+    has_healthy_ ? Eigen::Vector3d(last_healthy_speed_, 0.0, 0.0) : Eigen::Vector3d::Zero();
+  imu.set_velocity(predicted.so3() * body_speed);
+}
+
 void LidarImuMatcher::note_health(ImuProcessor & imu, const HealthEvent event)
 {
   health_ = advance_localization_health(health_, event, params_.limits.max_match_rejects);
@@ -746,8 +811,9 @@ MatchCandidate LidarImuMatcher::score_alignment(
 {
   MatchCandidate candidate;
   candidate.present = true;
+  const bool recovering = health_.health != LocalizationHealth::Healthy;
   const auto align_start = std::chrono::steady_clock::now();
-  const PlaneIcpResult icp = align(source, guess, deadline);
+  const PlaneIcpResult icp = align(source, guess, params_.max_correspondence_distance, deadline);
   timing.align_ms += elapsed_ms(align_start);
 
   candidate.iterations = icp.iterations;
@@ -758,10 +824,11 @@ MatchCandidate LidarImuMatcher::score_alignment(
   candidate.degenerate_axes = icp.degenerate_axes;
   candidate.saturated = icp.saturated;
   candidate.timed_out = icp.timed_out;
+  const bool have_solve =
+    icp.iterations + 0.5 >= static_cast<double>(params_.partial_min_iterations);
   if (icp.timed_out) {
-    candidate.partial_used = icp.iterations + 0.5 >= static_cast<double>(params_.partial_min_iterations) &&
-                             icp.last_step <= params_.partial_max_step;
-    if (!candidate.partial_used) {
+    candidate.partial_used = have_solve && icp.last_step <= params_.partial_max_step;
+    if (!have_solve) {
       candidate.pose = guess;
       candidate.passes = false;
       return candidate;
@@ -773,15 +840,37 @@ MatchCandidate LidarImuMatcher::score_alignment(
   const auto cost_start = std::chrono::steady_clock::now();
   const NdtScore ndt = ndt_score(
     source, candidate.pose, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences);
+  const NdtScore ndt_seed =
+    recovering ? ndt_score(source, guess, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences)
+               : NdtScore{};
   timing.cost_ms += elapsed_ms(cost_start);
   candidate.ndt_cost = ndt.mean_cost;
   candidate.ndt_inlier_fraction = ndt.inlier_fraction;
 
   const Sophus::SE3d imu_delta = guess.inverse() * candidate.pose;
-  const bool imu_ok = accept_vehicle_delta(icp.iterations, imu_delta);
-  const bool ndt_ok = !std::isfinite(ndt.mean_cost) ||
-                      (ndt.mean_cost < params_.max_ndt_cost &&
-                       ndt.inlier_fraction >= params_.min_ndt_inlier_fraction);
+  const bool small_step = imu_delta.translation().norm() <= k_small_step_translation &&
+                          imu_delta.so3().log().norm() <= k_small_step_rotation;
+
+  // A worse basin than the IMU prior is not a recovery, unless the step is a small refine.
+  if (
+    recovering && !small_step && std::isfinite(ndt_seed.mean_cost) && std::isfinite(ndt.mean_cost) &&
+    ndt.mean_cost > ndt_seed.mean_cost + 0.5) {
+    candidate.pose = guess;
+    candidate.ndt_cost = ndt_seed.mean_cost;
+    candidate.ndt_inlier_fraction = ndt_seed.inlier_fraction;
+    candidate.passes = false;
+    return candidate;
+  }
+
+  const bool ndt_strict = std::isfinite(ndt.mean_cost) && ndt.mean_cost < params_.max_ndt_cost &&
+                          ndt.inlier_fraction >= params_.min_ndt_inlier_fraction;
+  const bool ndt_soft =
+    small_step && ndt.inlier_fraction >= params_.min_ndt_inlier_fraction &&
+    (!std::isfinite(ndt.mean_cost) || ndt.mean_cost < k_small_step_ndt_scale * params_.max_ndt_cost);
+  const double max_translation =
+    recovering && ndt_strict ? params_.recovery_max_translation : k_max_translation;
+  const bool imu_ok = accept_vehicle_delta(icp.iterations, imu_delta, max_translation, k_max_rotation);
+  const bool ndt_ok = !std::isfinite(ndt.mean_cost) || ndt_strict || ndt_soft;
   const bool inliers_ok = candidate.inlier_ratio >= params_.min_inlier_ratio;
   candidate.passes =
     icp.iterations > 0.0 && imu_ok && std::isfinite(candidate.cost) && ndt_ok && inliers_ok;
@@ -865,10 +954,16 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
 
 PlaneIcpResult LidarImuMatcher::align(
   const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
-  const std::chrono::steady_clock::time_point * const deadline)
+  const double max_correspondence_distance, const std::chrono::steady_clock::time_point * const deadline)
 {
   PlaneIcpParams icp_params;
-  icp_params.max_correspondence_distance = params_.max_correspondence_distance;
+  icp_params.max_correspondence_distance = max_correspondence_distance;
+  icp_params.coarse_correspondence_distance =
+    std::max(max_correspondence_distance, params_.recovery_max_correspondence_distance);
+  icp_params.coarse_iterations =
+    icp_params.coarse_correspondence_distance > max_correspondence_distance + 1.0e-9
+      ? k_coarse_iterations
+      : 0;
   icp_params.kernel_scale = params_.kernel_scale;
   icp_params.max_iterations = params_.max_iterations;
   icp_params.convergence_criterion = params_.convergence_criterion;
@@ -884,15 +979,18 @@ PlaneIcpResult LidarImuMatcher::align(
       : (params_.device_recheck_scans > 0 &&
          scan_count_ - device_align_decided_at_ >= static_cast<std::uint64_t>(params_.device_recheck_scans));
   if (bakeoff_due) {
-    // The bake-off ignores the live rate budget: both solvers run to completion on this scan.
+    // Cap bake-off iterations: a full 200-iter pair on a large map stalls the worker for seconds
+    // and drops every scan while it runs (IMU keeps going; lidar looks frozen).
+    PlaneIcpParams bakeoff = icp_params;
+    bakeoff.max_iterations = std::min(icp_params.max_iterations, k_bakeoff_max_iterations);
     device_align_decided_ = true;
     device_align_decided_at_ = scan_count_;
     const auto device_start = std::chrono::steady_clock::now();
     const std::optional<PlaneIcpResult> device =
-      align_points_on_device(scan, map_, surface_, map_epoch_, guess, icp_params, nullptr);
+      align_points_on_device(scan, map_, surface_, map_epoch_, guess, bakeoff, deadline);
     const double device_ms = elapsed_ms(device_start);
     const auto cpu_start = std::chrono::steady_clock::now();
-    const PlaneIcpResult cpu = align_to_surface(scan, map_, surface_, guess, icp_params, nullptr);
+    const PlaneIcpResult cpu = align_to_surface(scan, map_, surface_, guess, bakeoff, deadline);
     const double cpu_ms = elapsed_ms(cpu_start);
     device_align_use_ = device.has_value() && close_poses(cpu.pose, device->pose) && device_ms < 0.8 * cpu_ms;
     return device_align_use_ ? *device : cpu;

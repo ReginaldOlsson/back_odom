@@ -112,13 +112,12 @@ void apply_transform(
   const double qy = transform.rotation.y;
   const double qz = transform.rotation.z;
   const double qw = transform.rotation.w;
-  const double tw = qx * px + qy * py + qz * pz;
-  const double txr = qw * px + qy * pz - qz * py;
-  const double tyr = qw * py + qz * px - qx * pz;
-  const double tzr = qw * pz + qx * py - qy * px;
-  ox = transform.translation.x + (txr * qw - tw * qx - tyr * qz + tzr * qy);
-  oy = transform.translation.y + (tyr * qw - tw * qy - tzr * qx + txr * qz);
-  oz = transform.translation.z + (tzr * qw - tw * qz - txr * qy + tyr * qx);
+  const double uvx = qy * pz - qz * py;
+  const double uvy = qz * px - qx * pz;
+  const double uvz = qx * py - qy * px;
+  ox = transform.translation.x + px + 2.0 * (qw * uvx + qy * uvz - qz * uvy);
+  oy = transform.translation.y + py + 2.0 * (qw * uvy + qz * uvx - qx * uvz);
+  oz = transform.translation.z + pz + 2.0 * (qw * uvz + qx * uvy - qy * uvx);
 }
 
 std_msgs::msg::ColorRGBA intensity_color(double mean, double stddev, double low, double high)
@@ -207,30 +206,25 @@ geometry_msgs::msg::Quaternion quaternion_from_rotation(const Eigen::Matrix3d & 
   return quaternion;
 }
 
-/// Intensity-weighted covariance of positions about the voxel center. Columns of `axes` are the
-/// principal components (red = largest, green = middle, blue = smallest).
-IntensityPca fit_intensity_pca(
-  const CellStats & cell, double center_x, double center_y, double center_z, int min_points)
+/// Intensity-weighted mean is the PCA origin. Covariance is about that mean, so the red axis
+/// starts on the principal component and stays parallel to it.
+IntensityPca fit_intensity_pca(const CellStats & cell, int min_points)
 {
   IntensityPca pca;
-  pca.center = Eigen::Vector3d(center_x, center_y, center_z);
   if (cell.count < min_points || !(cell.sum_weight > 1e-6)) {
     return pca;
   }
   const double inverse = 1.0 / cell.sum_weight;
-  const double cx = center_x;
-  const double cy = center_y;
-  const double cz = center_z;
+  const double mx = cell.sum_wx * inverse;
+  const double my = cell.sum_wy * inverse;
+  const double mz = cell.sum_wz * inverse;
+  pca.center = Eigen::Vector3d(mx, my, mz);
   Eigen::Matrix3d covariance;
-  covariance << (cell.sum_wxx - 2.0 * cx * cell.sum_wx + cx * cx * cell.sum_weight) * inverse,
-    (cell.sum_wxy - cx * cell.sum_wy - cy * cell.sum_wx + cx * cy * cell.sum_weight) * inverse,
-    (cell.sum_wxz - cx * cell.sum_wz - cz * cell.sum_wx + cx * cz * cell.sum_weight) * inverse,
-    (cell.sum_wxy - cx * cell.sum_wy - cy * cell.sum_wx + cx * cy * cell.sum_weight) * inverse,
-    (cell.sum_wyy - 2.0 * cy * cell.sum_wy + cy * cy * cell.sum_weight) * inverse,
-    (cell.sum_wyz - cy * cell.sum_wz - cz * cell.sum_wy + cy * cz * cell.sum_weight) * inverse,
-    (cell.sum_wxz - cx * cell.sum_wz - cz * cell.sum_wx + cx * cz * cell.sum_weight) * inverse,
-    (cell.sum_wyz - cy * cell.sum_wz - cz * cell.sum_wy + cy * cz * cell.sum_weight) * inverse,
-    (cell.sum_wzz - 2.0 * cz * cell.sum_wz + cz * cz * cell.sum_weight) * inverse;
+  covariance << cell.sum_wxx * inverse - mx * mx, cell.sum_wxy * inverse - mx * my,
+    cell.sum_wxz * inverse - mx * mz, cell.sum_wxy * inverse - mx * my,
+    cell.sum_wyy * inverse - my * my, cell.sum_wyz * inverse - my * mz,
+    cell.sum_wxz * inverse - mx * mz, cell.sum_wyz * inverse - my * mz,
+    cell.sum_wzz * inverse - mz * mz;
   const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
   if (solver.info() != Eigen::Success) {
     return pca;
@@ -313,7 +307,7 @@ IntensityLaneNode::IntensityLaneNode(const rclcpp::NodeOptions & options)
   longitudinal_distance_ = this->declare_parameter<double>("longitudinal_distance", 50.0);
   lateral_distance_ = this->declare_parameter<double>("lateral_distance", 25.0);
   z_below_ = this->declare_parameter<double>("z_below", 5.0);
-  min_points_ = this->declare_parameter<int>("min_points", 8);
+  min_points_ = this->declare_parameter<int>("min_points", 3);
   intensity_low_ = this->declare_parameter<double>("intensity_low", 0.0);
   intensity_high_ = this->declare_parameter<double>("intensity_high", 80.0);
 
@@ -409,9 +403,10 @@ void IntensityLaneNode::callback_cloud(const sensor_msgs::msg::PointCloud2::Cons
 
   if (accumulated_pub_->get_subscription_count() > 0) {
     sensor_msgs::msg::PointCloud2 debug_cloud;
-    debug_cloud.header = header;
+    debug_cloud.header.stamp = msg->header.stamp;
+    debug_cloud.header.frame_id = map_frame_;
     debug_cloud.height = 1;
-    debug_cloud.width = static_cast<std::uint32_t>(vehicle_points.size());
+    debug_cloud.width = static_cast<std::uint32_t>(accumulated_.size());
     debug_cloud.is_dense = true;
     debug_cloud.is_bigendian = false;
     sensor_msgs::msg::PointField field;
@@ -427,8 +422,8 @@ void IntensityLaneNode::callback_cloud(const sensor_msgs::msg::PointCloud2::Cons
     debug_cloud.point_step = 16;
     debug_cloud.row_step = debug_cloud.point_step * debug_cloud.width;
     debug_cloud.data.resize(static_cast<std::size_t>(debug_cloud.row_step));
-    for (std::size_t index = 0; index < vehicle_points.size(); ++index) {
-      const VehiclePoint & point = vehicle_points[index];
+    for (std::size_t index = 0; index < accumulated_.size(); ++index) {
+      const MapPoint & point = accumulated_[index];
       const float values[4] = {
         static_cast<float>(point.x), static_cast<float>(point.y), static_cast<float>(point.z),
         point.intensity};
@@ -520,11 +515,7 @@ void IntensityLaneNode::callback_cloud(const sensor_msgs::msg::PointCloud2::Cons
   pca_markers.markers.push_back(clear);
   int ellipsoid_id = 1;
   for (const auto & item : cells) {
-    const double center_x = (static_cast<double>(item.first.x) + 0.5) * voxel_size_;
-    const double center_y = (static_cast<double>(item.first.y) + 0.5) * voxel_size_;
-    const double center_z = (static_cast<double>(item.first.z) + 0.5) * voxel_height_;
-    const IntensityPca pca =
-      fit_intensity_pca(item.second, center_x, center_y, center_z, min_points_);
+    const IntensityPca pca = fit_intensity_pca(item.second, min_points_);
     if (!pca.valid) {
       continue;
     }

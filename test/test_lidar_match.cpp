@@ -19,6 +19,7 @@
 #include "back_odom/lidar/lidar_preprocess.hpp"
 #include "back_odom/lidar/match_candidate.hpp"
 #include "back_odom/lidar/ndt_health.hpp"
+#include "back_odom/lidar/plane_icp.hpp"
 #include "back_odom/lidar/scan_window.hpp"
 
 #include <kiss_icp_cpp/core/Registration.hpp>
@@ -209,6 +210,32 @@ TEST(BackwardMatch, drifted_imu_is_corrected_when_the_next_scan_is_aligned)
   EXPECT_NEAR(imu.pose().translation().z(), 0.0, 0.15);
 }
 
+TEST(BackwardMatch, fifteen_centimetre_offset_is_applied)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarImuMatcher matcher(match_params());
+  const LidarScan scan = corner_scan(imu.latest_stamp());
+  ASSERT_TRUE(matcher.on_scan(scan, imu).first_scan);
+  imu.reset_state(
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(0.15, 0.0, 0.0)), Eigen::Vector3d::Zero(),
+    imu.latest_stamp());
+  const MatchResult matched = matcher.on_scan(scan, imu);
+  ASSERT_TRUE(matched.applied);
+  EXPECT_NEAR(imu.pose().translation().x(), 0.0, 0.08);
+}
+
+TEST(PlaneIcp, correspondence_distance_switches_after_coarse_iterations)
+{
+  PlaneIcpParams params;
+  params.max_correspondence_distance = 2.0;
+  params.coarse_correspondence_distance = 4.0;
+  params.coarse_iterations = 6;
+  EXPECT_DOUBLE_EQ(correspondence_distance_for_iteration(params, 0), 4.0);
+  EXPECT_DOUBLE_EQ(correspondence_distance_for_iteration(params, 5), 4.0);
+  EXPECT_DOUBLE_EQ(correspondence_distance_for_iteration(params, 6), 2.0);
+  EXPECT_DOUBLE_EQ(correspondence_distance_for_iteration(params, 20), 2.0);
+}
+
 TEST(BackwardMatch, align_rate_budget_skips_the_scan_and_degrades_health)
 {
   ImuProcessor imu = aligned_imu();
@@ -236,6 +263,23 @@ TEST(BackwardMatch, align_rate_budget_skips_the_scan_and_degrades_health)
   EXPECT_EQ(matcher.health(), LocalizationHealth::Degraded);
   EXPECT_EQ(matcher.timeout_streak(), 1);
   EXPECT_EQ(matcher.reject_streak(), 0);
+}
+
+TEST(BackwardMatch, rejected_icp_keeps_the_imu_seed_as_the_lidar_pose)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarImuMatcher matcher(match_params());
+  ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
+  const double later = imu.latest_stamp() + 0.5;
+  imu.reset_state(
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(2.0, 0.0, 0.0),
+    later);
+  const MatchResult matched = matcher.on_scan(corner_scan(later), imu);
+  EXPECT_FALSE(matched.applied);
+  EXPECT_FALSE(matched.inserted_scan);
+  // The failed basin is not published: lidar debug stays on the IMU-propagated prior.
+  EXPECT_GT(matched.lidar_pose.translation().x(), 0.8);
+  EXPECT_NEAR(matched.lidar_pose.translation().x(), imu.pose().translation().x(), 0.25);
 }
 
 TEST(BackwardMatch, stationary_scans_are_matched_but_not_inserted)

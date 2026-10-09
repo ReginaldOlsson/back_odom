@@ -48,8 +48,8 @@ namespace back_odom
 
 /// IMU integration runs on the executor thread; every scan is matched on a dedicated worker
 /// thread fed by a single-slot mailbox (the newest scan wins). `state_mutex_` guards the IMU
-/// integrator and the matcher's committed state; the heavy ICP runs on an IMU snapshot outside
-/// the lock.
+/// integrator and matcher health/pose; ICP runs on an IMU snapshot, and map insert is flushed
+/// after that lock is released so the IMU path keeps publishing.
 class BackOdomNode : public rclcpp::Node
 {
 public:
