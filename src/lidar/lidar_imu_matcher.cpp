@@ -892,8 +892,17 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
       scan.intensities, half_longitudinal_, half_lateral_);
     const double deskew_ms = elapsed_ms(deskew_start);
     const auto voxel_start = std::chrono::steady_clock::now();
-    IntensityCloud map_cloud =
-      voxel_downsample_with_intensity(cropped.points, cropped.intensities, fine_voxel);
+    IntensityCloud map_cloud;
+    if (params_.use_random_grid_downsampling) {
+      const double rate = params_.random_downsample_target > 0
+                            ? static_cast<double>(params_.random_downsample_target) /
+                                static_cast<double>(std::max<std::size_t>(cropped.points.size(), 1))
+                            : params_.random_downsample_rate;
+      map_cloud = randomgrid_downsample_with_intensity(
+        cropped.points, cropped.intensities, fine_voxel, rate, downsample_rng_);
+    } else {
+      map_cloud = voxel_downsample_with_intensity(cropped.points, cropped.intensities, fine_voxel);
+    }
     out.source = kiss_icp::VoxelDownsample(map_cloud.points, coarse_voxel);
     out.map_points = std::move(map_cloud.points);
     out.map_intensities = std::move(map_cloud.intensities);
@@ -905,8 +914,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
       half_longitudinal_, half_lateral_, fine_voxel, coarse_voxel);
   };
 
-  const bool device_ok = params_.device_bakeoff_scan > 0 && device_available() &&
-                         scan.points.size() >= 1000 && !trajectory.empty();
+  const bool device_ok = !params_.use_random_grid_downsampling && params_.device_bakeoff_scan > 0 &&
+                         device_available() && scan.points.size() >= 1000 && !trajectory.empty();
   const bool bakeoff_due =
     device_ok &&
     (!device_front_decided_

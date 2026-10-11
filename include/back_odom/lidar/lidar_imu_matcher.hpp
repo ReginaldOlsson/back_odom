@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <random>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,12 @@ struct LidarScan
 struct LidarMatchParams
 {
   double voxel_size{0.5};
+  /// When true, the scan cloud uses random-grid sampling (GLIM) instead of first-point voxels.
+  bool use_random_grid_downsampling{false};
+  /// Fraction of points to keep when `random_downsample_target` is 0. Range (0, 1].
+  double random_downsample_rate{0.3};
+  /// When positive, the keep rate is this many points divided by the cropped cloud size.
+  int random_downsample_target{0};
   double crop_longitudinal{75.0};
   double crop_lateral{50.0};
   /// Scan copies kept for the debug cloud. The live map is still the cropped ICP cloud.
@@ -298,6 +305,7 @@ private:
 
   Sophus::SE3d body_from_lidar_{};
   LidarMatchParams params_;
+  std::mt19937 downsample_rng_{std::random_device{}()};
   double half_longitudinal_{37.5};
   double half_lateral_{25.0};
   mutable std::mutex map_mutex_;

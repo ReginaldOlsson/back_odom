@@ -108,6 +108,8 @@ rclcpp_components_register_node(${PROJECT_NAME}
 )
 
 ament_auto_add_library(intensity_lane SHARED
+  src/lane/cell_features.cpp
+  src/lane/cell_segmentation.cpp
   src/lane/intensity_lane_node.cpp
 )
 ament_target_dependencies(
@@ -131,6 +133,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_ekf_messages test/test_ekf_messages.cpp)
   target_link_libraries(test_ekf_messages ${PROJECT_NAME})
   ament_target_dependencies(test_ekf_messages rclcpp tf2_ros sensor_msgs geometry_msgs)
+  ament_add_gtest(test_cell_features test/test_cell_features.cpp)
+  target_link_libraries(test_cell_features intensity_lane)
   if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
     foreach(_back_odom_test IN ITEMS test_imu_processing test_lidar_match test_device_accel test_ekf_messages)
       target_compile_options(${_back_odom_test} PRIVATE ${BACK_ODOM_SIMD_FLAGS})

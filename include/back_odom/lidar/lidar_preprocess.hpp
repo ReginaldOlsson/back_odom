@@ -19,6 +19,7 @@
 
 #include <Eigen/Core>
 
+#include <random>
 #include <vector>
 
 namespace back_odom
@@ -42,6 +43,12 @@ struct IntensityCloud
 [[nodiscard]] IntensityCloud voxel_downsample_with_intensity(
   const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
   double voxel_size);
+
+/// GLIM-style random grid. Each voxel keeps about the same number of original points
+/// (`sampling_rate` of the cloud, spread across occupied voxels). Points are sampled, not averaged.
+[[nodiscard]] IntensityCloud randomgrid_downsample_with_intensity(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  double voxel_size, double sampling_rate, std::mt19937 & rng);
 
 /// Intensity of the first cropped point that occupies each downsampled point's voxel.
 [[nodiscard]] std::vector<float> intensities_for_downsampled(

@@ -37,6 +37,13 @@
     min_range: 1.5
     max_range: 0.0
     voxel_size: 0.5
+    # Scan downsample. false keeps the first point in each voxel (KISS-ICP).
+    # true uses GLIM random-grid sampling: original points, about the same count per voxel.
+    use_random_grid_downsampling: true
+    # Fraction of the cropped cloud to keep. Ignored when random_downsample_target > 0.
+    random_downsample_rate: 0.3
+    # Absolute point budget. 0 means use random_downsample_rate.
+    random_downsample_target: 0
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
     crop_longitudinal: 150.0
@@ -62,8 +69,8 @@
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
-    refine_window: false
-    refine_settle_passes: 2
+    refine_window: true
+    refine_settle_passes: 5
     # Scans are inserted only after moving this far since the last inserted scan. Stationary
     # scans are matched for the correction but never pile into the map.
     keyframe_min_translation: 0.5

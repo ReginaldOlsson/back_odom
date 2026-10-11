@@ -225,6 +225,12 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
   LidarMatchParams lidar_params;
   lidar_params.voxel_size = this->declare_parameter<double>("voxel_size", 0.5);
+  lidar_params.use_random_grid_downsampling =
+    this->declare_parameter<bool>("use_random_grid_downsampling", false);
+  lidar_params.random_downsample_rate =
+    this->declare_parameter<double>("random_downsample_rate", 0.3);
+  lidar_params.random_downsample_target =
+    this->declare_parameter<int>("random_downsample_target", 0);
   lidar_params.crop_longitudinal = this->declare_parameter<double>("crop_longitudinal", 75.0);
   lidar_params.crop_lateral = this->declare_parameter<double>("crop_lateral", 50.0);
   lidar_params.max_correspondence_distance =

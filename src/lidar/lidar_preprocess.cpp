@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -138,6 +139,71 @@ IntensityCloud voxel_downsample_with_intensity(
   for (const auto & item : grid) {
     downsampled.points.push_back(item.second.first);
     downsampled.intensities.push_back(item.second.second);
+  }
+  return downsampled;
+}
+
+IntensityCloud randomgrid_downsample_with_intensity(
+  const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
+  const double voxel_size, const double sampling_rate, std::mt19937 & rng)
+{
+  IntensityCloud downsampled;
+  if (points.empty() || !(voxel_size > 0.0) || !(sampling_rate > 0.0)) {
+    return downsampled;
+  }
+  if (sampling_rate >= 0.99) {
+    downsampled.points = points;
+    downsampled.intensities = intensities.size() == points.size()
+                                ? intensities
+                                : std::vector<float>(points.size(), 0.0F);
+    return downsampled;
+  }
+
+  const bool have_intensity = intensities.size() == points.size();
+  tsl::robin_map<kiss_icp::Voxel, std::vector<std::size_t>> grid;
+  grid.reserve(points.size());
+  for (std::size_t index = 0; index < points.size(); ++index) {
+    const Eigen::Vector3d & point = points[index];
+    if (!point.allFinite()) {
+      continue;
+    }
+    grid[kiss_icp::PointToVoxel(point, voxel_size)].push_back(index);
+  }
+  if (grid.empty()) {
+    return downsampled;
+  }
+
+  const double rate = std::min(sampling_rate, 1.0);
+  const std::size_t points_per_voxel = static_cast<std::size_t>(std::ceil(
+    (rate * static_cast<double>(points.size())) / static_cast<double>(grid.size())));
+  const std::size_t max_points = static_cast<std::size_t>(
+    std::ceil(static_cast<double>(points.size()) * rate * 1.2));
+
+  std::vector<std::size_t> kept;
+  kept.reserve(std::min(points.size(), max_points));
+  std::vector<std::size_t> chosen;
+  for (auto & item : grid) {
+    auto & cell = item.second;
+    if (cell.size() <= points_per_voxel) {
+      kept.insert(kept.end(), cell.begin(), cell.end());
+      continue;
+    }
+    chosen.clear();
+    std::sample(cell.begin(), cell.end(), std::back_inserter(chosen), points_per_voxel, rng);
+    kept.insert(kept.end(), chosen.begin(), chosen.end());
+  }
+  if (kept.size() > max_points) {
+    std::vector<std::size_t> capped;
+    capped.reserve(max_points);
+    std::sample(kept.begin(), kept.end(), std::back_inserter(capped), max_points, rng);
+    kept.swap(capped);
+  }
+  std::sort(kept.begin(), kept.end());
+  downsampled.points.reserve(kept.size());
+  downsampled.intensities.reserve(kept.size());
+  for (const std::size_t index : kept) {
+    downsampled.points.push_back(points[index]);
+    downsampled.intensities.push_back(have_intensity ? intensities[index] : 0.0F);
   }
   return downsampled;
 }

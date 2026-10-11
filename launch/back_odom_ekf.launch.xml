@@ -32,17 +32,23 @@
     <param name="use_sim_time" value="$(var use_sim_time)"/>
   </node>
 
-  <node pkg="back_odom" exec="intensity_lane_node" name="intensity_lane_node" output="screen">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-    <param name="pointcloud_topic" value="/back_odom/map"/>
+  <!-- <node pkg="back_odom" exec="intensity_lane_node" name="intensity_lane_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/> -->
+    <!-- Raw scans are accumulated with TF. /back_odom/map is already a map thinned to one
+         point per 0.5 m, so it gives at most one point per cell; if you still want it, set
+         accumulate_input=false so each frame replaces the buffer instead of duplicating it. -->
+    <!-- <param name="pointcloud_topic" value="/boreas/pointcloud"/>
+    <param name="accumulate_input" value="true"/>
     <param name="map_frame" value="map"/>
     <param name="base_frame" value="base_link"/>
     <param name="longitudinal_distance" value="15.0"/>
     <param name="lateral_distance" value="15.0"/>
     <param name="z_below" value="15.0"/>
-    <param name="voxel_size" value="0.5"/>
-    <param name="voxel_height" value="0.5"/>
-  </node>
+    <param name="voxel_size" value="0.25"/>
+    <param name="voxel_height" value="0.25"/>
+    <param name="segments_topic" value="back_odom/segments"/>
+    <param name="segmented_cloud_topic" value="back_odom/segmented_cloud"/>
+  </node> -->
 
   <!-- predict_on_twist EKF; inputs remapped to back_odom publishers -->
   <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
