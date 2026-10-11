@@ -50,11 +50,6 @@ struct IntensityCloud
   const std::vector<Eigen::Vector3d> & points, const std::vector<float> & intensities,
   double voxel_size, double sampling_rate, std::mt19937 & rng);
 
-/// Intensity of the first cropped point that occupies each downsampled point's voxel.
-[[nodiscard]] std::vector<float> intensities_for_downsampled(
-  const std::vector<Eigen::Vector3d> & cropped, const std::vector<float> & cropped_intensities,
-  const std::vector<Eigen::Vector3d> & downsampled, double voxel_size);
-
 /// The slice of `trajectory` that brackets [from_stamp, to_stamp], with one pose of margin on
 /// each side. Deskew only needs these; building motion segments for a 30 s buffer per scan is
 /// wasted work.

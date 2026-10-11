@@ -180,7 +180,6 @@ LidarMatchParams match_params()
 {
   LidarMatchParams params;
   params.voxel_size = 0.25;
-  params.backward_match_stride = 3;
   params.max_correspondence_distance = 2.0;
   params.apply_imu_correction = true;
   // The synthetic scans sit at the same place; insert every accepted scan so the horizon

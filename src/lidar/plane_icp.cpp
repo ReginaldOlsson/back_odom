@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <limits>
 
 namespace back_odom
 {
@@ -199,7 +198,6 @@ PlaneIcpResult align_to_surface(
       params.kernel_scale);
     result.correspondences = system.correspondences;
     result.robust_cost = system.cost * inverse_count;
-    result.hessian = system.jtj;
     if (system.correspondences < k_min_correspondences) {
       break;
     }
@@ -230,19 +228,6 @@ PlaneIcpResult align_to_surface(
   result.pose = pose;
   result.correction = pose * initial_guess.inverse();
   return result;
-}
-
-double surface_plane_cost(
-  const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
-  const SurfaceVoxelMap & surface, const Sophus::SE3d & pose, const double max_correspondence_distance,
-  const double kernel_scale)
-{
-  if (source.empty() || !(kernel_scale > 0.0) || !(max_correspondence_distance > 0.0)) {
-    return std::numeric_limits<double>::infinity();
-  }
-  const Accumulation system =
-    build_system(source, map, surface, pose, max_correspondence_distance, kernel_scale);
-  return system.cost / static_cast<double>(source.size());
 }
 
 }  // namespace back_odom

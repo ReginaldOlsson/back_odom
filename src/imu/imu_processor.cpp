@@ -334,7 +334,6 @@ ProcessorOutput ImuProcessor::make_tracking_output(const ImuSample & sample) con
   output.orientation = dead_reckoning_->orientation();
   output.position = dead_reckoning_->position();
   output.velocity_world = dead_reckoning_->velocity();
-  output.linear_acceleration_world = dead_reckoning_->linear_acceleration_world();
   output.specific_force_body = sample.linear_acceleration;
   output.angular_velocity_body = sample.angular_velocity - dead_reckoning_->gyro_bias();
   output.gravity = dead_reckoning_->gravity();

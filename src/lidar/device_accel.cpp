@@ -412,7 +412,6 @@ std::optional<PlaneIcpResult> align_points_on_device(
     upload_frame = false;
     result.correspondences = correspondences;
     result.robust_cost = robust_cost;
-    result.hessian = hessian;
     if (correspondences < k_min_correspondences) {
       break;
     }

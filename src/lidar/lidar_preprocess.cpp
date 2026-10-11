@@ -208,33 +208,6 @@ IntensityCloud randomgrid_downsample_with_intensity(
   return downsampled;
 }
 
-std::vector<float> intensities_for_downsampled(
-  const std::vector<Eigen::Vector3d> & cropped, const std::vector<float> & cropped_intensities,
-  const std::vector<Eigen::Vector3d> & downsampled, const double voxel_size)
-{
-  std::vector<float> intensities(downsampled.size(), 0.0F);
-  if (cropped.empty() || downsampled.empty() || !(voxel_size > 0.0)) {
-    return intensities;
-  }
-  const bool have_intensity = cropped_intensities.size() == cropped.size();
-  tsl::robin_map<kiss_icp::Voxel, float> grid;
-  grid.reserve(cropped.size());
-  for (std::size_t index = 0; index < cropped.size(); ++index) {
-    const kiss_icp::Voxel voxel = kiss_icp::PointToVoxel(cropped[index], voxel_size);
-    if (grid.contains(voxel)) {
-      continue;
-    }
-    grid.insert({voxel, have_intensity ? cropped_intensities[index] : 0.0F});
-  }
-  for (std::size_t index = 0; index < downsampled.size(); ++index) {
-    const auto found = grid.find(kiss_icp::PointToVoxel(downsampled[index], voxel_size));
-    if (found != grid.end()) {
-      intensities[index] = found->second;
-    }
-  }
-  return intensities;
-}
-
 std::vector<StampedPose> trajectory_window(
   const std::vector<StampedPose> & trajectory, const double from_stamp, const double to_stamp)
 {

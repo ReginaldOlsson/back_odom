@@ -244,7 +244,6 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.partial_max_step = this->declare_parameter<double>("partial_max_step", 0.05);
   lidar_params.max_points_per_voxel = this->declare_parameter<int>("max_points_per_voxel", 20);
   lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
-  lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
   lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
   lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
   lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);

@@ -66,7 +66,6 @@ struct ProcessorOutput
   Eigen::Vector3d position{Eigen::Vector3d::Zero()};
   Eigen::Vector3d velocity_world{Eigen::Vector3d::Zero()};
   Eigen::Vector3d angular_velocity_body{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d linear_acceleration_world{Eigen::Vector3d::Zero()};
   Eigen::Vector3d specific_force_body{Eigen::Vector3d::Zero()};
   double gravity{9.81};
   bool speed_clamped{false};

@@ -68,8 +68,6 @@ struct LidarMatchParams
   double convergence_criterion{1.0e-3};
   int max_iterations{20};
   int max_points_per_voxel{20};
-  /// Kept for parameter compatibility; the live path no longer keeps a scan window.
-  int backward_match_stride{4};
   /// Off on the live path: freezing each scan into the map duplicates a building once per pose.
   bool refine_window{false};
   double refine_min_travel{2.0};
@@ -233,7 +231,6 @@ public:
   explicit LidarImuMatcher(const LidarMatchParams & params);
 
   [[nodiscard]] bool has_reference() const;
-  [[nodiscard]] std::vector<Eigen::Vector3d> local_map() const;
   /// Horizon points in the map frame, with scan id and collective-pass count for RViz.
   [[nodiscard]] std::vector<LocalMapPoint> annotated_local_map() const;
   /// Lidar poses of scans whose points can still lie in the cropped cloud.
@@ -282,7 +279,7 @@ private:
   void hold_to_imu_prior(ImuProcessor & imu, const Sophus::SE3d & predicted, double scan_end);
   [[nodiscard]] PreparedClouds prepare_scan(
     const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing);
-  void remember_healthy(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, double stamp);
+  void remember_healthy(const Sophus::SE3d & pose, const Eigen::Vector3d & velocity);
   void restore_healthy_speed(ImuProcessor & imu);
   void note_health(ImuProcessor & imu, HealthEvent event);
   [[nodiscard]] MatchCandidate score_alignment(
@@ -351,8 +348,6 @@ private:
   bool has_bias_prior_{false};
   HealthState health_{};
   bool has_healthy_{false};
-  Sophus::SE3d last_healthy_pose_{};
-  double last_healthy_stamp_{0.0};
   Eigen::Vector3d last_healthy_velocity_{Eigen::Vector3d::Zero()};
   double last_healthy_speed_{0.0};
   std::uint64_t map_epoch_{1};

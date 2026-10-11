@@ -68,8 +68,6 @@ struct PlaneIcpResult
   bool timed_out{false};
   /// Iteration cap reached without meeting the convergence criterion.
   bool saturated{false};
-  /// Final 6x6 normal matrix (body frame), for downstream covariance / observability use.
-  Eigen::Matrix<double, 6, 6> hessian{Eigen::Matrix<double, 6, 6>::Zero()};
 };
 
 /// Point-to-plane ICP. Closest point from `map`, plane normal from the `surface` cache of the
@@ -78,12 +76,6 @@ struct PlaneIcpResult
   const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const Sophus::SE3d & initial_guess, const PlaneIcpParams & params,
   const std::chrono::steady_clock::time_point * deadline = nullptr);
-
-/// Mean robust plane cost at `pose` with the same association as align_to_surface.
-[[nodiscard]] double surface_plane_cost(
-  const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
-  const SurfaceVoxelMap & surface, const Sophus::SE3d & pose, double max_correspondence_distance,
-  double kernel_scale);
 
 }  // namespace back_odom
 

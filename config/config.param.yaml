@@ -66,8 +66,6 @@
     # 27-voxel neighbour scan growing past the budget.
     max_points_per_voxel: 20
     max_visible_scans: 10
-    # Recent scans kept with the lidar pose that inserted them.
-    backward_match_stride: 4
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
     refine_window: true
     refine_settle_passes: 5

@@ -76,7 +76,6 @@ struct SurfaceVoxelMap
 
 /// Backwards-compatible name used by the health tests.
 using NdtVoxelMap = SurfaceVoxelMap;
-using NdtVoxelEntry = SurfaceVoxel;
 
 /// Mean Mahalanobis distance squared of body points at `pose` against `cloud`.
 /// Returns NaN when fewer than `min_correspondences` valid voxel hits exist so callers can skip

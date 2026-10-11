@@ -38,7 +38,6 @@ enum class HealthEvent
   Accepted,
   Saturated,
   Rejected,
-  KinematicViolation,
   SpeedClamped,
   /// ICP ran out of its rate budget before settling. A compute problem, not a divergence:
   /// the scan is skipped, nothing is inserted, and the IMU keeps dead reckoning.
@@ -81,15 +80,6 @@ struct HealthState
   return clamp_body_velocity(after, limits.max_speed);
 }
 
-[[nodiscard]] inline bool clamp_world_velocity(
-  const Sophus::SO3d & orientation, Eigen::Vector3d & velocity_world, const double max_speed)
-{
-  const Eigen::Vector3d world = orientation * clamp_body_velocity(orientation.inverse() * velocity_world, max_speed);
-  const bool changed = (world - velocity_world).norm() > 1.0e-9;
-  velocity_world = world;
-  return changed;
-}
-
 /// Reject a committed vehicle step that is faster or spinning harder than the vehicle allows.
 /// A very small dt skips the rate check so a same-stamp pose fix still uses the displacement gate.
 [[nodiscard]] inline bool step_within_vehicle_limits(
@@ -115,7 +105,7 @@ struct HealthState
   next.update_bias = true;
   const int reject_limit = std::max(1, max_rejects);
 
-  if (event == HealthEvent::KinematicViolation || event == HealthEvent::SpeedClamped) {
+  if (event == HealthEvent::SpeedClamped) {
     next.health = LocalizationHealth::Diverged;
     next.update_bias = false;
     next.restore_speed = true;

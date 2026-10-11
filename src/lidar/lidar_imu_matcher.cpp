@@ -156,9 +156,6 @@ LidarImuMatcher::LidarImuMatcher(const LidarMatchParams & params)
     params_.voxel_size <= 0.0 || params_.crop_longitudinal <= 0.0 || params_.crop_lateral <= 0.0) {
     throw std::invalid_argument("lidar crop and voxel size must be positive");
   }
-  if (params_.backward_match_stride < 1) {
-    throw std::invalid_argument("backward_match_stride must be positive");
-  }
   if (params_.max_points_per_voxel < 1) {
     throw std::invalid_argument("max_points_per_voxel must be positive");
   }
@@ -236,12 +233,6 @@ int LidarImuMatcher::timeout_streak() const
 bool LidarImuMatcher::has_reference() const
 {
   return has_reference_;
-}
-
-std::vector<Eigen::Vector3d> LidarImuMatcher::local_map() const
-{
-  std::lock_guard<std::mutex> lock(map_mutex_);
-  return map_.Pointcloud();
 }
 
 std::vector<LocalMapPoint> LidarImuMatcher::annotated_local_map() const
@@ -631,7 +622,7 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
     result.inserted_scan = true;
     result.first_scan = true;
     result.corrected_pose = predicted;
-    remember_healthy(predicted, imu.velocity(), scan_end);
+    remember_healthy(predicted, imu.velocity());
     note_health(imu, HealthEvent::Accepted);
     result.health = health_.health;
     return result;
@@ -704,7 +695,7 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
   anchor_stamp_ = scan_end;
   result.corrected_pose = imu.pose();
   result.lidar_pose = committed;
-  remember_healthy(result.corrected_pose, imu.velocity(), scan_end);
+  remember_healthy(result.corrected_pose, imu.velocity());
   result.health = health_.health;
   result.gyro_bias = imu.gyro_bias();
   result.accel_bias = imu.accel_bias();
@@ -766,11 +757,9 @@ void LidarImuMatcher::apply_correction(
 }
 
 void LidarImuMatcher::remember_healthy(
-  const Sophus::SE3d & pose, const Eigen::Vector3d & velocity, const double stamp)
+  const Sophus::SE3d & pose, const Eigen::Vector3d & velocity)
 {
   has_healthy_ = true;
-  last_healthy_pose_ = pose;
-  last_healthy_stamp_ = stamp;
   last_healthy_velocity_ = velocity;
   last_healthy_speed_ = (pose.so3().inverse() * velocity).x();
 }
