@@ -1,0 +1,784 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 80
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /TF1/Frames1
+        - /local_cloud1/Autocompute Value Bounds1
+        - /ekf_pose1/Topic1
+        - /gt1/Shape1
+        - /error_kitti1/Layout1
+        - /lon_lat_error1/Series1/Series 21
+      Splitter Ratio: 0.46355140209198
+    Tree Height: 746
+  - Class: rviz_common/Tool Properties
+    Expanded:
+      - /2D Goal Pose1
+      - /Publish Point1
+    Name: Tool Properties
+    Splitter Ratio: 0.5886790156364441
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.7692307829856873
+  - Class: rviz_common/Time
+    Experimental: false
+    Name: Time
+    SyncMode: 0
+    SyncSource: local_cloud
+  - Class: autoware::visualization::bag_time_manager_rviz_plugin::BagTimeManagerPanel
+    Name: BagTimeManagerPanel
+  - Class: rviz_common/Help
+    Name: Help
+  - Class: rviz_common/Selection
+    Name: Selection
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 1
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 94; 92; 100
+      Enabled: false
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 101
+      Reference Frame: base_link
+      Value: false
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: false
+        applanix:
+          Value: false
+        base_link:
+          Value: true
+        imu:
+          Value: false
+        lidar:
+          Value: false
+        map:
+          Value: false
+        sensor_kit_base_link:
+          Value: false
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        map:
+          base_link:
+            sensor_kit_base_link:
+              applanix:
+                {}
+              imu:
+                {}
+              lidar:
+                {}
+      Update Interval: 0
+      Value: true
+    - Angle Tolerance: 0.10000000149011612
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: true
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: true
+        Value: true
+      Enabled: true
+      Keep: 100
+      Name: Odometry
+      Position Tolerance: 0.10000000149011612
+      Shape:
+        Alpha: 1
+        Axes Length: 1
+        Axes Radius: 0.10000000149011612
+        Color: 255; 25; 0
+        Head Length: 0.30000001192092896
+        Head Radius: 0.10000000149011612
+        Shaft Length: 1
+        Shaft Radius: 0.05000000074505806
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /back_odom
+      Value: true
+    - Alpha: 1
+      Cell Size: 5
+      Class: rviz_default_plugins/Grid
+      Color: 94; 92; 100
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 10
+      Reference Frame: map
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: false
+      Autocompute Value Bounds:
+        Max Value: -57.18928909301758
+        Min Value: -84.0572738647461
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 85; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 100
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: local_cloud
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.10000000149011612
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /back_odom/map
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 25.566024780273438
+        Min Value: -6.3887481689453125
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 255
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: boreas_cloud
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.054999999701976776
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /boreas/pointcloud
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 0; 0; 127
+      Enabled: true
+      Head Diameter: 0.11999999731779099
+      Head Length: 0.05000000074505806
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: lidar_path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: Arrows
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.09000000357627869
+      Shaft Length: 0.10000000149011612
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /back_odom/debug/lidar/path
+      Value: true
+    - Alpha: 1
+      Axes Length: 1
+      Axes Radius: 0.10000000149011612
+      Class: rviz_default_plugins/PoseWithCovariance
+      Color: 255; 25; 0
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: true
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: true
+        Value: true
+      Enabled: true
+      Head Length: 0.30000001192092896
+      Head Radius: 0.10000000149011612
+      Name: ekf_pose
+      Shaft Length: 1
+      Shaft Radius: 0.05000000074505806
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ekf_pose_with_covariance
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: pca_axis
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /back_odom/pca_axes
+      Value: false
+    - Angle Tolerance: 0.10000000149011612
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: true
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: true
+        Value: true
+      Enabled: true
+      Keep: 1000
+      Name: gt
+      Position Tolerance: 0.10000000149011612
+      Shape:
+        Alpha: 1
+        Axes Length: 1
+        Axes Radius: 0.10000000149011612
+        Color: 85; 255; 0
+        Head Length: 0.30000001192092896
+        Head Radius: 0.10000000149011612
+        Shaft Length: 1
+        Shaft Radius: 0.05000000074505806
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /boreas/ground_truth/odom
+      Value: true
+    - Class: rviz_2d_plot_plugin/Plot2D
+      Clear History: false
+      Enabled: true
+      Grid:
+        Major Grid: true
+        Minor Divisions: 1
+        Minor Grid: true
+        X Major Ticks: 6
+        Y Major Ticks: 5
+      Layout:
+        Height: 220
+        Horizontal Alignment: Right
+        Vertical Alignment: Top
+        Width: 360
+        X Offset: 10
+        Y Offset: 230
+      Legend:
+        Enabled: true
+        Position: Top Left
+        Show Values: true
+        X Offset: 4
+        Y Offset: 4
+      Name: error_kitti
+      Pause Plot: false
+      Plot Mode: Time Series
+      QoS:
+        Depth: 10
+        Durability: Volatile
+        Reliability: Reliable
+      References:
+        Preset: None
+        Preset Tolerance: 0.10000000149011612
+        Preset Value: 0
+        Reference Count: 0
+      Series:
+        Series 1:
+          Color: 80; 220; 130
+          Field: skipped_total
+          Label: skipped_total
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ""
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series Count: 1
+      Style:
+        Axis Color: 230; 230; 230
+        Background Alpha: 0.10000000149011612
+        Background Color: 0; 0; 0
+        Font Size: 8
+        Grid Color: 130; 130; 130
+        Text Color: 245; 245; 245
+      Time:
+        Refresh Rate: 20
+        Time Source: Receive Time
+        Window Seconds: 30
+        XY History Mode: Rolling Time Window
+      Value: true
+      X Axis:
+        Auto Scale: true
+        Axis Scale: Independent
+        X Max: 1
+        X Min: -1
+      Y Axis:
+        Auto Scale: true
+        Y Max: 1
+        Y Min: -1
+    - Class: rviz_2d_plot_plugin/Plot2D
+      Clear History: false
+      Enabled: true
+      Grid:
+        Major Grid: true
+        Minor Divisions: 1
+        Minor Grid: true
+        X Major Ticks: 6
+        Y Major Ticks: 5
+      Layout:
+        Height: 220
+        Horizontal Alignment: Right
+        Vertical Alignment: Top
+        Width: 360
+        X Offset: 10
+        Y Offset: 10
+      Legend:
+        Enabled: true
+        Position: Top Left
+        Show Values: true
+        X Offset: 4
+        Y Offset: 4
+      Name: Plot2D
+      Pause Plot: false
+      Plot Mode: Time Series
+      QoS:
+        Depth: 10
+        Durability: Volatile
+        Reliability: Reliable
+      References:
+        Preset: None
+        Preset Tolerance: 0.10000000149011612
+        Preset Value: 0
+        Reference Count: 0
+      Series:
+        Series 1:
+          Color: 80; 170; 255
+          Field: twist/linear/x
+          Label: twist_linear_x
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /ekf_twist
+          Unit: ""
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series Count: 1
+      Style:
+        Axis Color: 230; 230; 230
+        Background Alpha: 0.10000000149011612
+        Background Color: 0; 0; 0
+        Font Size: 8
+        Grid Color: 130; 130; 130
+        Text Color: 245; 245; 245
+      Time:
+        Refresh Rate: 20
+        Time Source: Receive Time
+        Window Seconds: 30
+        XY History Mode: Rolling Time Window
+      Value: true
+      X Axis:
+        Auto Scale: true
+        Axis Scale: Independent
+        X Max: 1
+        X Min: -1
+      Y Axis:
+        Auto Scale: true
+        Y Max: 1
+        Y Min: -1
+    - Class: rviz_2d_plot_plugin/Plot2D
+      Clear History: false
+      Enabled: true
+      Grid:
+        Major Grid: true
+        Minor Divisions: 1
+        Minor Grid: true
+        X Major Ticks: 6
+        Y Major Ticks: 5
+      Layout:
+        Height: 220
+        Horizontal Alignment: Right
+        Vertical Alignment: Top
+        Width: 360
+        X Offset: 10
+        Y Offset: 440
+      Legend:
+        Enabled: true
+        Position: Top Left
+        Show Values: true
+        X Offset: 4
+        Y Offset: 4
+      Name: lon_lat_error
+      Pause Plot: false
+      Plot Mode: Time Series
+      QoS:
+        Depth: 10
+        Durability: Volatile
+        Reliability: Reliable
+      References:
+        Preset: None
+        Preset Tolerance: 0.10000000149011612
+        Preset Value: 0
+        Reference Count: 0
+      Series:
+        Series 1:
+          Color: 80; 170; 255
+          Field: lateral_m
+          Label: lateral_m
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/error/lateral_longitudinal
+          Unit: m
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series 2:
+          Color: 80; 220; 130
+          Field: longitudinal_m
+          Label: longitudinal_m
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/error/lateral_longitudinal
+          Unit: m
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series Count: 2
+      Style:
+        Axis Color: 230; 230; 230
+        Background Alpha: 0.10000000149011612
+        Background Color: 0; 0; 0
+        Font Size: 8
+        Grid Color: 130; 130; 130
+        Text Color: 245; 245; 245
+      Time:
+        Refresh Rate: 20
+        Time Source: Receive Time
+        Window Seconds: 30
+        XY History Mode: Rolling Time Window
+      Value: true
+      X Axis:
+        Auto Scale: true
+        Axis Scale: Independent
+        X Max: 1
+        X Min: -1
+      Y Axis:
+        Auto Scale: true
+        Y Max: 1
+        Y Min: -1
+    - Class: rviz_2d_plot_plugin/Plot2D
+      Clear History: false
+      Enabled: true
+      Grid:
+        Major Grid: true
+        Minor Divisions: 1
+        Minor Grid: true
+        X Major Ticks: 6
+        Y Major Ticks: 5
+      Layout:
+        Height: 220
+        Horizontal Alignment: Right
+        Vertical Alignment: Top
+        Width: 360
+        X Offset: 10
+        Y Offset: 650
+      Legend:
+        Enabled: true
+        Position: Top Left
+        Show Values: true
+        X Offset: 4
+        Y Offset: 4
+      Name: pipeline_timmings
+      Pause Plot: false
+      Plot Mode: Time Series
+      QoS:
+        Depth: 10
+        Durability: Volatile
+        Reliability: Reliable
+      References:
+        Preset: None
+        Preset Tolerance: 0.10000000149011612
+        Preset Value: 0
+        Reference Count: 0
+      Series:
+        Series 1:
+          Color: 80; 220; 130
+          Field: deskew_ms
+          Label: deskew_ms
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ms
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series 2:
+          Color: 255; 0; 127
+          Field: map_ms
+          Label: map_ms
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ms
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series 3:
+          Color: 85; 85; 255
+          Field: refine_ms
+          Label: refine_ms
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ms
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series 4:
+          Color: 85; 85; 255
+          Field: cost_ms
+          Label: cost_ms
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ms
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series 5:
+          Color: 170; 170; 0
+          Field: align_ms
+          Label: align_ms
+          Line Alpha: 1
+          Line Style: Solid
+          Line Width: 2
+          Plot Style: Line
+          Topic: /back_odom/debug/scan_stages
+          Unit: ms
+          Value: true
+          Value Offset: 0
+          Value Scale: 1
+          X Field: ""
+          Y Field: ""
+        Series Count: 5
+      Style:
+        Axis Color: 230; 230; 230
+        Background Alpha: 0.10000000149011612
+        Background Color: 0; 0; 0
+        Font Size: 8
+        Grid Color: 130; 130; 130
+        Text Color: 245; 245; 245
+      Time:
+        Refresh Rate: 20
+        Time Source: Receive Time
+        Window Seconds: 30
+        XY History Mode: Rolling Time Window
+      Value: true
+      X Axis:
+        Auto Scale: true
+        Axis Scale: Independent
+        X Max: 1
+        X Min: -1
+      Y Axis:
+        Auto Scale: true
+        Y Max: 1
+        Y Min: -1
+  Enabled: true
+  Global Options:
+    Background Color: 30; 30; 30
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Covariance x: 0.25
+      Covariance y: 0.25
+      Covariance yaw: 0.06853891909122467
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
+    - Class: rviz_default_plugins/PublishPoint
+      Single click: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /clicked_point
+    - Boost Factor: 1
+      Class: autoware_fps_view_rviz_plugin/KeyboardFPSTool
+      Fly Mode: true
+      Movement Speed: 1
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Angle: 8.14000129699707
+      Class: tier4_camera_view_rviz_plugin/BirdEyeView
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Scale: 11.460661888122559
+      Target Frame: base_link
+      Value: BirdEyeView (tier4_camera_view_rviz_plugin)
+      X: 0.9528369903564453
+      Y: 1.1143360137939453
+    Saved: ~
+Window Geometry:
+  BagTimeManagerPanel:
+    collapsed: false
+  Displays:
+    collapsed: false
+  Height: 1011
+  Help:
+    collapsed: false
+  Hide Left Dock: false
+  Hide Right Dock: true
+  QMainWindow State: 000000ff00000000fd0000000400000000000002170000038efc020000000bfb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb0000001200530065006c0065006300740069006f006e0000000043000000550000005500fffffffb000000100044006900730070006c00610079007301000000430000038e000000d200fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb0000000c00430061006d00650072006100000001eb000001a50000000000000000fb0000002600420061006700540069006d0065004d0061006e006100670065007200500061006e0065006c00000003330000004e0000004e00fffffffb0000000800480065006c0070000000027f000000930000007900ffffff00000001000001ad0000038efc0200000007fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000e0061006c00690067006e00650064000000003f0000013c0000000000000000fb0000000a0056006900650077007300000000430000038e000000a400fffffffb0000000a0049006d006100670065000000024a000001870000000000000000fb0000000c00630061006e0076006100730000000043000001960000000000000000fb0000000600690070006d00000000430000033e0000000000000000fb0000001200530065006c0065006300740069006f006e010000025a000000b20000000000000000000000020000073e000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e100000197000000030000073e00000041fc0100000002fb0000000800540069006d006500000000000000073e000002c100fffffffb0000000800540069006d00650100000000000004500000000000000000000005180000038e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Selection:
+    collapsed: false
+  Time:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: true
+  Width: 1854
+  X: 66
+  Y: 32
