@@ -223,6 +223,9 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const int path_max_poses = this->declare_parameter<int>("path_max_poses", 1000);
   const int imu_queue_depth = this->declare_parameter<int>("imu_queue_depth", 2000);
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
+  align_to_ground_truth_ = this->declare_parameter<bool>("align_to_ground_truth", false);
+  ground_truth_odom_topic_ = this->declare_parameter<std::string>(
+    "ground_truth_odom_topic", "/boreas/ground_truth/odom");
   LidarMatchParams lidar_params;
   lidar_params.voxel_size = this->declare_parameter<double>("voxel_size", 0.5);
   lidar_params.use_random_grid_downsampling =
@@ -340,6 +343,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
+  if (align_to_ground_truth_) {
+    ground_truth_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      ground_truth_odom_topic_, rclcpp::QoS(rclcpp::KeepLast(50)).reliable(),
+      [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) { this->callback_ground_truth(msg); });
+  }
 
   odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom", rclcpp::QoS(10));
   imu_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom/imu", rclcpp::QoS(10));
@@ -362,6 +370,12 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/lidar", rclcpp::QoS(10));
   lidar_debug_path_pub_ =
     this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/lidar/path", rclcpp::QoS(10));
+  scan_stages_pub_ = this->create_publisher<back_odom::msg::ScanStages>(
+    "back_odom/debug/scan_stages", rclcpp::QoS(10));
+  icp_debug_pub_ = this->create_publisher<back_odom::msg::IcpDebug>(
+    "back_odom/debug/icp", rclcpp::QoS(10));
+  pose_refine_pub_ = this->create_publisher<back_odom::msg::PoseRefine>(
+    "back_odom/debug/refine", rclcpp::QoS(10));
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
@@ -376,9 +390,10 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
 
   RCLCPP_INFO(
     this->get_logger(),
-    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s",
+    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s align_to_gt=%s",
     imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
-    pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort");
+    pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort",
+    align_to_ground_truth_ ? "true" : "false");
 }
 
 BackOdomNode::~BackOdomNode()
@@ -437,6 +452,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
     health = lidar_matcher_->health();
     reject_streak = lidar_matcher_->reject_streak();
     timeout_streak = lidar_matcher_->timeout_streak();
+    try_lock_ground_truth_alignment();
   }
   imu_cv_.notify_all();
   if (output.speed_clamped) {
@@ -458,16 +474,22 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
     publish_markers(output, health, stamp);
     return;
   }
+  if (!map_frame_ready()) {
+    // Body-frame twist does not depend on the map alignment.
+    publish_twist(output, stamp);
+    return;
+  }
+  const ProcessorOutput mapped = to_map_frame(output);
 
-  publish_odometry(odometry_pub_, output, stamp);
+  publish_odometry(odometry_pub_, mapped, stamp);
   // Keep /back_odom/imu moving at IMU rate. It used to update only on an accepted lidar
   // scan, so a reject/timeout made the IMU path look frozen even though the integrator ran.
-  publish_odometry(imu_odom_pub_, output, stamp);
+  publish_odometry(imu_odom_pub_, mapped, stamp);
   publish_twist(output, stamp);
-  publish_path(output, stamp);
-  publish_markers(output, health, stamp);
+  publish_path(mapped, stamp);
+  publish_markers(mapped, health, stamp);
   if (publish_tf_) {
-    publish_tf(output, stamp);
+    publish_tf(mapped, stamp);
   }
   bool health_due = false;
   {
@@ -574,14 +596,17 @@ void BackOdomNode::worker_loop()
 void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg)
 {
   LidarScan scan = scan_from_cloud(*msg);
+  const rclcpp::Time cloud_stamp(msg->header.stamp);
   if (scan.points.empty()) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 5000,
       "Skipping lidar scan. Need xyz points and a timestamp field.");
+    note_skipped_scan(cloud_stamp);
     return;
   }
   Sophus::SE3d base_from_lidar;
   if (!base_from_frame(msg->header.frame_id, base_from_lidar)) {
+    note_skipped_scan(cloud_stamp);
     return;
   }
   const rclcpp::Time stamp(msg->header.stamp);
@@ -622,27 +647,31 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "Lidar scan waiting for IMU alignment (scan_end %.3f).", scan_end);
-      return;
+    } else {
+      const double imu_stamp = imu_processor_->latest_stamp();
+      if (imu_stamp + 1.0e-3 < scan_end) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Lidar scan end is %.3f s ahead of the newest IMU. Matching with the IMU pose in hand.",
+          scan_end - imu_stamp);
+      }
+      if (
+        !imu_processor_->trajectory().empty() &&
+        imu_processor_->trajectory().front().stamp > scan_start + imu_max_pair_dt_) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "IMU buffer no longer covers scan start (buffer front %.3f, scan_start %.3f). "
+          "Increase imu_trajectory_horizon.",
+          imu_processor_->trajectory().front().stamp, scan_start);
+      } else {
+        lidar_matcher_->set_body_from_lidar(base_from_lidar);
+        snapshot.emplace(*imu_processor_);
+      }
     }
-    const double imu_stamp = imu_processor_->latest_stamp();
-    if (imu_stamp + 1.0e-3 < scan_end) {
-      RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Lidar scan end is %.3f s ahead of the newest IMU. Matching with the IMU pose in hand.",
-        scan_end - imu_stamp);
-    }
-    if (
-      !imu_processor_->trajectory().empty() &&
-      imu_processor_->trajectory().front().stamp > scan_start + imu_max_pair_dt_) {
-      RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "IMU buffer no longer covers scan start (buffer front %.3f, scan_start %.3f). "
-        "Increase imu_trajectory_horizon.",
-        imu_processor_->trajectory().front().stamp, scan_start);
-      return;
-    }
-    lidar_matcher_->set_body_from_lidar(base_from_lidar);
-    snapshot.emplace(*imu_processor_);
+  }
+  if (!snapshot) {
+    note_skipped_scan(stamp);
+    return;
   }
 
   ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot);
@@ -657,6 +686,7 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
   int timeout_streak = 0;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    try_lock_ground_truth_alignment();
     prior = imu_processor_->output_at(
       ImuSample{scan.stamp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()});
     matched = lidar_matcher_->commit_scan(std::move(alignment), *imu_processor_);
@@ -670,13 +700,7 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
   lidar_matcher_->flush_pending_insert(matched);
   scan_poses = lidar_matcher_->visible_scan_poses();
   scans_processed_.fetch_add(1, std::memory_order_relaxed);
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 1000,
-    "scan stages ms deskew %.2f voxel %.2f align %.2f cost %.2f refine %.2f map %.2f "
-    "timed_out %s skipped %s applied %s",
-    matched.deskew_ms, matched.voxel_ms, matched.align_ms, matched.cost_ms, matched.refine_ms,
-    matched.map_ms, matched.align_timed_out ? "yes" : "no", matched.skipped ? "yes" : "no",
-    matched.applied ? "yes" : "no");
+  publish_pipeline_debug(matched, stamp);
   {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     last_match_ = matched;
@@ -694,8 +718,15 @@ void BackOdomNode::publish_match(
   const MatchResult & matched, const ProcessorOutput & prior, const ProcessorOutput & corrected,
   const rclcpp::Time & stamp)
 {
-  const double total_ms = matched.deskew_ms + matched.voxel_ms + matched.align_ms + matched.cost_ms +
-                          matched.refine_ms + matched.map_ms;
+  if (!map_frame_ready()) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Waiting for %s before publishing map -> %s.", ground_truth_odom_topic_.c_str(),
+      child_frame_.c_str());
+    return;
+  }
+  const ProcessorOutput prior_map = to_map_frame(prior);
+  const ProcessorOutput corrected_map = to_map_frame(corrected);
   if (matched.skipped) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000, "Scan skipped: %s",
@@ -703,17 +734,11 @@ void BackOdomNode::publish_match(
     return;
   }
   if (matched.align_timed_out && !matched.applied) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "ICP hit the rate budget after %.0f iterations (deskew %.1f voxel %.1f align %.1f ms, "
-      "%.1f ms total). Holding IMU prior; health %s.",
-      matched.iterations, matched.deskew_ms, matched.voxel_ms, matched.align_ms, total_ms,
-      health_name(matched.health));
-    publish_odometry(imu_odom_pub_, prior, stamp);
-    publish_odometry(odometry_pub_, corrected, stamp);
-    publish_pose(corrected, stamp);
+    publish_odometry(imu_odom_pub_, prior_map, stamp);
+    publish_odometry(odometry_pub_, corrected_map, stamp);
+    publish_pose(corrected_map, stamp);
     if (publish_tf_) {
-      publish_tf(corrected, stamp);
+      publish_tf(corrected_map, stamp);
     }
     return;
   }
@@ -727,38 +752,23 @@ void BackOdomNode::publish_match(
       std::isfinite(matched.ndt_inlier_fraction) ? matched.ndt_inlier_fraction : -1.0,
       matched.inlier_ratio, matched.lidar_passed ? "yes" : "no", matched.translation_error,
       matched.rotation_error, matched.degenerate_axes);
-    publish_odometry(imu_odom_pub_, prior, stamp);
-    publish_odometry(odometry_pub_, corrected, stamp);
-    publish_pose(corrected, stamp);
+    publish_odometry(imu_odom_pub_, prior_map, stamp);
+    publish_odometry(odometry_pub_, corrected_map, stamp);
+    publish_pose(corrected_map, stamp);
     if (publish_tf_) {
-      publish_tf(corrected, stamp);
+      publish_tf(corrected_map, stamp);
     }
     return;
   }
   if (matched.first_scan) {
     RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
-  } else {
-    RCLCPP_INFO_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "ICP %s. cost %.3f ndt %.3f ratio %.2f iters %.0f%s, translation %.3f m, rotation %.4f rad, "
-      "health %s, %s, %.1f ms (align %.1f)",
-      matched.saturated ? "saturated" : "applied", matched.lidar_cost,
-      std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0, matched.inlier_ratio,
-      matched.iterations, matched.partial_used ? " (partial)" : "", matched.translation_error,
-      matched.rotation_error, health_name(matched.health),
-      matched.inserted_scan ? "inserted" : "no keyframe", total_ms, matched.align_ms);
   }
-  if (matched.refined_window) {
-    RCLCPP_INFO(
-      this->get_logger(), "Refined %d scan poses, %d already settled. largest shift %.3f m",
-      matched.refine_scans, matched.refine_settled, matched.refine_shift);
-  }
-  publish_odometry(imu_odom_pub_, prior, stamp);
-  publish_odometry(odometry_pub_, corrected, stamp);
-  publish_pose(corrected, stamp);
-  publish_path(corrected, stamp);
+  publish_odometry(imu_odom_pub_, prior_map, stamp);
+  publish_odometry(odometry_pub_, corrected_map, stamp);
+  publish_pose(corrected_map, stamp);
+  publish_path(corrected_map, stamp);
   if (publish_tf_) {
-    publish_tf(corrected, stamp);
+    publish_tf(corrected_map, stamp);
   }
 }
 
@@ -816,8 +826,77 @@ void BackOdomNode::publish_health(
   health_pub_->publish(status);
 }
 
+void BackOdomNode::note_skipped_scan(const rclcpp::Time & stamp)
+{
+  MatchResult skipped;
+  skipped.skipped = true;
+  publish_pipeline_debug(skipped, stamp);
+}
+
+void BackOdomNode::publish_pipeline_debug(const MatchResult & matched, const rclcpp::Time & stamp)
+{
+  back_odom::msg::ScanStages stages;
+  stages.header.stamp = stamp;
+  stages.header.frame_id = parent_frame_;
+  stages.deskew_ms = matched.deskew_ms;
+  stages.voxel_ms = matched.voxel_ms;
+  stages.align_ms = matched.align_ms;
+  stages.cost_ms = matched.cost_ms;
+  stages.refine_ms = matched.refine_ms;
+  stages.map_ms = matched.map_ms;
+  stages.timed_out = matched.align_timed_out;
+  stages.skipped = matched.skipped;
+  stages.applied = matched.applied;
+  if (matched.skipped || (matched.align_timed_out && !matched.applied)) {
+    ++skipped_scans_;
+  }
+  stages.skipped_total = skipped_scans_;
+  scan_stages_pub_->publish(stages);
+
+  const bool timeout = matched.align_timed_out && !matched.applied;
+  if (timeout || (matched.applied && !matched.first_scan)) {
+    back_odom::msg::IcpDebug icp;
+    icp.header = stages.header;
+    if (timeout) {
+      icp.status = "timeout";
+    } else if (matched.saturated) {
+      icp.status = "saturated";
+    } else {
+      icp.status = "applied";
+    }
+    icp.cost = matched.lidar_cost;
+    icp.ndt_cost = std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0;
+    icp.inlier_ratio = matched.inlier_ratio;
+    icp.iterations = matched.iterations;
+    icp.partial = matched.partial_used;
+    icp.translation_m = matched.translation_error;
+    icp.rotation_rad = matched.rotation_error;
+    icp.health = health_name(matched.health);
+    icp.inserted = matched.inserted_scan;
+    icp.total_ms = matched.deskew_ms + matched.voxel_ms + matched.align_ms + matched.cost_ms +
+                   matched.refine_ms + matched.map_ms;
+    icp.deskew_ms = matched.deskew_ms;
+    icp.voxel_ms = matched.voxel_ms;
+    icp.align_ms = matched.align_ms;
+    icp_debug_pub_->publish(icp);
+  }
+
+  if (matched.refined_window) {
+    back_odom::msg::PoseRefine refine;
+    refine.header = stages.header;
+    refine.scans = matched.refine_scans;
+    refine.settled = matched.refine_settled;
+    refine.largest_shift_m = matched.refine_shift;
+    pose_refine_pub_->publish(refine);
+  }
+}
+
 void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp)
 {
+  if (!map_frame_ready()) {
+    return;
+  }
+  const Sophus::SE3d align = map_from_local();
   const auto publish_one =
     [this, &stamp](
       const Sophus::SE3d & pose, const std::string & child_frame,
@@ -847,7 +926,9 @@ void BackOdomNode::publish_debug_odometry(const MatchResult & match, const rclcp
     };
 
   if (match.has_lidar_debug) {
-    publish_one(match.lidar_pose, "lidar_odom", lidar_debug_pub_, lidar_debug_path_, lidar_debug_path_pub_);
+    publish_one(
+      align * match.lidar_pose, "lidar_odom", lidar_debug_pub_, lidar_debug_path_,
+      lidar_debug_path_pub_);
   }
 }
 
@@ -1142,7 +1223,7 @@ void BackOdomNode::publish_tf(const ProcessorOutput & output, const rclcpp::Time
 void BackOdomNode::publish_local_map()
 {
   // The annotated cloud is a few hundred thousand points; build it only for a live subscriber.
-  if (!aligned_ || map_pub_->get_subscription_count() == 0) {
+  if (!aligned_ || !map_frame_ready() || map_pub_->get_subscription_count() == 0) {
     return;
   }
   std::vector<LocalMapPoint> points;
@@ -1155,7 +1236,13 @@ void BackOdomNode::publish_local_map()
     points = lidar_matcher_->annotated_local_map();
     stamp_seconds = imu_processor_->latest_stamp();
   }
-  const std::vector<LocalMapPoint> shown = thin_for_display(points, 0.5);
+  std::vector<LocalMapPoint> shown = thin_for_display(points, 0.5);
+  if (align_to_ground_truth_) {
+    const Sophus::SE3d align = map_from_local();
+    for (LocalMapPoint & point : shown) {
+      point.position = align * point.position;
+    }
+  }
   const rclcpp::Time stamp(
     static_cast<std::int64_t>(std::llround(stamp_seconds * 1.0e9)), RCL_ROS_TIME);
   map_pub_->publish(to_annotated_pointcloud(stamp, parent_frame_, shown));
@@ -1233,9 +1320,18 @@ void BackOdomNode::publish_markers(
 void BackOdomNode::publish_scan_poses(
   const std::vector<StampedPose> & poses, const rclcpp::Time & stamp)
 {
-  if (scan_pose_pub_->get_subscription_count() == 0) {
+  if (!map_frame_ready() || scan_pose_pub_->get_subscription_count() == 0) {
     return;
   }
+  std::vector<StampedPose> mapped;
+  if (align_to_ground_truth_) {
+    const Sophus::SE3d align = map_from_local();
+    mapped.reserve(poses.size());
+    for (const StampedPose & scan : poses) {
+      mapped.push_back(StampedPose{scan.stamp, align * scan.pose});
+    }
+  }
+  const std::vector<StampedPose> & shown = align_to_ground_truth_ ? mapped : poses;
   visualization_msgs::msg::MarkerArray markers;
 
   const auto delete_namespace = [&](const std::string & ns) {
@@ -1248,7 +1344,7 @@ void BackOdomNode::publish_scan_poses(
   };
   delete_namespace("scan_horizon");
   delete_namespace("scan_pose");
-  if (poses.empty()) {
+  if (shown.empty()) {
     scan_pose_pub_->publish(markers);
     return;
   }
@@ -1266,18 +1362,18 @@ void BackOdomNode::publish_scan_poses(
   horizon.color.g = 0.85F;
   horizon.color.b = 0.2F;
   horizon.color.a = 0.9F;
-  horizon.points.reserve(poses.size());
-  for (const StampedPose & scan : poses) {
+  horizon.points.reserve(shown.size());
+  for (const StampedPose & scan : shown) {
     horizon.points.push_back(to_point(scan.pose.translation()));
   }
   markers.markers.push_back(horizon);
 
-  const std::size_t count = poses.size();
+  const std::size_t count = shown.size();
   for (std::size_t index = 0; index < count; ++index) {
     const float age =
       count == 1U ? 1.0F : static_cast<float>(index) / static_cast<float>(count - 1U);
-    const Eigen::Vector3d origin = poses[index].pose.translation();
-    const Eigen::Vector3d forward = origin + poses[index].pose.so3() * Eigen::Vector3d(3.0, 0.0, 0.0);
+    const Eigen::Vector3d origin = shown[index].pose.translation();
+    const Eigen::Vector3d forward = origin + shown[index].pose.so3() * Eigen::Vector3d(3.0, 0.0, 0.0);
     visualization_msgs::msg::Marker arrow = make_arrow(
       stamp, parent_frame_, static_cast<int>(index), origin, forward, age, 0.35F, 1.0F - age);
     arrow.ns = "scan_pose";
@@ -1295,7 +1391,7 @@ void BackOdomNode::publish_scan_poses(
   text.id = static_cast<int>(count);
   text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
   text.action = visualization_msgs::msg::Marker::ADD;
-  text.pose.position = to_point(poses.back().pose.translation());
+  text.pose.position = to_point(shown.back().pose.translation());
   text.pose.position.z += 1.2;
   text.pose.orientation.w = 1.0;
   text.scale.z = 0.4;
@@ -1306,6 +1402,123 @@ void BackOdomNode::publish_scan_poses(
   text.text = std::to_string(count) + " scans in view";
   markers.markers.push_back(text);
   scan_pose_pub_->publish(markers);
+}
+
+void BackOdomNode::callback_ground_truth(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+{
+  if (map_from_local_locked_.load(std::memory_order_acquire)) {
+    return;
+  }
+  Eigen::Quaterniond quaternion(
+    msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+    msg->pose.pose.orientation.z);
+  if (quaternion.norm() < 1.0e-9) {
+    return;
+  }
+  quaternion.normalize();
+  GroundTruthSample sample;
+  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
+  sample.pose = Sophus::SE3d(
+    Sophus::SO3d(quaternion),
+    Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
+  std::lock_guard<std::mutex> lock(align_mutex_);
+  if (map_from_local_locked_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (!ground_truth_samples_.empty() && sample.stamp + 1.0e-9 < ground_truth_samples_.back().stamp) {
+    return;
+  }
+  if (
+    !ground_truth_samples_.empty() &&
+    std::abs(sample.stamp - ground_truth_samples_.back().stamp) < 1.0e-9) {
+    ground_truth_samples_.back() = sample;
+    return;
+  }
+  ground_truth_samples_.push_back(sample);
+  if (ground_truth_samples_.size() > 5000U) {
+    ground_truth_samples_.erase(ground_truth_samples_.begin());
+  }
+}
+
+void BackOdomNode::try_lock_ground_truth_alignment()
+{
+  if (!align_to_ground_truth_ || map_from_local_locked_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!imu_processor_->aligned() || imu_processor_->trajectory().empty()) {
+    return;
+  }
+
+  std::vector<GroundTruthSample> samples;
+  {
+    std::lock_guard<std::mutex> lock(align_mutex_);
+    if (map_from_local_locked_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    samples = ground_truth_samples_;
+  }
+  if (samples.empty()) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Waiting for %s before publishing map -> %s.", ground_truth_odom_topic_.c_str(),
+      child_frame_.c_str());
+    return;
+  }
+
+  for (const GroundTruthSample & sample : samples) {
+    if (!imu_processor_->has_pose_near(sample.stamp, imu_max_pair_dt_)) {
+      continue;
+    }
+    const Sophus::SE3d local = imu_processor_->interpolate_pose(sample.stamp);
+    const Sophus::SE3d map_from_local = sample.pose * local.inverse();
+    {
+      std::lock_guard<std::mutex> lock(align_mutex_);
+      map_from_local_ = map_from_local;
+      ground_truth_samples_.clear();
+      map_from_local_locked_.store(true, std::memory_order_release);
+    }
+    const Eigen::Vector3d translation = map_from_local.translation();
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Aligned map -> %s to %s at %.3f s. xyz=(%.2f, %.2f, %.2f)", child_frame_.c_str(),
+      ground_truth_odom_topic_.c_str(), sample.stamp, translation.x(), translation.y(),
+      translation.z());
+    return;
+  }
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), 2000,
+    "Waiting until the IMU trajectory covers a pose from %s.", ground_truth_odom_topic_.c_str());
+}
+
+bool BackOdomNode::map_frame_ready() const
+{
+  if (!align_to_ground_truth_) {
+    return true;
+  }
+  return map_from_local_locked_.load(std::memory_order_acquire);
+}
+
+Sophus::SE3d BackOdomNode::map_from_local() const
+{
+  if (!align_to_ground_truth_) {
+    return Sophus::SE3d();
+  }
+  std::lock_guard<std::mutex> lock(align_mutex_);
+  return map_from_local_;
+}
+
+ProcessorOutput BackOdomNode::to_map_frame(const ProcessorOutput & output) const
+{
+  if (!align_to_ground_truth_) {
+    return output;
+  }
+  const Sophus::SE3d align = map_from_local();
+  const Sophus::SE3d pose = align * Sophus::SE3d(output.orientation, output.position);
+  ProcessorOutput mapped = output;
+  mapped.orientation = pose.so3();
+  mapped.position = pose.translation();
+  mapped.velocity_world = align.so3() * output.velocity_world;
+  return mapped;
 }
 
 }  // namespace back_odom

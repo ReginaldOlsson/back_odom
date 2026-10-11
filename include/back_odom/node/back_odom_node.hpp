@@ -22,6 +22,9 @@
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
 
+#include <back_odom/msg/icp_debug.hpp>
+#include <back_odom/msg/pose_refine.hpp>
+#include <back_odom/msg/scan_stages.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
@@ -42,6 +45,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace back_odom
 {
@@ -59,6 +63,12 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void callback_ground_truth(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  /// Requires state_mutex_. Locks map_from_local_ on the earliest ground-truth stamp the IMU covers.
+  void try_lock_ground_truth_alignment();
+  [[nodiscard]] bool map_frame_ready() const;
+  [[nodiscard]] Sophus::SE3d map_from_local() const;
+  [[nodiscard]] ProcessorOutput to_map_frame(const ProcessorOutput & output) const;
   void worker_loop();
   void process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
   void watch_lidar_start();
@@ -67,6 +77,8 @@ private:
     const rclcpp::Time & stamp);
   void publish_health(LocalizationHealth health, int reject_streak, int timeout_streak);
   void publish_debug_odometry(const MatchResult & match, const rclcpp::Time & stamp);
+  void publish_pipeline_debug(const MatchResult & matched, const rclcpp::Time & stamp);
+  void note_skipped_scan(const rclcpp::Time & stamp);
   void publish_odometry(
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
     const ProcessorOutput & output, const rclcpp::Time & stamp);
@@ -101,6 +113,7 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr ground_truth_sub_;
   rclcpp::TimerBase::SharedPtr map_timer_;
   rclcpp::TimerBase::SharedPtr lidar_watch_timer_;
 
@@ -116,6 +129,9 @@ private:
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr health_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lidar_debug_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr lidar_debug_path_pub_;
+  rclcpp::Publisher<back_odom::msg::ScanStages>::SharedPtr scan_stages_pub_;
+  rclcpp::Publisher<back_odom::msg::IcpDebug>::SharedPtr icp_debug_pub_;
+  rclcpp::Publisher<back_odom::msg::PoseRefine>::SharedPtr pose_refine_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -135,6 +151,8 @@ private:
   std::atomic<std::uint64_t> clouds_received_{0};
   std::atomic<std::uint64_t> clouds_before_align_{0};
   std::atomic<std::uint64_t> scans_processed_{0};
+  /// Worker-thread count of scans that produced no pose update.
+  std::uint32_t skipped_scans_{0};
   std::atomic<bool> logged_first_cloud_{false};
 
   std::string imu_topic_;
@@ -163,6 +181,19 @@ private:
   double pose_variance_yaw_{0.01};
   bool imu_left_handed_{false};
   std::string time_field_;
+  bool align_to_ground_truth_{false};
+  std::string ground_truth_odom_topic_{"/boreas/ground_truth/odom"};
+
+  struct GroundTruthSample
+  {
+    double stamp{0.0};
+    Sophus::SE3d pose{};
+  };
+  /// Guards ground-truth samples and map_from_local_. Never acquire state_mutex_ while holding this.
+  mutable std::mutex align_mutex_;
+  std::vector<GroundTruthSample> ground_truth_samples_;
+  Sophus::SE3d map_from_local_{};
+  std::atomic<bool> map_from_local_locked_{false};
 };
 
 }  // namespace back_odom

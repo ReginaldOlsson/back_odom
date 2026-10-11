@@ -1,0 +1,4 @@
+std_msgs/Header header
+float64 translation_percent
+float64 rotation_deg_per_100m
+uint32 num_segments

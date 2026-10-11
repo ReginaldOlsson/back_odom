@@ -2,6 +2,10 @@
   ros__parameters:
     # The EKF publishes map to base_link. Leave this false so both nodes do not publish that transform.
     publish_tf: false
+    # When true, wait for ground_truth_odom_topic and left-multiply published map-frame poses
+    # so the first covered pose matches that ground truth. The Boreas launch turns this on.
+    align_to_ground_truth: false
+    ground_truth_odom_topic: "/boreas/ground_truth/odom"
     # Bags exported before boreas converts imu_raw still contain left-handed samples
     # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
     # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
@@ -64,7 +68,7 @@
     partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
     # 27-voxel neighbour scan growing past the budget.
-    max_points_per_voxel: 20
+    max_points_per_voxel: 70
     max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
@@ -76,12 +80,12 @@
     keyframe_min_translation: 0.5
     keyframe_min_rotation: 0.05
     # GPU vs CPU bake-off at this scan (map must be representative), re-run every N scans. 0 = CPU only.
-    device_bakeoff_scan: 10
+    device_bakeoff_scan: 20
     device_recheck_scans: 200
     # Coarse ICP neighbourhood (also used after a reject). Fine iterations use
     # max_correspondence_distance. A strict NDT match may snap up to recovery_max_translation.
-    recovery_max_correspondence_distance: 4.0
-    recovery_max_translation: 3.0
+    recovery_max_correspondence_distance: 20.0
+    recovery_max_translation: 50.0
     # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
     # and the EKF see the lidar-corrected trajectory.
     apply_imu_correction: true

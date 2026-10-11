@@ -4,6 +4,18 @@ project(back_odom)
 find_package(autoware_cmake REQUIRED)
 autoware_package()
 
+find_package(rosidl_default_generators REQUIRED)
+# The typesupport libraries must be named libback_odom__rosidl_*.so, so this target
+# has to match the package name. The node component library uses another name.
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/KittiError.msg"
+  "msg/BodyFrameError.msg"
+  "msg/ScanStages.msg"
+  "msg/IcpDebug.msg"
+  "msg/PoseRefine.msg"
+  DEPENDENCIES std_msgs
+)
+
 find_package(Sophus REQUIRED)
 find_package(TBB REQUIRED)
 find_package(kiss_icp_cpp REQUIRED)
@@ -92,19 +104,40 @@ else()
   target_sources(lidar_imu_matcher PRIVATE src/lidar/device_kernels_stub.cpp)
 endif()
 
-ament_auto_add_library(${PROJECT_NAME} SHARED
+ament_auto_add_library(back_odom_component SHARED
   src/node/back_odom_node.cpp
 )
-target_link_libraries(${PROJECT_NAME} imu_processor lidar_imu_matcher)
+target_link_libraries(back_odom_component imu_processor lidar_imu_matcher)
 if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
-  target_compile_options(${PROJECT_NAME} PRIVATE ${BACK_ODOM_SIMD_FLAGS})
-  target_compile_definitions(${PROJECT_NAME} PRIVATE ${BACK_ODOM_SIMD_DEFINES})
+  target_compile_options(back_odom_component PRIVATE ${BACK_ODOM_SIMD_FLAGS})
+  target_compile_definitions(back_odom_component PRIVATE ${BACK_ODOM_SIMD_DEFINES})
 endif()
 
-rclcpp_components_register_node(${PROJECT_NAME}
+rclcpp_components_register_node(back_odom_component
   PLUGIN "back_odom::BackOdomNode"
   EXECUTABLE ${PROJECT_NAME}_node
   EXECUTOR MultiThreadedExecutor
+)
+
+ament_auto_add_library(odom_kpi SHARED
+  src/eval/kitti_error_node.cpp
+  src/eval/lateral_longitudinal_error_node.cpp
+)
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_typesupport_cpp)
+target_link_libraries(odom_kpi "${cpp_typesupport_target}")
+target_link_libraries(back_odom_component "${cpp_typesupport_target}")
+if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
+  target_compile_options(odom_kpi PRIVATE ${BACK_ODOM_SIMD_FLAGS})
+  target_compile_definitions(odom_kpi PRIVATE ${BACK_ODOM_SIMD_DEFINES})
+endif()
+
+rclcpp_components_register_node(odom_kpi
+  PLUGIN "back_odom::KittiErrorNode"
+  EXECUTABLE kitti_error_node
+)
+rclcpp_components_register_node(odom_kpi
+  PLUGIN "back_odom::LateralLongitudinalErrorNode"
+  EXECUTABLE lateral_longitudinal_error_node
 )
 
 ament_auto_add_library(intensity_lane SHARED
@@ -131,10 +164,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_device_accel test/test_device_accel.cpp)
   target_link_libraries(test_device_accel lidar_imu_matcher)
   ament_add_gtest(test_ekf_messages test/test_ekf_messages.cpp)
-  target_link_libraries(test_ekf_messages ${PROJECT_NAME})
+  target_link_libraries(test_ekf_messages back_odom_component)
   ament_target_dependencies(test_ekf_messages rclcpp tf2_ros sensor_msgs geometry_msgs)
   ament_add_gtest(test_cell_features test/test_cell_features.cpp)
   target_link_libraries(test_cell_features intensity_lane)
+  ament_add_gtest(test_kitti_metrics test/test_kitti_metrics.cpp)
+  target_include_directories(test_kitti_metrics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_kitti_metrics Sophus::Sophus)
   if(BACK_ODOM_ENABLE_SIMD AND BACK_ODOM_SIMD_FLAGS)
     foreach(_back_odom_test IN ITEMS test_imu_processing test_lidar_match test_device_accel test_ekf_messages)
       target_compile_options(${_back_odom_test} PRIVATE ${BACK_ODOM_SIMD_FLAGS})

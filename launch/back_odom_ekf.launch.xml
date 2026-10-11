@@ -12,6 +12,9 @@
   <arg name="pointcloud_topic" default="/boreas/pointcloud"/>
   <arg name="config_file" default="$(find-pkg-share back_odom)/config/config.param.yaml"/>
   <arg name="ekf_param_file" default="$(find-pkg-share back_odom)/config/ekf_back_odom.param.yaml"/>
+  <arg name="align_to_ground_truth" default="true"/>
+  <arg name="ground_truth_odom_topic" default="/boreas/ground_truth/odom"/>
+  <arg name="publish_kpis" default="true"/>
 
   <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
 
@@ -30,6 +33,8 @@
     <param name="imu_topic" value="$(var imu_topic)"/>
     <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
     <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="align_to_ground_truth" value="$(var align_to_ground_truth)"/>
+    <param name="ground_truth_odom_topic" value="$(var ground_truth_odom_topic)"/>
   </node>
 
   <!-- <node pkg="back_odom" exec="intensity_lane_node" name="intensity_lane_node" output="screen">
@@ -57,4 +62,16 @@
     <arg name="input_pose_with_cov_name" value="/back_odom/pose_with_covariance"/>
     <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
   </include>
+
+  <!-- <node if="$(var publish_kpis)" pkg="back_odom" exec="kitti_error_node" name="kitti_error_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="ground_truth_topic" value="$(var ground_truth_odom_topic)"/>
+    <param name="estimate_topic" value="/back_odom"/>
+  </node> -->
+  <node if="$(var publish_kpis)" pkg="back_odom" exec="lateral_longitudinal_error_node"
+        name="lateral_longitudinal_error_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="ground_truth_topic" value="$(var ground_truth_odom_topic)"/>
+    <param name="estimate_topic" value="/back_odom"/>
+  </node>
 </launch>
