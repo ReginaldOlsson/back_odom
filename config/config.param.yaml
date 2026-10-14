@@ -68,7 +68,7 @@
     partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
     # 27-voxel neighbour scan growing past the budget.
-    max_points_per_voxel: 70
+    max_points_per_voxel: 20
     max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
@@ -84,8 +84,8 @@
     device_recheck_scans: 200
     # Coarse ICP neighbourhood (also used after a reject). Fine iterations use
     # max_correspondence_distance. A strict NDT match may snap up to recovery_max_translation.
-    recovery_max_correspondence_distance: 20.0
-    recovery_max_translation: 50.0
+    recovery_max_correspondence_distance: 4.0
+    recovery_max_translation: 3.0
     # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
     # and the EKF see the lidar-corrected trajectory.
     apply_imu_correction: true
