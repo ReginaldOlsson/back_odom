@@ -1,0 +1,55 @@
+<launch>
+  <!-- back_odom + EKF for Shield_tunnel bags (IMU + Livox CustomMsg only).
+       ros2 launch back_odom back_odom_shield_tunnel.launch.xml use_sim_time:=true
+       ros2 bag play /home/mosal/rosbags/Shield_tunnel1_gamma clock
+       /livox/imu and /livox/lidar are both livox_frame. No ground truth.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <arg name="imu_topic" default="/imu/data"/>
+  <arg name="pointcloud_topic" default="/velodyne_points"/>
+  <arg name="lidar_frame" default="velodyne"/>
+  <arg name="config_file" default="$(find-pkg-share back_odom)/config/config_bridge.param.yaml"/>
+  <arg name="ekf_param_file" default="$(find-pkg-share back_odom)/config/ekf_back_odom.param.yaml"/>
+
+  <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
+
+  <!-- Lidar and IMU share livox_frame. Identity puts that frame on base_link. -->
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_livox" output="screen"
+        args="--x 0 --y 0 --z 0 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id $(var lidar_frame)"/>
+
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_imu" output="screen"
+        args="--x 0 --y 0 --z 0 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id imu_link"/>
+
+  <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen"
+        ros_args="--log-level back_odom_node:=info">
+    <param from="$(var config_file)"/>
+    <param name="imu_topic" value="$(var imu_topic)"/>
+    <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="align_to_ground_truth" value="false"/>
+  </node>
+
+  <node pkg="back_odom" exec="intensity_lane_node" name="intensity_lane_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
+    <param name="accumulate_input" value="true"/>
+    <param name="map_frame" value="map"/>
+    <param name="base_frame" value="base_link"/>
+    <param name="longitudinal_distance" value="15.0"/>
+    <param name="lateral_distance" value="15.0"/>
+    <param name="z_below" value="15.0"/>
+    <param name="voxel_size" value="0.25"/>
+    <param name="voxel_height" value="0.25"/>
+    <param name="segments_topic" value="back_odom/segments"/>
+    <param name="segmented_cloud_topic" value="back_odom/segmented_cloud"/>
+    <param name="surfaces_topic" value="back_odom/surfaces"/>
+    <param name="surface_normals_topic" value="back_odom/surface_normals"/>
+  </node>
+
+  <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
+    <arg name="param_file" value="$(var ekf_param_file)"/>
+    <arg name="input_initial_pose_name" value="/back_odom/initialpose"/>
+    <arg name="input_pose_with_cov_name" value="/back_odom/pose_with_covariance"/>
+    <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
+  </include>
+</launch>

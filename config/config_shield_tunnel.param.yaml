@@ -1,0 +1,117 @@
+/**:
+  ros__parameters:
+    # The EKF publishes map to base_link. Leave this false so both nodes do not publish that transform.
+    publish_tf: false
+    # When true, wait for ground_truth_odom_topic and left-multiply published map-frame poses
+    # so the first covered pose matches that ground truth. The Boreas launch turns this on.
+    align_to_ground_truth: false
+    ground_truth_odom_topic: "/boreas/ground_truth/odom"
+    # Bags exported before boreas converts imu_raw still contain left-handed samples
+    # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
+    # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
+    # the bag, or the yaw correction is applied twice and the turn mirrors again.
+    imu_left_handed: false
+    parent_frame: "map"
+    child_frame: "base_link"
+    alignment_sample_count: 500
+    stationary_gyro_thresh: 0.05
+    stationary_accel_dev_thresh: 0.5
+    gravity: 9.81
+    max_dt: 0.1
+    # Keep a long IMU pose history so a slow ICP can still pair a lidar scan to the
+    # nearest IMU sample instead of the live tip of the integrator.
+    imu_trajectory_horizon: 30.0
+    imu_max_trajectory_poses: 20000
+    # Max |t_closest_imu - t_scan_end| when accepting a lidar/IMU pair.
+    imu_max_pair_dt: 0.1
+    # Wall-clock bound on waiting for the IMU to reach the end of a sweep before matching.
+    imu_wait_timeout: 0.5
+    # IMU subscription depth. 200 Hz x 10 s; a dropped sample is an integration hole.
+    imu_queue_depth: 2000
+    # rosbag2 and Autoware clouds are reliable. Set false only for live SensorDataQoS drivers.
+    pointcloud_reliable: true
+    path_min_dt: 0.1
+    path_max_poses: 1000
+    # RViz-only outputs. Markers/health at most this often; the map on a timer, only with a subscriber.
+    marker_min_dt: 0.1
+    health_min_dt: 0.1
+    map_publish_period: 1.0
+    time_field: "time"
+    # Returns closer than min_range are the ego vehicle. max_range 0 = no cap (the crop box applies).
+    min_range: 1.5
+    max_range: 0.0
+    voxel_size: 0.5
+    # Scan downsample. false keeps the first point in each voxel (KISS-ICP).
+    # true uses GLIM random-grid sampling: original points, about the same count per voxel.
+    use_random_grid_downsampling: true
+    # Fraction of the cropped cloud to keep. Ignored when random_downsample_target > 0.
+    random_downsample_rate: 0.3
+    # Absolute point budget. 0 means use random_downsample_rate.
+    random_downsample_target: 0
+    # Full length and width of the ICP cloud, centered on the vehicle.
+    # 20 x 20 keeps ±10 m. The scan list uses the same box.
+    crop_longitudinal: 150.0
+    crop_lateral: 100.0
+    max_correspondence_distance: 2.0
+    kernel_scale: 0.5
+    # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
+    # lidar-anchored seed. Saturated solves are accepted but do not update biases.
+    convergence_criterion: 0.001
+    max_iterations: 200
+    # Target ICP rate. Align budget is wall-clock 1/hz (100 ms at 10), not bag/sim time.
+    # First 6 iterations search recovery_max_correspondence_distance, then this radius.
+    # A timeout with >= partial_min_iterations is still scored; a small step (≤0.25 m / 0.05
+    # rad) may pass even if mean NDT is up to 2*max_ndt_cost, so a slightly-off seed can
+    # pull back instead of freezing on the IMU prior. partial_max_step is logging only.
+    align_rate_hz: 10.0
+    partial_min_iterations: 3
+    partial_max_step: 0.05
+    # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
+    # 27-voxel neighbour scan growing past the budget.
+    max_points_per_voxel: 20
+    max_visible_scans: 10
+    # Recent scans kept with the lidar pose that inserted them.
+    backward_match_stride: 4
+    # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
+    refine_window: true
+    refine_settle_passes: 2
+    # Scans are inserted only after moving this far since the last inserted scan. Stationary
+    # scans are matched for the correction but never pile into the map.
+    keyframe_min_translation: 0.5
+    keyframe_min_rotation: 0.05
+    # GPU vs CPU bake-off at this scan (map must be representative), re-run every N scans. 0 = CPU only.
+    device_bakeoff_scan: 10
+    device_recheck_scans: 200
+    # Coarse ICP neighbourhood (also used after a reject). Fine iterations use
+    # max_correspondence_distance. A strict NDT match may snap up to recovery_max_translation.
+    recovery_max_correspondence_distance: 4.0
+    recovery_max_translation: 3.0
+    # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
+    # and the EKF see the lidar-corrected trajectory.
+    apply_imu_correction: true
+    # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
+    gyro_bias_gain: 0.1
+    accel_bias_gain: 0.02
+    speed_correction_gain: 0.5
+    # Lidar keeps lateral shift and yaw. Forward motion stays with the IMU inside this band.
+    max_longitudinal_correction: 0.15
+    max_gyro_bias: 0.05
+    max_accel_bias: 1.0
+    max_speed: 20.0
+    max_acceleration: 5.0
+    max_yaw_rate: 1.0
+    max_match_rejects: 5
+    # NDT Mahalanobis health gate (mean D_M^2; χ² 3-DoF ~95% heuristic).
+    max_ndt_cost: 7.81
+    ndt_cov_regularization: 0.001
+    min_ndt_correspondences: 20
+    # Acceptance gates: fraction of NDT hits under max_ndt_cost, and plane
+    # correspondences / source points. A small IMU-relative step may still pass when
+    # mean NDT is below 2*max_ndt_cost and inliers stay above min_ndt_inlier_fraction.
+    min_ndt_inlier_fraction: 0.5
+    min_inlier_ratio: 0.3
+    # Diagonal entries of the twist and pose messages sent to the EKF.
+    twist_variance_vx: 0.05
+    twist_variance_wz: 0.01
+    pose_variance_xy: 0.05
+    pose_variance_yaw: 0.01
