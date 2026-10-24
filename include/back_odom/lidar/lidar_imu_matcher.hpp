@@ -115,6 +115,8 @@ struct LidarMatchParams
   double recovery_max_correspondence_distance{4.0};
   /// Allowed snap from the IMU prior back onto the map, only when NDT still passes strictly.
   double recovery_max_translation{3.0};
+  /// Longest hole, in seconds, accepted while integrating the EKF body twist into the ICP seed.
+  double ekf_twist_max_gap{0.05};
   VehicleLimits limits{};
 };
 
@@ -126,6 +128,19 @@ struct LidarMatchParams
   const Eigen::Vector3d local = latest.inverse() * scan.translation();
   return std::abs(local.x()) <= longitudinal && std::abs(local.y()) <= lateral;
 }
+
+/// One body-frame velocity sample from `/ekf_twist_with_covariance` (base_link).
+struct BodyTwistSample
+{
+  double stamp{0.0};
+  Eigen::Vector3d linear{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d angular{Eigen::Vector3d::Zero()};
+};
+
+/// Motion of the body from `t0` to `t1` under piecewise-constant twist.
+/// Empty when `samples` leave a hole longer than `max_gap` inside the interval.
+[[nodiscard]] std::optional<Sophus::SE3d> integrate_body_twist(
+  const std::vector<BodyTwistSample> & samples, double t0, double t1, double max_gap);
 
 /// The road does not observe forward motion, so a match may only nudge the IMU step along the vehicle.
 [[nodiscard]] inline Sophus::SE3d limit_longitudinal_correction(
@@ -189,6 +204,8 @@ struct MatchResult
   /// ICP hit the rate budget. `partial_used` says whether the partial solve was good enough.
   bool align_timed_out{false};
   bool partial_used{false};
+  /// The ICP seed was the lidar anchor composed with the integrated EKF body twist.
+  bool ekf_twist_prior{false};
   bool refined_window{false};
   double refine_shift{0.0};
   int refine_scans{0};
@@ -219,7 +236,7 @@ struct ScanAlignment
   std::vector<Eigen::Vector3d> map_points;
   std::vector<float> map_intensities;
   std::vector<Eigen::Vector3d> source;
-  /// Seed pose used for ICP (lidar anchor + IMU relative motion).
+  /// Seed pose used for ICP (lidar anchor plus EKF twist, or IMU motion when twist is missing).
   Sophus::SE3d predicted{};
   MatchCandidate candidate;
   bool first_scan{false};
@@ -249,14 +266,18 @@ public:
 
   /// Heavy half: deskew, crop, downsample, ICP, gates. Reads the IMU only; safe to run on a
   /// snapshot while the live integrator keeps going on another thread.
-  [[nodiscard]] ScanAlignment align_scan(const LidarScan & scan, const ImuProcessor & imu);
+  [[nodiscard]] ScanAlignment align_scan(
+    const LidarScan & scan, const ImuProcessor & imu,
+    const std::vector<BodyTwistSample> & body_twists = {});
   /// Light half: apply the IMU correction and advance health. Map insertion is queued; call
   /// `flush_pending_insert` after releasing the IMU lock.
   [[nodiscard]] MatchResult commit_scan(ScanAlignment && alignment, ImuProcessor & imu);
   /// Write a queued keyframe into the local map. Safe to call without holding the IMU lock.
   void flush_pending_insert(MatchResult & timing);
   /// align_scan, commit_scan, then flush_pending_insert.
-  [[nodiscard]] MatchResult on_scan(const LidarScan & scan, ImuProcessor & imu);
+  [[nodiscard]] MatchResult on_scan(
+    const LidarScan & scan, ImuProcessor & imu,
+    const std::vector<BodyTwistSample> & body_twists = {});
 
   /// The integrator crossed the speed limit. Hold the last healthy speed.
   void notify_speed_limit(ImuProcessor & imu);

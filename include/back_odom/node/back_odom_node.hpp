@@ -39,6 +39,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -62,6 +63,7 @@ public:
 
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
+  void callback_ekf_twist(const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void callback_ground_truth(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
   /// Requires state_mutex_. Locks map_from_local_ on the earliest ground-truth stamp the IMU covers.
@@ -112,6 +114,7 @@ private:
   std::mutex extrinsics_mutex_;
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr ekf_twist_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr ground_truth_sub_;
   rclcpp::TimerBase::SharedPtr map_timer_;
@@ -157,6 +160,13 @@ private:
 
   std::string imu_topic_;
   std::string pointcloud_topic_;
+  bool use_ekf_twist_prior_{true};
+  std::string ekf_twist_topic_{"/ekf_twist_with_covariance"};
+  double ekf_twist_max_gap_{0.05};
+  double ekf_twist_horizon_{2.0};
+  /// Body twists from the RI-EKF. Never acquire state_mutex_ while holding this.
+  std::mutex twist_mutex_;
+  std::deque<BodyTwistSample> ekf_twists_;
   bool pointcloud_reliable_{true};
   std::string parent_frame_;
   std::string child_frame_;

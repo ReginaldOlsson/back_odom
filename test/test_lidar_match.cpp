@@ -192,6 +192,94 @@ LidarMatchParams match_params()
   return params;
 }
 
+TEST(BodyTwistPrior, constant_forward_speed_integrates_along_body_x)
+{
+  const std::vector<BodyTwistSample> samples = {
+    {0.0, Eigen::Vector3d(10.0, 0.0, 0.0), Eigen::Vector3d::Zero()},
+    {0.05, Eigen::Vector3d(10.0, 0.0, 0.0), Eigen::Vector3d::Zero()},
+    {0.1, Eigen::Vector3d(10.0, 0.0, 0.0), Eigen::Vector3d::Zero()},
+  };
+  const std::optional<Sophus::SE3d> delta = integrate_body_twist(samples, 0.0, 0.1, 0.05);
+  ASSERT_TRUE(delta.has_value());
+  EXPECT_NEAR(delta->translation().x(), 1.0, 1.0e-6);
+  EXPECT_NEAR(delta->translation().y(), 0.0, 1.0e-6);
+  EXPECT_NEAR(delta->so3().log().norm(), 0.0, 1.0e-6);
+}
+
+TEST(BodyTwistPrior, constant_yaw_rate_is_a_body_rotation)
+{
+  const std::vector<BodyTwistSample> samples = {
+    {0.0, Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 1.0)},
+    {0.1, Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 1.0)},
+  };
+  const std::optional<Sophus::SE3d> delta = integrate_body_twist(samples, 0.0, 0.1, 0.1);
+  ASSERT_TRUE(delta.has_value());
+  EXPECT_NEAR(delta->so3().log().z(), 0.1, 1.0e-6);
+  EXPECT_NEAR(delta->translation().norm(), 0.0, 1.0e-6);
+}
+
+TEST(BodyTwistPrior, a_hole_in_the_stream_refuses_the_prior)
+{
+  const std::vector<BodyTwistSample> samples = {
+    {0.0, Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Vector3d::Zero()},
+    {0.2, Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Vector3d::Zero()},
+  };
+  EXPECT_FALSE(integrate_body_twist(samples, 0.0, 0.2, 0.05).has_value());
+}
+
+TEST(BodyTwistPrior, one_sample_matches_the_screw_exponential)
+{
+  BodyTwistSample sample;
+  sample.stamp = 1.0;
+  sample.linear = Eigen::Vector3d(5.0, 0.2, 0.0);
+  sample.angular = Eigen::Vector3d(0.0, 0.0, 0.4);
+  Sophus::SE3d::Tangent twist;
+  twist << sample.linear, sample.angular;
+  const Sophus::SE3d expected = Sophus::SE3d::exp(twist * 0.1);
+  const std::optional<Sophus::SE3d> delta = integrate_body_twist({sample}, 1.0, 1.1, 0.1);
+  ASSERT_TRUE(delta.has_value());
+  EXPECT_NEAR((expected.inverse() * *delta).log().norm(), 0.0, 1.0e-8);
+}
+
+TEST(BodyTwistPrior, integrated_twist_replaces_the_imu_seed)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarMatchParams params = match_params();
+  params.max_iterations = 1;
+  params.align_rate_hz = 100.0;
+  LidarImuMatcher matcher(params);
+  const double t0 = imu.latest_stamp();
+  const MatchResult first = matcher.on_scan(corner_scan(t0), imu);
+  ASSERT_TRUE(first.first_scan);
+
+  const double t1 = t0 + 0.1;
+  for (int step = 1; step <= 5; ++step) {
+    const ProcessorOutput output = imu.process(
+      ImuSample{t0 + 0.02 * step, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()});
+    ASSERT_TRUE(output.aligned);
+  }
+  std::vector<BodyTwistSample> twists;
+  for (int step = 0; step <= 5; ++step) {
+    BodyTwistSample sample;
+    sample.stamp = t0 + 0.02 * step;
+    sample.linear = Eigen::Vector3d(10.0, 0.0, 0.0);
+    twists.push_back(sample);
+  }
+
+  const ScanAlignment with_twist = matcher.align_scan(corner_scan(t1), imu, twists);
+  ASSERT_TRUE(with_twist.ready);
+  EXPECT_TRUE(with_twist.result.ekf_twist_prior);
+  const Sophus::SE3d ekf_motion = first.corrected_pose.inverse() * with_twist.predicted;
+  EXPECT_NEAR(ekf_motion.translation().x(), 1.0, 1.0e-6);
+  EXPECT_NEAR(ekf_motion.translation().y(), 0.0, 1.0e-6);
+
+  const ScanAlignment imu_only = matcher.align_scan(corner_scan(t1), imu);
+  ASSERT_TRUE(imu_only.ready);
+  EXPECT_FALSE(imu_only.result.ekf_twist_prior);
+  const Sophus::SE3d imu_motion = first.corrected_pose.inverse() * imu_only.predicted;
+  EXPECT_LT(imu_motion.translation().norm(), 0.2);
+}
+
 TEST(BackwardMatch, drifted_imu_is_corrected_when_the_next_scan_is_aligned)
 {
   ImuProcessor imu = aligned_imu();

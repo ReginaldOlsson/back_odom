@@ -191,6 +191,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
 {
   imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu/data");
   pointcloud_topic_ = this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
+  use_ekf_twist_prior_ = this->declare_parameter<bool>("use_ekf_twist_prior", true);
+  ekf_twist_topic_ =
+    this->declare_parameter<std::string>("ekf_twist_topic", "/ekf_twist_with_covariance");
+  ekf_twist_max_gap_ = this->declare_parameter<double>("ekf_twist_max_gap", 0.05);
+  ekf_twist_horizon_ = this->declare_parameter<double>("ekf_twist_horizon", 2.0);
   // Bags record PointCloud2 as reliable. Best-effort (SensorDataQoS) will never match them.
   pointcloud_reliable_ = this->declare_parameter<bool>("pointcloud_reliable", true);
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
@@ -272,6 +277,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("recovery_max_correspondence_distance", 4.0);
   lidar_params.recovery_max_translation =
     this->declare_parameter<double>("recovery_max_translation", 3.0);
+  lidar_params.ekf_twist_max_gap = ekf_twist_max_gap_;
   lidar_params.apply_imu_correction = this->declare_parameter<bool>("apply_imu_correction", true);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
@@ -311,6 +317,17 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   if (!(imu_wait_timeout_ >= 0.0) || !std::isfinite(imu_wait_timeout_)) {
     throw std::invalid_argument("imu_wait_timeout must be non-negative and finite");
   }
+  if (use_ekf_twist_prior_) {
+    if (ekf_twist_topic_.empty()) {
+      throw std::invalid_argument("ekf_twist_topic must be set when use_ekf_twist_prior is true");
+    }
+    if (!(ekf_twist_max_gap_ > 0.0) || !std::isfinite(ekf_twist_max_gap_)) {
+      throw std::invalid_argument("ekf_twist_max_gap must be positive and finite");
+    }
+    if (!(ekf_twist_horizon_ > 0.0) || !std::isfinite(ekf_twist_horizon_)) {
+      throw std::invalid_argument("ekf_twist_horizon must be positive and finite");
+    }
+  }
   if (imu_queue_depth < 1) {
     throw std::invalid_argument("imu_queue_depth must be positive");
   }
@@ -340,6 +357,13 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
     imu_topic_, rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(imu_queue_depth))).reliable(),
     [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) { this->callback_imu(msg); });
+  if (use_ekf_twist_prior_) {
+    ekf_twist_sub_ = this->create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+      ekf_twist_topic_, rclcpp::QoS(rclcpp::KeepLast(200)).reliable(),
+      [this](const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg) {
+        this->callback_ekf_twist(msg);
+      });
+  }
   // Scans go through a single-slot mailbox; no point queueing more than the newest two.
   // Reliability must match the publisher: rosbag2 and most Autoware clouds are reliable.
   auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(2));
@@ -401,10 +425,12 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
 
   RCLCPP_INFO(
     this->get_logger(),
-    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s align_to_gt=%s",
+    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s align_to_gt=%s "
+    "ekf_twist_prior=%s topic=%s",
     imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
     pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort",
-    align_to_ground_truth_ ? "true" : "false");
+    align_to_ground_truth_ ? "true" : "false", use_ekf_twist_prior_ ? "true" : "false",
+    ekf_twist_topic_.c_str());
 }
 
 BackOdomNode::~BackOdomNode()
@@ -416,6 +442,44 @@ BackOdomNode::~BackOdomNode()
     worker_.join();
   }
   RCLCPP_INFO(this->get_logger(), "BackOdomNode destroyed.");
+}
+
+void BackOdomNode::callback_ekf_twist(
+  const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg)
+{
+  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  const Eigen::Vector3d linear(
+    msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
+  const Eigen::Vector3d angular(
+    msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z);
+  if (!std::isfinite(stamp) || !linear.allFinite() || !angular.allFinite()) {
+    return;
+  }
+  if (!msg->header.frame_id.empty() && msg->header.frame_id != child_frame_) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Ignoring %s in frame '%s'; the ICP seed expects body twist in %s.", ekf_twist_topic_.c_str(),
+      msg->header.frame_id.c_str(), child_frame_.c_str());
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(twist_mutex_);
+  if (!ekf_twists_.empty() && stamp + 1.0e-4 < ekf_twists_.back().stamp) {
+    ekf_twists_.clear();
+  }
+  BodyTwistSample sample;
+  sample.stamp = stamp;
+  sample.linear = linear;
+  sample.angular = angular;
+  if (!ekf_twists_.empty() && std::abs(stamp - ekf_twists_.back().stamp) <= 1.0e-6) {
+    ekf_twists_.back() = sample;
+  } else {
+    ekf_twists_.push_back(sample);
+  }
+  const double oldest = stamp - ekf_twist_horizon_;
+  while (!ekf_twists_.empty() && ekf_twists_.front().stamp < oldest) {
+    ekf_twists_.pop_front();
+  }
 }
 
 void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
@@ -688,7 +752,12 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     return;
   }
 
-  ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot);
+  std::vector<BodyTwistSample> body_twists;
+  if (use_ekf_twist_prior_) {
+    std::lock_guard<std::mutex> lock(twist_mutex_);
+    body_twists.assign(ekf_twists_.begin(), ekf_twists_.end());
+  }
+  ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot, body_twists);
   snapshot.reset();
 
   MatchResult matched;
@@ -721,6 +790,25 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     has_last_match_ = true;
     last_health_stamp_ = stamp;
     has_published_health_ = true;
+  }
+  if (use_ekf_twist_prior_ && !matched.skipped && !matched.first_scan) {
+    if (matched.ekf_twist_prior) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "ICP initial guess integrated %s from the last lidar pose (residual %.3f m / %.3f rad, "
+        "%.0f iterations).",
+        ekf_twist_topic_.c_str(), matched.translation_error, matched.rotation_error,
+        matched.iterations);
+    } else if (body_twists.empty()) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "ICP initial guess is the IMU step. %s has not published yet.", ekf_twist_topic_.c_str());
+    } else {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "ICP initial guess is the IMU step. %s did not cover this scan within %.3f s.",
+        ekf_twist_topic_.c_str(), ekf_twist_max_gap_);
+    }
   }
   publish_debug_odometry(matched, stamp);
   publish_scan_poses(scan_poses, stamp);
@@ -758,9 +846,9 @@ void BackOdomNode::publish_match(
   if (!matched.applied) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "ICP correction rejected. Holding IMU prior (last lidar + IMU). health %s, lidar cost %.3f "
+      "ICP correction rejected. Holding the %s seed. health %s, lidar cost %.3f "
       "ndt %.3f (inliers %.2f) ratio %.2f pass %s, icp step %.3f m / %.3f rad, degenerate %d",
-      health_name(matched.health), matched.lidar_cost,
+      matched.ekf_twist_prior ? "ekf twist" : "imu", health_name(matched.health), matched.lidar_cost,
       std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
       std::isfinite(matched.ndt_inlier_fraction) ? matched.ndt_inlier_fraction : -1.0,
       matched.inlier_ratio, matched.lidar_passed ? "yes" : "no", matched.translation_error,
@@ -827,6 +915,7 @@ void BackOdomNode::publish_health(
       add_value("saturated", last.saturated ? "true" : "false");
       add_value("align_timed_out", last.align_timed_out ? "true" : "false");
       add_value("partial_used", last.partial_used ? "true" : "false");
+      add_value("ekf_twist_prior", last.ekf_twist_prior ? "true" : "false");
       add_value("inserted_scan", last.inserted_scan ? "true" : "false");
       add_value("iterations", std::to_string(last.iterations));
       add_value("deskew_ms", std::to_string(last.deskew_ms));

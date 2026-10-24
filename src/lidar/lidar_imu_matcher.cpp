@@ -33,6 +33,81 @@
 
 namespace back_odom
 {
+
+std::optional<Sophus::SE3d> integrate_body_twist(
+  const std::vector<BodyTwistSample> & samples, const double t0, const double t1,
+  const double max_gap)
+{
+  if (
+    samples.empty() || !(max_gap >= 0.0) || !std::isfinite(max_gap) || !std::isfinite(t0) ||
+    !std::isfinite(t1) || t1 < t0) {
+    return std::nullopt;
+  }
+  for (std::size_t index = 1; index < samples.size(); ++index) {
+    if (samples[index].stamp + 1.0e-9 < samples[index - 1].stamp) {
+      return std::nullopt;
+    }
+  }
+  if (
+    samples.front().stamp > t0 + max_gap + 1.0e-9 ||
+    samples.back().stamp + max_gap + 1.0e-9 < t1) {
+    return std::nullopt;
+  }
+
+  std::size_t index = 0;
+  while (index + 1 < samples.size() && samples[index + 1].stamp <= t0) {
+    ++index;
+  }
+
+  double previous = std::min(samples[index].stamp, t0);
+  for (std::size_t cursor = index; cursor < samples.size(); ++cursor) {
+    const double stamp = samples[cursor].stamp;
+    if (stamp - previous > max_gap + 1.0e-9) {
+      return std::nullopt;
+    }
+    previous = stamp;
+    const bool last_in_interval = cursor + 1 == samples.size() || samples[cursor + 1].stamp > t1;
+    if (stamp > t1) {
+      break;
+    }
+    if (last_in_interval) {
+      if (t1 - stamp > max_gap + 1.0e-9) {
+        return std::nullopt;
+      }
+      break;
+    }
+  }
+
+  Sophus::SE3d delta;
+  double time = t0;
+  const std::size_t max_steps = samples.size() + 2;
+  for (std::size_t step = 0; step < max_steps && time < t1 - 1.0e-9; ++step) {
+    double next_time = t1;
+    if (
+      index + 1 < samples.size() && samples[index + 1].stamp > time &&
+      samples[index + 1].stamp < t1) {
+      next_time = samples[index + 1].stamp;
+    }
+    const double dt = next_time - time;
+    if (dt > 0.0) {
+      Sophus::SE3d::Tangent twist;
+      twist << samples[index].linear, samples[index].angular;
+      if (!twist.allFinite()) {
+        return std::nullopt;
+      }
+      delta *= Sophus::SE3d::exp(twist * dt);
+    }
+    time = next_time;
+    if (index + 1 < samples.size() && samples[index + 1].stamp <= time + 1.0e-9) {
+      ++index;
+    }
+  }
+  if (time < t1 - 1.0e-9 || !delta.matrix().allFinite()) {
+    return std::nullopt;
+  }
+  return delta;
+}
+
 namespace
 {
 
@@ -528,7 +603,8 @@ void LidarImuMatcher::insert_scan(
   timing.map_ms += elapsed_ms(map_start);
 }
 
-ScanAlignment LidarImuMatcher::align_scan(const LidarScan & scan, const ImuProcessor & imu)
+ScanAlignment LidarImuMatcher::align_scan(
+  const LidarScan & scan, const ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists)
 {
   ScanAlignment alignment;
   MatchResult & result = alignment.result;
@@ -582,6 +658,20 @@ ScanAlignment LidarImuMatcher::align_scan(const LidarScan & scan, const ImuProce
   if (!trajectory.empty() && anchor_stamp_ + 1.0e-6 >= trajectory.front().stamp &&
       anchor_stamp_ <= scan_end) {
     predicted = anchor_pose_ * (imu.interpolate_pose(anchor_stamp_).inverse() * imu_pose);
+  }
+  // A covered EKF twist replaces that IMU step. The anchor stays the last lidar pose, so the
+  // filter's absolute frame cannot drag the seed off the local map.
+  if (const std::optional<Sophus::SE3d> motion = integrate_body_twist(
+        body_twists, anchor_stamp_, scan_end, params_.ekf_twist_max_gap)) {
+    const double dt = std::max(0.0, scan_end - anchor_stamp_);
+    const double translation = motion->translation().norm();
+    const double rotation = motion->so3().log().norm();
+    if (
+      translation <= params_.limits.max_speed * dt + 1.0 &&
+      rotation <= params_.limits.max_yaw_rate * dt + 0.5) {
+      predicted = anchor_pose_ * *motion;
+      result.ekf_twist_prior = true;
+    }
   }
   alignment.predicted = predicted;
 
@@ -711,9 +801,10 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
   return result;
 }
 
-MatchResult LidarImuMatcher::on_scan(const LidarScan & scan, ImuProcessor & imu)
+MatchResult LidarImuMatcher::on_scan(
+  const LidarScan & scan, ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists)
 {
-  MatchResult result = commit_scan(align_scan(scan, imu), imu);
+  MatchResult result = commit_scan(align_scan(scan, imu, body_twists), imu);
   flush_pending_insert(result);
   return result;
 }

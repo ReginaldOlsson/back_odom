@@ -43,7 +43,7 @@
     voxel_size: 0.5
     # Scan downsample. false keeps the first point in each voxel (KISS-ICP).
     # true uses GLIM random-grid sampling: original points, about the same count per voxel.
-    use_random_grid_downsampling: true
+    use_random_grid_downsampling: false
     # Fraction of the cropped cloud to keep. Ignored when random_downsample_target > 0.
     random_downsample_rate: 0.3
     # Absolute point budget. 0 means use random_downsample_rate.
@@ -89,6 +89,13 @@
     # On: accepted ICP results correct the IMU pose/velocity and feed the biases, so /back_odom
     # and the EKF see the lidar-corrected trajectory.
     apply_imu_correction: true
+    # Integrate /ekf_twist_with_covariance from the last lidar pose to this scan and use that
+    # body motion as the ICP initial guess. The IMU step is used when the twist does not cover
+    # the interval (ekf_twist_max_gap) or the integrated motion exceeds the vehicle limits.
+    use_ekf_twist_prior: true
+    ekf_twist_topic: "/ekf_twist_with_covariance"
+    ekf_twist_max_gap: 0.05
+    ekf_twist_horizon: 2.0
     # Accepted ICP residual fed back into the biases. Gains are per scan, in [0, 1].
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02

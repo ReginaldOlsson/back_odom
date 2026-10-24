@@ -57,7 +57,7 @@
 
   <!-- IMU propagates attitude, velocity, and position. The first /back_odom/initialpose
        copies rotation and position. Later poses correct the full pose, and twist corrects
-       body velocity. -->
+       body velocity. back_odom integrates /ekf_twist_with_covariance into the next ICP seed. -->
   <include file="$(find-pkg-share autoware_ri_ekf_localizer)/launch/ri_ekf_localizer.launch.xml">
     <arg name="param_file" value="$(var ekf_param_file)"/>
     <arg name="input_imu_topic" value="$(var imu_topic)"/>
