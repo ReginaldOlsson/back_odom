@@ -109,7 +109,8 @@ sensor_msgs::msg::PointField float_field(const std::string & name, const std::ui
   return field;
 }
 
-std::vector<LocalMapPoint> thin_for_display(const std::vector<LocalMapPoint> & points, const double voxel)
+std::vector<LocalMapPoint> thin_for_display(
+  const std::vector<LocalMapPoint> & points, const double voxel)
 {
   if (voxel <= 0.0 || points.size() < 2) {
     return points;
@@ -119,15 +120,20 @@ std::vector<LocalMapPoint> thin_for_display(const std::vector<LocalMapPoint> & p
     std::int64_t x;
     std::int64_t y;
     std::int64_t z;
-    bool operator==(const Key & other) const { return x == other.x && y == other.y && z == other.z; }
+    bool operator==(const Key & other) const
+    {
+      return x == other.x && y == other.y && z == other.z;
+    }
   };
   struct Hash
   {
     std::size_t operator()(const Key & key) const
     {
       std::size_t value = static_cast<std::size_t>(key.x);
-      value ^= static_cast<std::size_t>(key.y) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
-      value ^= static_cast<std::size_t>(key.z) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+      value ^=
+        static_cast<std::size_t>(key.y) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+      value ^=
+        static_cast<std::size_t>(key.z) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
       return value;
     }
   };
@@ -159,21 +165,20 @@ sensor_msgs::msg::PointCloud2 to_annotated_pointcloud(
   cloud.width = static_cast<std::uint32_t>(points.size());
   cloud.is_dense = true;
   cloud.is_bigendian = false;
-  cloud.fields = {
-    float_field("x", 0),
-    float_field("y", 4),
-    float_field("z", 8),
-    float_field("intensity", 12),
-    float_field("scan_id", 16),
-    float_field("collective_passes", 20)};
+  cloud.fields = {float_field("x", 0),        float_field("y", 4),
+                  float_field("z", 8),        float_field("intensity", 12),
+                  float_field("scan_id", 16), float_field("collective_passes", 20)};
   cloud.point_step = 24;
   cloud.row_step = cloud.point_step * cloud.width;
   cloud.data.resize(static_cast<std::size_t>(cloud.row_step));
   for (std::size_t index = 0; index < points.size(); ++index) {
     const LocalMapPoint & point = points[index];
     const float values[6] = {
-      static_cast<float>(point.position.x()), static_cast<float>(point.position.y()),
-      static_cast<float>(point.position.z()), point.intensity, point.scan_id,
+      static_cast<float>(point.position.x()),
+      static_cast<float>(point.position.y()),
+      static_cast<float>(point.position.z()),
+      point.intensity,
+      point.scan_id,
       point.collective_passes};
     std::memcpy(cloud.data.data() + index * cloud.point_step, values, sizeof(values));
   }
@@ -189,14 +194,20 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   // Bags record PointCloud2 as reliable. Best-effort (SensorDataQoS) will never match them.
   pointcloud_reliable_ = this->declare_parameter<bool>("pointcloud_reliable", true);
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
-  twist_variance_vx_ = this->declare_parameter<double>("twist_variance_vx", 0.05);
+  twist_variance_vx_ = this->declare_parameter<double>("twist_variance_vx", 0.0225);
+  twist_variance_vy_ = this->declare_parameter<double>("twist_variance_vy", 0.0025);
+  twist_variance_vz_ = this->declare_parameter<double>("twist_variance_vz", 0.0025);
   twist_variance_wz_ = this->declare_parameter<double>("twist_variance_wz", 0.01);
-  pose_variance_xy_ = this->declare_parameter<double>("pose_variance_xy", 0.05);
+  pose_variance_xy_ = this->declare_parameter<double>("pose_variance_xy", 0.04);
+  pose_variance_z_ = this->declare_parameter<double>("pose_variance_z", 0.40);
+  pose_variance_roll_pitch_ = this->declare_parameter<double>("pose_variance_roll_pitch", 0.01);
   pose_variance_yaw_ = this->declare_parameter<double>("pose_variance_yaw", 0.01);
   if (
-    twist_variance_vx_ <= 0.0 || twist_variance_wz_ <= 0.0 || pose_variance_xy_ <= 0.0 ||
-    pose_variance_yaw_ <= 0.0) {
-    throw std::invalid_argument("EKF measurement variances must be positive");
+    twist_variance_vx_ < 0.01 || twist_variance_vy_ <= 0.0 || twist_variance_vz_ <= 0.0 ||
+    twist_variance_wz_ <= 0.0 || pose_variance_xy_ < 0.0025 || pose_variance_z_ < 0.0025 ||
+    pose_variance_roll_pitch_ <= 0.0 || pose_variance_yaw_ <= 0.0) {
+    throw std::invalid_argument(
+      "EKF variances must stay positive: vx at least 0.1 m/s and position at least 0.05 m");
   }
   imu_left_handed_ = this->declare_parameter<bool>("imu_left_handed", false);
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
@@ -224,8 +235,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const int imu_queue_depth = this->declare_parameter<int>("imu_queue_depth", 2000);
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
   align_to_ground_truth_ = this->declare_parameter<bool>("align_to_ground_truth", false);
-  ground_truth_odom_topic_ = this->declare_parameter<std::string>(
-    "ground_truth_odom_topic", "/boreas/ground_truth/odom");
+  ground_truth_odom_topic_ =
+    this->declare_parameter<std::string>("ground_truth_odom_topic", "/boreas/ground_truth/odom");
   LidarMatchParams lidar_params;
   lidar_params.voxel_size = this->declare_parameter<double>("voxel_size", 0.5);
   lidar_params.use_random_grid_downsampling =
@@ -261,8 +272,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("recovery_max_correspondence_distance", 4.0);
   lidar_params.recovery_max_translation =
     this->declare_parameter<double>("recovery_max_translation", 3.0);
-  lidar_params.apply_imu_correction =
-    this->declare_parameter<bool>("apply_imu_correction", true);
+  lidar_params.apply_imu_correction = this->declare_parameter<bool>("apply_imu_correction", true);
   lidar_params.gyro_bias_gain = this->declare_parameter<double>("gyro_bias_gain", 0.1);
   lidar_params.accel_bias_gain = this->declare_parameter<double>("accel_bias_gain", 0.02);
   lidar_params.speed_correction_gain =
@@ -339,14 +349,15 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     cloud_qos.best_effort();
   }
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    pointcloud_topic_, cloud_qos,
-    [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+    pointcloud_topic_, cloud_qos, [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
       this->callback_pointcloud(msg);
     });
   if (align_to_ground_truth_) {
     ground_truth_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       ground_truth_odom_topic_, rclcpp::QoS(rclcpp::KeepLast(50)).reliable(),
-      [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) { this->callback_ground_truth(msg); });
+      [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+        this->callback_ground_truth(msg);
+      });
   }
 
   odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("back_odom", rclcpp::QoS(10));
@@ -372,10 +383,10 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->create_publisher<nav_msgs::msg::Path>("back_odom/debug/lidar/path", rclcpp::QoS(10));
   scan_stages_pub_ = this->create_publisher<back_odom::msg::ScanStages>(
     "back_odom/debug/scan_stages", rclcpp::QoS(10));
-  icp_debug_pub_ = this->create_publisher<back_odom::msg::IcpDebug>(
-    "back_odom/debug/icp", rclcpp::QoS(10));
-  pose_refine_pub_ = this->create_publisher<back_odom::msg::PoseRefine>(
-    "back_odom/debug/refine", rclcpp::QoS(10));
+  icp_debug_pub_ =
+    this->create_publisher<back_odom::msg::IcpDebug>("back_odom/debug/icp", rclcpp::QoS(10));
+  pose_refine_pub_ =
+    this->create_publisher<back_odom::msg::PoseRefine>("back_odom/debug/refine", rclcpp::QoS(10));
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, false);
@@ -384,8 +395,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     map_timer_ = this->create_wall_timer(
       std::chrono::duration<double>(map_publish_period_), [this]() { this->publish_local_map(); });
   }
-  lidar_watch_timer_ = this->create_wall_timer(
-    std::chrono::seconds(2), [this]() { this->watch_lidar_start(); });
+  lidar_watch_timer_ =
+    this->create_wall_timer(std::chrono::seconds(2), [this]() { this->watch_lidar_start(); });
   worker_ = std::thread([this]() { this->worker_loop(); });
 
   RCLCPP_INFO(
@@ -457,8 +468,7 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   imu_cv_.notify_all();
   if (output.speed_clamped) {
     RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "IMU speed was clamped to the vehicle limit.");
+      this->get_logger(), *this->get_clock(), 2000, "IMU speed was clamped to the vehicle limit.");
   }
 
   if (!output.aligned && output.sample_count >= alignment_sample_count_) {
@@ -494,7 +504,8 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   bool health_due = false;
   {
     std::lock_guard<std::mutex> lock(publish_mutex_);
-    health_due = !has_published_health_ || (stamp - last_health_stamp_).seconds() >= health_min_dt_ ||
+    health_due = !has_published_health_ ||
+                 (stamp - last_health_stamp_).seconds() >= health_min_dt_ ||
                  (stamp - last_health_stamp_).seconds() < 0.0;
     if (health_due) {
       last_health_stamp_ = stamp;
@@ -563,12 +574,15 @@ void BackOdomNode::watch_lidar_start()
   const std::size_t publishers = pointcloud_sub_ ? pointcloud_sub_->get_publisher_count() : 0;
   RCLCPP_WARN(
     this->get_logger(),
-    "IMU is aligned but lidar matching has not started. topic %s publishers=%zu clouds_received=%lu "
+    "IMU is aligned but lidar matching has not started. topic %s publishers=%zu "
+    "clouds_received=%lu "
     "(held_before_align=%lu) qos=%s. publishers=0 usually means the bag is not playing that topic, "
     "or QoS does not match (set pointcloud_reliable:=false for best-effort drivers).",
     pointcloud_topic_.c_str(), publishers,
-    static_cast<unsigned long>(clouds_received_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
-    static_cast<unsigned long>(clouds_before_align_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
+    static_cast<unsigned long>(
+      clouds_received_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
+    static_cast<unsigned long>(
+      clouds_before_align_.load(std::memory_order_relaxed)),  // NOLINT(runtime/int)
     pointcloud_reliable_ ? "reliable" : "best_effort");
 }
 
@@ -720,9 +734,8 @@ void BackOdomNode::publish_match(
 {
   if (!map_frame_ready()) {
     RCLCPP_INFO_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Waiting for %s before publishing map -> %s.", ground_truth_odom_topic_.c_str(),
-      child_frame_.c_str());
+      this->get_logger(), *this->get_clock(), 2000, "Waiting for %s before publishing map -> %s.",
+      ground_truth_odom_topic_.c_str(), child_frame_.c_str());
     return;
   }
   const ProcessorOutput prior_map = to_map_frame(prior);
@@ -800,11 +813,13 @@ void BackOdomNode::publish_health(
       const MatchResult & last = last_match_;
       add_value("lidar_cost", last.has_lidar_debug ? std::to_string(last.lidar_cost) : "none");
       add_value(
-        "ndt_cost",
-        last.has_lidar_debug && std::isfinite(last.ndt_cost) ? std::to_string(last.ndt_cost) : "none");
+        "ndt_cost", last.has_lidar_debug && std::isfinite(last.ndt_cost)
+                      ? std::to_string(last.ndt_cost)
+                      : "none");
       add_value(
-        "ndt_inlier_fraction",
-        std::isfinite(last.ndt_inlier_fraction) ? std::to_string(last.ndt_inlier_fraction) : "none");
+        "ndt_inlier_fraction", std::isfinite(last.ndt_inlier_fraction)
+                                 ? std::to_string(last.ndt_inlier_fraction)
+                                 : "none");
       add_value("inlier_ratio", std::to_string(last.inlier_ratio));
       add_value("correspondences", std::to_string(last.correspondences));
       add_value("degenerate_axes", std::to_string(last.degenerate_axes));
@@ -1026,41 +1041,41 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     }
     return std::numeric_limits<double>::quiet_NaN();
   };
-  const auto read_intensity = [&cloud](
-                                const sensor_msgs::msg::PointField & field, const std::size_t index) {
-    const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
-    switch (field.datatype) {
-      case sensor_msgs::msg::PointField::FLOAT32: {
-        float value = 0.0F;
-        std::memcpy(&value, pointer, sizeof(float));
-        return value;
+  const auto read_intensity =
+    [&cloud](const sensor_msgs::msg::PointField & field, const std::size_t index) {
+      const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
+      switch (field.datatype) {
+        case sensor_msgs::msg::PointField::FLOAT32: {
+          float value = 0.0F;
+          std::memcpy(&value, pointer, sizeof(float));
+          return value;
+        }
+        case sensor_msgs::msg::PointField::FLOAT64: {
+          double value = 0.0;
+          std::memcpy(&value, pointer, sizeof(double));
+          return static_cast<float>(value);
+        }
+        case sensor_msgs::msg::PointField::UINT8:
+          return static_cast<float>(*pointer);
+        case sensor_msgs::msg::PointField::UINT16: {
+          std::uint16_t value = 0;
+          std::memcpy(&value, pointer, sizeof(std::uint16_t));
+          return static_cast<float>(value);
+        }
+        case sensor_msgs::msg::PointField::INT16: {
+          std::int16_t value = 0;
+          std::memcpy(&value, pointer, sizeof(std::int16_t));
+          return static_cast<float>(value);
+        }
+        case sensor_msgs::msg::PointField::UINT32: {
+          std::uint32_t value = 0;
+          std::memcpy(&value, pointer, sizeof(std::uint32_t));
+          return static_cast<float>(value);
+        }
+        default:
+          return 0.0F;
       }
-      case sensor_msgs::msg::PointField::FLOAT64: {
-        double value = 0.0;
-        std::memcpy(&value, pointer, sizeof(double));
-        return static_cast<float>(value);
-      }
-      case sensor_msgs::msg::PointField::UINT8:
-        return static_cast<float>(*pointer);
-      case sensor_msgs::msg::PointField::UINT16: {
-        std::uint16_t value = 0;
-        std::memcpy(&value, pointer, sizeof(std::uint16_t));
-        return static_cast<float>(value);
-      }
-      case sensor_msgs::msg::PointField::INT16: {
-        std::int16_t value = 0;
-        std::memcpy(&value, pointer, sizeof(std::int16_t));
-        return static_cast<float>(value);
-      }
-      case sensor_msgs::msg::PointField::UINT32: {
-        std::uint32_t value = 0;
-        std::memcpy(&value, pointer, sizeof(std::uint32_t));
-        return static_cast<float>(value);
-      }
-      default:
-        return 0.0F;
-    }
-  };
+    };
 
   const std::size_t count = static_cast<std::size_t>(cloud.width) * cloud.height;
   scan.points.reserve(count);
@@ -1070,8 +1085,8 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
   // Returns off the ego vehicle and beyond the crop box never reach the map; drop them here so
   // deskew and voxelisation do not pay for them.
   const double min_range_sq = min_range_ * min_range_;
-  const double max_range_sq = max_range_ > 0.0 ? max_range_ * max_range_
-                                               : std::numeric_limits<double>::infinity();
+  const double max_range_sq =
+    max_range_ > 0.0 ? max_range_ * max_range_ : std::numeric_limits<double>::infinity();
   double max_abs_time = 0.0;
   for (std::size_t index = 0; index < count; ++index) {
     const double x = read_float(*x_field, index);
@@ -1148,8 +1163,12 @@ void BackOdomNode::publish_twist(const ProcessorOutput & output, const rclcpp::T
   twist.header.frame_id = child_frame_;
   const Eigen::Vector3d velocity_body = output.orientation.inverse() * output.velocity_world;
   twist.twist.twist.linear.x = velocity_body.x();
+  twist.twist.twist.linear.y = velocity_body.y();
+  twist.twist.twist.linear.z = velocity_body.z();
   twist.twist.twist.angular.z = output.angular_velocity_body.z();
   twist.twist.covariance[0] = twist_variance_vx_;
+  twist.twist.covariance[7] = twist_variance_vy_;
+  twist.twist.covariance[14] = twist_variance_vz_;
   twist.twist.covariance[35] = twist_variance_wz_;
   twist_pub_->publish(twist);
 }
@@ -1165,9 +1184,9 @@ void BackOdomNode::publish_pose(const ProcessorOutput & output, const rclcpp::Ti
   set_quaternion(pose.pose.pose.orientation, output.orientation);
   pose.pose.covariance[0] = pose_variance_xy_;
   pose.pose.covariance[7] = pose_variance_xy_;
-  pose.pose.covariance[14] = pose_variance_xy_;
-  pose.pose.covariance[21] = pose_variance_yaw_;
-  pose.pose.covariance[28] = pose_variance_yaw_;
+  pose.pose.covariance[14] = pose_variance_z_;
+  pose.pose.covariance[21] = pose_variance_roll_pitch_;
+  pose.pose.covariance[28] = pose_variance_roll_pitch_;
   pose.pose.covariance[35] = pose_variance_yaw_;
   pose_pub_->publish(pose);
   bool send_initial = false;
@@ -1306,8 +1325,7 @@ void BackOdomNode::publish_markers(
   std::ostringstream stream;
   stream << std::fixed << std::setprecision(2);
   if (output.aligned) {
-    stream << "tracking " << health_name(health)
-           << " |f|=" << output.specific_force_body.norm()
+    stream << "tracking " << health_name(health) << " |f|=" << output.specific_force_body.norm()
            << " |w|=" << output.angular_velocity_body.norm();
   } else {
     stream << "collecting " << output.sample_count << "/" << alignment_sample_count_;
@@ -1373,7 +1391,8 @@ void BackOdomNode::publish_scan_poses(
     const float age =
       count == 1U ? 1.0F : static_cast<float>(index) / static_cast<float>(count - 1U);
     const Eigen::Vector3d origin = shown[index].pose.translation();
-    const Eigen::Vector3d forward = origin + shown[index].pose.so3() * Eigen::Vector3d(3.0, 0.0, 0.0);
+    const Eigen::Vector3d forward =
+      origin + shown[index].pose.so3() * Eigen::Vector3d(3.0, 0.0, 0.0);
     visualization_msgs::msg::Marker arrow = make_arrow(
       stamp, parent_frame_, static_cast<int>(index), origin, forward, age, 0.35F, 1.0F - age);
     arrow.ns = "scan_pose";
@@ -1420,12 +1439,14 @@ void BackOdomNode::callback_ground_truth(const nav_msgs::msg::Odometry::ConstSha
   sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
   sample.pose = Sophus::SE3d(
     Sophus::SO3d(quaternion),
-    Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
+    Eigen::Vector3d(
+      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
   std::lock_guard<std::mutex> lock(align_mutex_);
   if (map_from_local_locked_.load(std::memory_order_relaxed)) {
     return;
   }
-  if (!ground_truth_samples_.empty() && sample.stamp + 1.0e-9 < ground_truth_samples_.back().stamp) {
+  if (
+    !ground_truth_samples_.empty() && sample.stamp + 1.0e-9 < ground_truth_samples_.back().stamp) {
     return;
   }
   if (
@@ -1459,9 +1480,8 @@ void BackOdomNode::try_lock_ground_truth_alignment()
   }
   if (samples.empty()) {
     RCLCPP_INFO_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Waiting for %s before publishing map -> %s.", ground_truth_odom_topic_.c_str(),
-      child_frame_.c_str());
+      this->get_logger(), *this->get_clock(), 2000, "Waiting for %s before publishing map -> %s.",
+      ground_truth_odom_topic_.c_str(), child_frame_.c_str());
     return;
   }
 
@@ -1479,10 +1499,9 @@ void BackOdomNode::try_lock_ground_truth_alignment()
     }
     const Eigen::Vector3d translation = map_from_local.translation();
     RCLCPP_INFO(
-      this->get_logger(),
-      "Aligned map -> %s to %s at %.3f s. xyz=(%.2f, %.2f, %.2f)", child_frame_.c_str(),
-      ground_truth_odom_topic_.c_str(), sample.stamp, translation.x(), translation.y(),
-      translation.z());
+      this->get_logger(), "Aligned map -> %s to %s at %.3f s. xyz=(%.2f, %.2f, %.2f)",
+      child_frame_.c_str(), ground_truth_odom_topic_.c_str(), sample.stamp, translation.x(),
+      translation.y(), translation.z());
     return;
   }
   RCLCPP_INFO_THROTTLE(

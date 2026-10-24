@@ -175,9 +175,13 @@ private:
   double max_range_{0.0};
   bool publish_tf_{true};
   bool initial_pose_sent_{false};
-  double twist_variance_vx_{0.05};
+  double twist_variance_vx_{0.0225};
+  double twist_variance_vy_{0.0025};
+  double twist_variance_vz_{0.0025};
   double twist_variance_wz_{0.01};
-  double pose_variance_xy_{0.05};
+  double pose_variance_xy_{0.04};
+  double pose_variance_z_{0.40};
+  double pose_variance_roll_pitch_{0.01};
   double pose_variance_yaw_{0.01};
   bool imu_left_handed_{false};
   std::string time_field_;

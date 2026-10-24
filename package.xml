@@ -26,7 +26,7 @@
   <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
 
-  <exec_depend>autoware_ekf_localizer</exec_depend>
+  <exec_depend>autoware_ri_ekf_localizer</exec_depend>
   <exec_depend>boreas_sensor_kit_description</exec_depend>
   <exec_depend>boreas_vehicle_description</exec_depend>
   <exec_depend>boreas_vehicle_launch</exec_depend>

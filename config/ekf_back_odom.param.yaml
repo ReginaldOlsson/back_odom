@@ -1,53 +1,85 @@
 /**:
   ros__parameters:
     node:
-      show_debug_info: false
-      # Each IMU twist runs predict and the queued pose update. dt is the twist stamp gap.
-      predict_on_twist: true
-      enable_yaw_bias_estimation: true
-      # Nominal rate used for the first step, before two twist stamps exist. Boreas IMU is 200 Hz.
-      predict_frequency: 200.0
+      map_frame: map
+      odom_frame: odom
+      base_frame: base_link
+      # Boreas sensor kit link. Static TF rotates this into base_link.
+      imu_frame: imu
+      # Boreas IMU is 200 Hz. Propagation still runs on every sample.
+      publish_frequency: 200.0
       tf_rate: 200.0
-      # 50 steps at 200 Hz is 0.25 s and would reject a lidar pose. 200 steps covers about 1 s.
-      extend_state_step: 200
-
-    pose_measurement:
-      pose_additional_delay: 0.0
-      pose_measure_uncertainty_time: 0.01
-      pose_smoothing_steps: 5
-      max_pose_queue_size: 5
-      pose_gate_dist: 49.5
-
-    twist_measurement:
-      twist_additional_delay: 0.0
-      # One application per IMU sample. A later cycle must not reuse the same twist.
-      twist_smoothing_steps: 1
-      # 200 Hz IMU twist. 2000 covers ~10 s while waiting for the first lidar pose.
-      max_twist_queue_size: 200
-      twist_gate_dist: 46.1
-
-    process_noise:
-      proc_stddev_yaw_c: 0.005
-      proc_stddev_vx_c: 10.0
-      proc_stddev_wz_c: 5.0
-
-    simple_1d_filter_parameters:
-      z_filter_proc_dev: 5.0
-      roll_filter_proc_dev: 0.1
-      pitch_filter_proc_dev: 0.1
-
-    diagnostics:
-      pose_no_update_count_threshold_warn: 50
-      pose_no_update_count_threshold_error: 100
-      twist_no_update_count_threshold_warn: 50
-      twist_no_update_count_threshold_error: 100
-      ellipse_scale: 3.0
-      error_ellipse_size: 1.5
-      warn_ellipse_size: 1.2
-      error_ellipse_size_lateral_direction: 0.3
-      warn_ellipse_size_lateral_direction: 0.25
+      gravity: 9.80665
+      # ICP poses are stamped at the scan and often arrive 0.3–1 s after the IMU.
+      # Older than this are dropped. A late pose is applied to the current state.
+      max_measurement_delay: 1.0
+      pose_buffer_duration: 10.0
+      show_debug_info: false
+      # This launch publishes /back_odom/initialpose and does not call trigger_node.
+      activate_on_initial_pose: true
       diagnostics_publish_frequency: 10.0
+      covariance_floor: 1.0e-9
+      # One row per sample: EKF state, latest back_odom pose, and the difference.
+      trace_csv_path: /tmp/ri_ekf_trace.csv
+      trace_csv_rate: 20.0
 
-    misc:
-      threshold_observable_velocity_mps: 0.0
-      pose_frame_id: "map"
+    imu_noise:
+      # Continuous-time densities. Discrete covariance is Phi G Q_c G^T Phi^T dt.
+      sigma_gyro: 0.01
+      sigma_accel: 0.1
+      sigma_bias_gyro: 0.001
+      sigma_bias_accel: 0.01
+      # A speed bump otherwise walks into b_a,z and the car climbs after it.
+      sigma_bias_accel_z: 0.0
+
+    extrinsics:
+      use_tf: true
+      # Boreas z reads about -g. Negate z after the extrinsic rotation. Do not negate x and y:
+      # the yaw mount already places them in base_link, and a full negation reverses forward accel.
+      negate_linear_acceleration: true
+      # Fallback until imu -> base_link TF is available. Matches the Boreas sensor-kit joint.
+      imu_to_base_rpy: [0.0, 0.0, -3.099765643786288]
+      gnss_lever_arm_in_base: [0.0, 0.0, 0.0]
+      # /back_odom/twist_with_covariance is already in base_link.
+      velocity_lever_arm_in_base: [0.0, 0.0, 0.0]
+      velocity_sensor_rpy: [0.0, 0.0, 0.0]
+
+    lidar_update:
+      # Map poses are rotated into odom by the current alignment. It is identity after the seed.
+      # The pose is a full SE(3) measurement, including roll and pitch.
+      enable: true
+
+    velocity_update:
+      # Body vx, vy, and vz from /back_odom/twist_with_covariance, already in base_link.
+      # nonholonomic_stddev > 0 would replace vy and vz with zero; leave it at 0.
+      enable: true
+      nonholonomic_stddev: 0.0
+
+    gnss_window:
+      window_size: 50
+      min_keyframe_distance: 0.5
+      yaw_unlock_distance: 5.0
+      sigma_drift: 0.05
+      sigma_drift_z: 0.02
+      gnss_z_variance_scale: 3.0
+      huber_delta: 1.5
+      iterations: 5
+      prior_stddev_yaw: 0.1
+      prior_stddev_xy: 1.0
+      prior_stddev_z: 0.3
+      yaw_lock_variance: 1.0e-12
+
+    initialization:
+      static_init_duration: 0.5
+      static_gyro_threshold: 0.05
+      # The aligned pose arrives after the vehicle is moving. Copy it into the state.
+      # Stationary IMU before that pose can still set the gyro bias and does not move position.
+      initialize_state_from_pose: true
+      initial_stddev_xy: 1.0
+      initial_stddev_z: 1.0
+      initial_stddev_roll_pitch: 0.05
+      initial_stddev_yaw: 0.1
+      initial_stddev_velocity: 0.5
+      initial_stddev_bias_gyro: 0.01
+      initial_stddev_bias_accel: 0.1
+      initial_stddev_bias_accel_z: 0.001

@@ -26,7 +26,7 @@
     <arg name="vehicle_model" value="$(var vehicle_model)"/>
   </include>
 
-  <!-- ICP pose + IMU twist. publish_tf is false in config; EKF owns map -> base_link. -->
+  <!-- ICP pose + IMU twist. publish_tf is false. The RI-EKF owns map -> odom -> base_link. -->
   <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen"
         ros_args="--log-level back_odom_node:=info">
     <param from="$(var config_file)"/>
@@ -55,12 +55,15 @@
     <param name="segmented_cloud_topic" value="back_odom/segmented_cloud"/>
   </node> -->
 
-  <!-- predict_on_twist EKF; inputs remapped to back_odom publishers -->
-  <include file="$(find-pkg-share autoware_ekf_localizer)/launch/ekf_localizer.launch.xml">
+  <!-- IMU propagates attitude, velocity, and position. The first /back_odom/initialpose
+       copies rotation and position. Later poses correct the full pose, and twist corrects
+       body velocity. -->
+  <include file="$(find-pkg-share autoware_ri_ekf_localizer)/launch/ri_ekf_localizer.launch.xml">
     <arg name="param_file" value="$(var ekf_param_file)"/>
+    <arg name="input_imu_topic" value="$(var imu_topic)"/>
     <arg name="input_initial_pose_name" value="/back_odom/initialpose"/>
-    <arg name="input_pose_with_cov_name" value="/back_odom/pose_with_covariance"/>
     <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
+    <arg name="input_lidar_odom_topic" value="/back_odom/pose_with_covariance"/>
   </include>
 
   <!-- <node if="$(var publish_kpis)" pkg="back_odom" exec="kitti_error_node" name="kitti_error_node" output="screen">

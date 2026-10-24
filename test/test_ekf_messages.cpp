@@ -116,7 +116,9 @@ TEST(EkfMessages, imu_publishes_body_twist_and_not_the_pose)
   EXPECT_EQ(latest_twist->header.frame_id, "base_link");
   EXPECT_NEAR(latest_twist->twist.twist.linear.x, 0.1, 1.0e-3);
   EXPECT_NEAR(latest_twist->twist.twist.angular.z, 0.25, 1.0e-6);
-  EXPECT_DOUBLE_EQ(latest_twist->twist.covariance[0], 0.05);
+  EXPECT_DOUBLE_EQ(latest_twist->twist.covariance[0], 0.0225);
+  EXPECT_DOUBLE_EQ(latest_twist->twist.covariance[7], 0.0025);
+  EXPECT_DOUBLE_EQ(latest_twist->twist.covariance[14], 0.0025);
   EXPECT_DOUBLE_EQ(latest_twist->twist.covariance[35], 0.01);
   EXPECT_EQ(pose_count, 0U);
   EXPECT_EQ(initial_count, 0U);
