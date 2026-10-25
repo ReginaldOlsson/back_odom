@@ -50,8 +50,8 @@
     random_downsample_target: 0
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 150.0
-    crop_lateral: 100.0
+    crop_longitudinal: 250.0
+    crop_lateral: 200.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the

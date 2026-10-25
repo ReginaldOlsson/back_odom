@@ -191,6 +191,7 @@ endif()
 install(
   PROGRAMS
     scripts/eval_trajectory.py
+    scripts/eval_trace_kitti.py
     scripts/dump_odom_csv.py
   DESTINATION lib/${PROJECT_NAME}
 )
