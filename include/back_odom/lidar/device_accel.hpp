@@ -41,6 +41,8 @@ struct DeviceScanClouds
   std::vector<float> map_intensities;
   /// Coarser cloud used as the registration source.
   std::vector<Eigen::Vector3d> source;
+  /// Normalized scan time of each source point, 1 at the end of the sweep.
+  std::vector<float> source_tau;
   double deskew_ms{0.0};
   double voxel_ms{0.0};
 };
@@ -71,7 +73,8 @@ struct DeviceScanClouds
 [[nodiscard]] std::optional<PlaneIcpResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, std::uint64_t map_epoch, const Sophus::SE3d & initial_guess,
-  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * deadline = nullptr);
+  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * deadline = nullptr,
+  const std::vector<float> * tau = nullptr);
 
 }  // namespace back_odom
 

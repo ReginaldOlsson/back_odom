@@ -16,6 +16,7 @@
 
 #include "back_odom/lidar/device_kernels.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/plane_class.hpp"
 
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 
@@ -226,22 +227,46 @@ bool upload_map(const kiss_icp::VoxelHashMap & map, const SurfaceVoxelMap & surf
 
 bool plane_at(
   const double * xyz, const int count, const bool upload_frame, const Sophus::SE3d & pose,
-  const double max_distance, const double kernel_scale, Matrix6d & hessian, Vector6d & gradient,
-  int & correspondences, double & robust_cost)
+  const double max_distance, const double kernel_scale, const CurveConstraint & constraint,
+  Matrix6d & hessian, Vector6d & gradient, int & correspondences, double & robust_cost,
+  Matrix6d & wall_hessian, int & wall_correspondences)
 {
   double rotation[9];
   double translation[3];
   store_pose(pose, rotation, translation);
   CudaPlaneSystem system;
-  if (!cuda_plane_system(xyz, count, rotation, translation, max_distance, kernel_scale, upload_frame, system)) {
+  if (!cuda_plane_system(
+        xyz, count, rotation, translation, max_distance, kernel_scale, upload_frame, system)) {
     return false;
   }
-  for (int row = 0; row < 6; ++row) {
-    gradient(row) = system.jtr[row];
-    for (int column = 0; column < 6; ++column) {
-      hessian(row, column) = system.jtj[row * 6 + column];
+  const auto unpack = [](const double upper[21], Matrix6d & matrix) {
+    matrix.setZero();
+    for (int row = 0; row < 6; ++row) {
+      for (int column = row; column < 6; ++column) {
+        const int index = row * 6 - (row * (row - 1)) / 2 + (column - row);
+        matrix(row, column) = upper[index];
+        matrix(column, row) = upper[index];
+      }
     }
+  };
+  Matrix6d ground_h;
+  Matrix6d wall_h;
+  Matrix6d other_h;
+  unpack(system.ground_jtj, ground_h);
+  unpack(system.wall_jtj, wall_h);
+  unpack(system.other_jtj, other_h);
+  Vector6d ground_g;
+  Vector6d wall_g;
+  Vector6d other_g;
+  for (int item = 0; item < 6; ++item) {
+    ground_g(item) = system.ground_jtr[item];
+    wall_g(item) = system.wall_jtr[item];
+    other_g(item) = system.other_jtr[item];
   }
+  compose_class_system(
+    ground_h, wall_h, other_h, ground_g, wall_g, other_g, constraint, hessian, gradient);
+  wall_hessian = wall_h;
+  wall_correspondences = system.wall_correspondences;
   correspondences = system.correspondences;
   robust_cost = count <= 0 ? std::numeric_limits<double>::infinity()
                            : system.robust_cost_sum / static_cast<double>(count);
@@ -271,13 +296,15 @@ std::optional<DeviceScanClouds> device_downsample_scan(
   std::vector<double> fine_xyz;
   std::vector<int> fine_index;
   std::vector<double> coarse_xyz;
+  std::vector<int> coarse_index;
   if (!cuda_front_downsample(
         upload.flat.data(), timestamps.data(), static_cast<int>(points.size()), upload.segments.data(),
         static_cast<int>(upload.segments.size()), trajectory.front().stamp, trajectory.back().stamp,
         upload.front_rotation, upload.front_translation, upload.back_rotation, upload.back_translation,
         upload.end_rotation, upload.end_translation, upload.body_rotation, upload.body_translation,
-        half_longitudinal, half_lateral, fine_voxel, coarse_voxel, fine_xyz, fine_index, coarse_xyz) ||
-      fine_xyz.size() != fine_index.size() * 3 || coarse_xyz.size() % 3 != 0) {
+        half_longitudinal, half_lateral, fine_voxel, coarse_voxel, fine_xyz, fine_index, coarse_xyz,
+        coarse_index) ||
+      fine_xyz.size() != fine_index.size() * 3 || coarse_xyz.size() != coarse_index.size() * 3) {
     return std::nullopt;
   }
   DeviceScanClouds clouds;
@@ -297,10 +324,23 @@ std::optional<DeviceScanClouds> device_downsample_scan(
           : 0.0F;
     }
   }
-  clouds.source.resize(coarse_xyz.size() / 3);
+  clouds.source.resize(coarse_index.size());
+  clouds.source_tau.resize(coarse_index.size());
+  const double sweep_start = *std::min_element(timestamps.cbegin(), timestamps.cend());
+  const double sweep_end = *std::max_element(timestamps.cbegin(), timestamps.cend());
+  const double sweep_span = sweep_end - sweep_start;
   for (std::size_t index = 0; index < clouds.source.size(); ++index) {
     clouds.source[index] =
       Eigen::Vector3d(coarse_xyz[3 * index], coarse_xyz[3 * index + 1], coarse_xyz[3 * index + 2]);
+    const int source_index = coarse_index[index];
+    if (sweep_span <= 1.0e-6 || source_index < 0 ||
+        static_cast<std::size_t>(source_index) >= timestamps.size()) {
+      clouds.source_tau[index] = 1.0F;
+      continue;
+    }
+    const double normalized =
+      (timestamps[static_cast<std::size_t>(source_index)] - sweep_start) / sweep_span;
+    clouds.source_tau[index] = static_cast<float>(std::clamp(normalized, 0.0, 1.0));
   }
   clouds.voxel_ms =
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voxel_started).count();
@@ -366,7 +406,8 @@ std::optional<std::vector<Eigen::Vector3d>> device_voxel_downsample(
 std::optional<PlaneIcpResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const std::uint64_t map_epoch, const Sophus::SE3d & initial_guess,
-  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * const deadline)
+  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * const deadline,
+  const std::vector<float> * const tau)
 {
   if (!cuda_available() || frame.empty() || map.Empty() || !(params.kernel_scale > 0.0) ||
       params.max_iterations < 1) {
@@ -384,12 +425,17 @@ std::optional<PlaneIcpResult> align_points_on_device(
   if (!upload_map(map, surface, map_epoch)) {
     return std::nullopt;
   }
+  const bool residual_deskew = tau != nullptr && tau->size() == frame.size();
+  std::vector<Eigen::Vector3d> working = frame;
   std::vector<double> xyz(frame.size() * 3);
-  for (std::size_t index = 0; index < frame.size(); ++index) {
-    xyz[3 * index] = frame[index].x();
-    xyz[3 * index + 1] = frame[index].y();
-    xyz[3 * index + 2] = frame[index].z();
-  }
+  const auto store_working = [&xyz, &working]() {
+    for (std::size_t index = 0; index < working.size(); ++index) {
+      xyz[3 * index] = working[index].x();
+      xyz[3 * index + 1] = working[index].y();
+      xyz[3 * index + 2] = working[index].z();
+    }
+  };
+  store_working();
   const int count = static_cast<int>(frame.size());
   Sophus::SE3d pose = initial_guess;
   bool upload_frame = true;
@@ -399,17 +445,36 @@ std::optional<PlaneIcpResult> align_points_on_device(
       result.timed_out = true;
       break;
     }
+    const Eigen::Matrix<double, 6, 1> xi_from_seed = (initial_guess.inverse() * pose).log();
+    if (residual_deskew && (iteration == 2 || iteration == 4)) {
+      apply_sweep_residual_deskew(frame, *tau, xi_from_seed, working);
+      store_working();
+      upload_frame = true;
+    }
     Matrix6d hessian = Matrix6d::Zero();
     Vector6d gradient = Vector6d::Zero();
+    Matrix6d wall_hessian = Matrix6d::Zero();
     int correspondences = 0;
+    int wall_correspondences = 0;
     double robust_cost = 0.0;
+    CurveConstraint constraint;
+    constraint.yaw_rate = params.yaw_rate;
+    constraint.axle_in_body = params.axle_in_body;
+    constraint.longitudinal_sigma = params.longitudinal_sigma;
+    constraint.xi_from_seed = xi_from_seed;
     if (!plane_at(
           xyz.data(), count, upload_frame, pose,
-          correspondence_distance_for_iteration(params, iteration), params.kernel_scale, hessian,
-          gradient, correspondences, robust_cost)) {
+          correspondence_distance_for_iteration(params, iteration),
+          kernel_scale_for_iteration(params, iteration, residual_deskew), constraint, hessian,
+          gradient, correspondences, robust_cost, wall_hessian, wall_correspondences)) {
       return std::nullopt;
     }
     upload_frame = false;
+    result.wall_hessian = wall_hessian;
+    result.wall_inlier_fraction =
+      correspondences > 0 ? static_cast<double>(wall_correspondences) / static_cast<double>(correspondences)
+                          : 0.0;
+    result.robust_rms = std::sqrt(std::max(robust_cost, 0.0));
     result.correspondences = correspondences;
     result.robust_cost = robust_cost;
     result.hessian = hessian;

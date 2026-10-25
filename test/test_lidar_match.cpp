@@ -18,6 +18,7 @@
 #include "back_odom/lidar/lidar_imu_matcher.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
 #include "back_odom/lidar/match_candidate.hpp"
+#include "back_odom/lidar/plane_class.hpp"
 #include "back_odom/lidar/ndt_health.hpp"
 #include "back_odom/lidar/plane_icp.hpp"
 #include "back_odom/lidar/scan_window.hpp"
@@ -46,6 +47,51 @@ TEST(LidarPreprocess, crop_keeps_points_inside_the_box)
   ASSERT_EQ(cropped.size(), 2U);
   EXPECT_NEAR(cropped[0].z(), 5.0, 1e-9);
   EXPECT_NEAR(cropped[1].z(), 100.0, 1e-9);
+}
+
+TEST(LidarPreprocess, ground_plane_on_a_flat_cloud_points_up)
+{
+  std::vector<Eigen::Vector3d> cloud;
+  for (int ix = 0; ix < 20; ++ix) {
+    for (int iy = 0; iy < 20; ++iy) {
+      cloud.emplace_back(0.3 * ix, 0.3 * iy, 0.0);
+    }
+  }
+  const GroundPlaneFit fit = fit_ground_plane(cloud, 0.15, 32, 1);
+  EXPECT_TRUE(fit.valid);
+  EXPECT_GT(fit.inlier_ratio, 0.9);
+  EXPECT_NEAR(fit.normal.z(), 1.0, 1e-6);
+}
+
+TEST(LidarPreprocess, pose_buffer_covers_a_dense_sweep_and_rejects_a_hole)
+{
+  std::vector<StampedPose> dense(5);
+  for (std::size_t index = 0; index < dense.size(); ++index) {
+    dense[index].stamp = 0.01 * static_cast<double>(index);
+  }
+  EXPECT_TRUE(pose_buffer_covers(dense, 0.0, 0.04, 0.05));
+
+  std::vector<StampedPose> hole = dense;
+  hole[2].stamp = 0.2;
+  hole[3].stamp = 0.21;
+  hole[4].stamp = 0.22;
+  EXPECT_FALSE(pose_buffer_covers(hole, 0.0, 0.22, 0.05));
+}
+
+TEST(LidarPreprocess, deskew_uses_the_relative_pose_when_the_buffer_covers_the_sweep)
+{
+  std::vector<StampedPose> trajectory(101);
+  for (std::size_t index = 0; index < trajectory.size(); ++index) {
+    trajectory[index].stamp = 0.01 * static_cast<double>(index);
+    trajectory[index].pose =
+      Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(trajectory[index].stamp, 0.0, 0.0));
+  }
+  ASSERT_TRUE(pose_buffer_covers(trajectory, 0.0, 1.0, 0.05));
+  const std::vector<Eigen::Vector3d> deskewed = deskew_to_scan_end(
+    {Eigen::Vector3d::Zero(), Eigen::Vector3d(1.0, 0.0, 0.0)}, {0.0, 1.0}, trajectory);
+  ASSERT_EQ(deskewed.size(), 2U);
+  EXPECT_NEAR(deskewed[0].x(), -1.0, 1e-6);
+  EXPECT_NEAR(deskewed[1].x(), 1.0, 1e-6);
 }
 
 TEST(LidarPreprocess, deskew_moves_the_scan_start_into_the_end_frame)
@@ -429,7 +475,7 @@ TEST(BackwardMatch, older_scan_does_not_rewind_a_later_imu_pose)
   EXPECT_NEAR(imu.pose().translation().x(), 1.0, 0.15);
 }
 
-TEST(InertialCorrection, curve_keeps_the_tangent_instead_of_the_chord)
+TEST(InertialCorrection, curve_keeps_the_screw_instead_of_the_chord)
 {
   constexpr double yaw = 0.2;
   constexpr double speed = 10.0;
@@ -440,20 +486,33 @@ TEST(InertialCorrection, curve_keeps_the_tangent_instead_of_the_chord)
   const Eigen::Vector3d tangent = speed * Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
 
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, tangent, Eigen::Vector3d::Zero(), dt, 0.1, 0.02,
-    0.5);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, tangent, Sophus::SE3d(), dt, 0.1, 0.02, 0.5);
 
-  const Eigen::Vector3d forward = corrected.so3() * Eigen::Vector3d::UnitX();
-  const double imu_forward = tangent.dot(forward);
-  const double lidar_forward = position.dot(forward) / dt;
-  const double blended = 0.5 * imu_forward + 0.5 * lidar_forward;
-  const Eigen::Vector3d expected = blended * forward;
-  EXPECT_NEAR(correction.velocity_world.x(), expected.x(), 1e-6);
-  EXPECT_NEAR(correction.velocity_world.y(), expected.y(), 1e-6);
-  EXPECT_GT(correction.velocity_world.y(), 1.5);
+  const Eigen::Vector3d screw = corrected.log().head<3>() / dt;
+  const Eigen::Vector3d naive = corrected.so3().inverse() * position / dt;
+  const Eigen::Vector3d body = corrected.so3().inverse() * correction.velocity_world;
+  EXPECT_NEAR(body.x(), 0.5 * speed + 0.5 * screw.x(), 1e-6);
+  EXPECT_NEAR(body.y(), screw.y(), 1e-6);
+  EXPECT_NEAR(screw.x(), speed, 1e-6);
+  EXPECT_LT(std::abs(body.y()), 1e-6);
+  EXPECT_GT(std::abs(naive.y()), 0.5);
   EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
-  EXPECT_GT(correction.accel_bias_delta.x(), 0.0);
   EXPECT_NEAR(correction.gyro_bias_delta.norm(), 0.0, 1e-12);
+}
+
+TEST(InertialCorrection, screw_recovers_the_body_velocity_of_a_turning_step)
+{
+  const Eigen::Vector3d velocity(9.5, 0.12, -0.05);
+  constexpr double dt = 0.1;
+  Eigen::Matrix<double, 6, 1> tangent;
+  tangent << 9.5 * dt, 0.12 * dt, -0.05 * dt, 0.02, -0.03, 0.18;
+  const Sophus::SE3d step = Sophus::SE3d::exp(tangent);
+  const Eigen::Vector3d recovered = step.log().head<3>() / dt;
+  const Eigen::Vector3d naive = step.so3().inverse() * step.translation() / dt;
+  EXPECT_NEAR(recovered.x(), velocity.x(), 1e-9);
+  EXPECT_NEAR(recovered.y(), velocity.y(), 1e-9);
+  EXPECT_NEAR(recovered.z(), velocity.z(), 1e-9);
+  EXPECT_GT(std::abs(naive.y() - velocity.y()), 0.5);
 }
 
 TEST(InertialCorrection, off_heading_velocity_is_pulled_onto_the_matched_forward_axis)
@@ -464,8 +523,7 @@ TEST(InertialCorrection, off_heading_velocity_is_pulled_onto_the_matched_forward
   const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(10.0, 0.0, 0.0));
   const Eigen::Vector3d velocity(speed * std::cos(angle), speed * std::sin(angle), 0.0);
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, velocity, Eigen::Vector3d::Zero(), 1.0, 0.1, 0.02,
-    0.5);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, velocity, Sophus::SE3d(), 1.0, 0.1, 0.02, 0.5);
   const double blended = 0.5 * velocity.x() + 0.5 * 10.0;
   EXPECT_NEAR(correction.velocity_world.x(), blended, 1e-9);
   EXPECT_NEAR(correction.velocity_world.y(), 0.0, 1e-12);
@@ -473,13 +531,14 @@ TEST(InertialCorrection, off_heading_velocity_is_pulled_onto_the_matched_forward
   EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
 }
 
-TEST(InertialCorrection, lateral_displacement_does_not_enter_velocity_or_accel_bias)
+TEST(InertialCorrection, lateral_displacement_sets_lateral_velocity_but_not_accel_bias)
 {
   const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(0.0, 1.0, 0.0));
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-    1.0, 0.1, 0.02, 0.5);
-  EXPECT_NEAR(correction.velocity_world.norm(), 0.0, 1e-12);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d::Zero(), Sophus::SE3d(), 1.0, 0.1,
+    0.02, 0.5);
+  EXPECT_NEAR(correction.velocity_world.x(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.velocity_world.y(), 1.0, 1e-9);
   EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
 }
 
@@ -487,8 +546,8 @@ TEST(InertialCorrection, extra_positive_yaw_increases_gyro_bias)
 {
   const Sophus::SE3d vehicle_delta(Sophus::SO3d::rotZ(-0.002), Eigen::Vector3d::Zero());
   const InertialCorrection correction = inertial_correction_from_match(
-    vehicle_delta, Sophus::SO3d(), Sophus::SE3d(), Eigen::Vector3d(1.0, 0.0, 0.0),
-    Eigen::Vector3d::Zero(), 0.2, 0.1, 0.02, 0.5);
+    vehicle_delta, Sophus::SO3d(), Sophus::SE3d(), Eigen::Vector3d(1.0, 0.0, 0.0), Sophus::SE3d(),
+    0.2, 0.1, 0.02, 0.5);
   EXPECT_NEAR(correction.gyro_bias_delta.z(), 0.001, 1e-9);
   EXPECT_NEAR(correction.gyro_bias_delta.x(), 0.0, 1e-12);
   EXPECT_NEAR(correction.gyro_bias_delta.y(), 0.0, 1e-12);
@@ -1006,6 +1065,111 @@ TEST(SurfaceVoxelMap, incremental_update_matches_a_full_rebuild)
   EXPECT_TRUE(incremental.voxels.empty());
 }
 
+TEST(PlaneClass, ground_loses_planar_votes_and_the_axle_prior_holds_longitudinal_slip)
+{
+  Eigen::Matrix<double, 6, 6> ground = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> wall = Eigen::Matrix<double, 6, 6>::Zero();
+  ground(0, 0) = 40.0;
+  ground(2, 2) = 10.0;
+  ground(3, 3) = 4.0;
+  ground(4, 4) = 4.0;
+  wall(0, 0) = 8.0;
+  wall(1, 1) = 8.0;
+  wall(5, 5) = 2.0;
+  const Eigen::Matrix<double, 6, 6> other = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> ground_gradient = Eigen::Matrix<double, 6, 1>::Zero();
+  ground_gradient(0) = 4.0;
+  const Eigen::Matrix<double, 6, 1> wall_gradient = Eigen::Matrix<double, 6, 1>::Zero();
+  const Eigen::Matrix<double, 6, 1> other_gradient = Eigen::Matrix<double, 6, 1>::Zero();
+
+  CurveConstraint turning;
+  turning.yaw_rate = 0.2;
+  turning.axle_in_body = Eigen::Vector3d(-0.65, 0.0, -1.80);
+  turning.longitudinal_sigma = 0.08;
+  turning.xi_from_seed(0) = 0.2;
+
+  Eigen::Matrix<double, 6, 6> hessian;
+  Eigen::Matrix<double, 6, 1> gradient;
+  compose_class_system(
+    ground, wall, other, ground_gradient, wall_gradient, other_gradient, turning, hessian,
+    gradient);
+
+  const double prior = hessian(0, 0) - wall(0, 0);
+  EXPECT_GT(prior, 0.0);
+  EXPECT_NEAR(hessian(0, 4), turning.axle_in_body.z() * prior, 1e-6);
+  EXPECT_GT(hessian(2, 2), 0.0);
+  EXPECT_GT(gradient(0), 0.0);
+
+  CurveConstraint masked = turning;
+  masked.longitudinal_sigma = 0.0;
+  Eigen::Matrix<double, 6, 6> masked_hessian;
+  Eigen::Matrix<double, 6, 1> masked_gradient;
+  compose_class_system(
+    ground, wall, other, ground_gradient, wall_gradient, other_gradient, masked, masked_hessian,
+    masked_gradient);
+  EXPECT_NEAR(masked_hessian(0, 0), wall(0, 0), 1e-9);
+  EXPECT_NEAR(masked_hessian(2, 2), ground(2, 2), 1e-9);
+  EXPECT_NEAR(masked_gradient(0), 0.0, 1e-9);
+
+  CurveConstraint straight;
+  Eigen::Matrix<double, 6, 6> straight_hessian;
+  Eigen::Matrix<double, 6, 1> straight_gradient;
+  compose_class_system(
+    ground, wall, other, ground_gradient, wall_gradient, other_gradient, straight,
+    straight_hessian, straight_gradient);
+  EXPECT_GT(straight_hessian(0, 0), wall(0, 0));
+}
+
+TEST(PlaneClass, ground_scale_matches_wall_weight)
+{
+  EXPECT_DOUBLE_EQ(ground_balance_scale(0.0, 4.0), 1.0);
+  EXPECT_DOUBLE_EQ(ground_balance_scale(2.0, 8.0), 4.0);
+  EXPECT_DOUBLE_EQ(ground_balance_scale(1.0, 100.0), 20.0);
+  EXPECT_EQ(classify_plane_normal(0.99), PlaneClass::Ground);
+  EXPECT_EQ(classify_plane_normal(0.1), PlaneClass::Wall);
+}
+
+TEST(PlaneIcp, wall_heavy_pitched_ground_recovers_pitch)
+{
+  constexpr double voxel_size = 0.5;
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  std::vector<Eigen::Vector3d> world;
+  for (int ix = -6; ix <= 6; ++ix) {
+    for (int iy = -6; iy <= 6; ++iy) {
+      world.emplace_back(0.5 * ix, 0.5 * iy, 0.0);
+    }
+  }
+  for (int iz = 0; iz <= 8; ++iz) {
+    for (int iy = -6; iy <= 6; ++iy) {
+      const double y = 0.5 * iy;
+      const double z = 0.4 * iz;
+      world.emplace_back(-4.0, y, z);
+      world.emplace_back(4.0, y, z);
+      world.emplace_back(y, -4.0, z);
+      world.emplace_back(y, 4.0, z);
+    }
+  }
+  map.AddPoints(world);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = voxel_size;
+  surface.rebuild_from(map);
+
+  const Sophus::SO3d pitch = Sophus::SO3d::rotY(0.02);
+  std::vector<Eigen::Vector3d> source;
+  source.reserve(world.size());
+  for (const Eigen::Vector3d & point : world) {
+    source.push_back(pitch.inverse() * point);
+  }
+  PlaneIcpParams params;
+  params.max_iterations = 40;
+  params.convergence_criterion = 1.0e-4;
+  const PlaneIcpResult result =
+    align_to_surface(source, map, surface, Sophus::SE3d(), params);
+  EXPECT_NEAR(result.pose.so3().log().y(), 0.02, 0.01);
+  EXPECT_LT(std::abs(result.pose.so3().log().x()), 0.01);
+  EXPECT_LT(std::abs(result.pose.so3().log().z()), 0.01);
+}
+
 TEST(PlaneIcp, align_to_surface_recovers_a_shifted_corner)
 {
   constexpr double voxel_size = 0.25;
@@ -1076,6 +1240,57 @@ TEST(LocalizationHealth, timeouts_degrade_without_counting_as_rejects)
   // Saturated is accepted but must not feed the biases.
   state = advance_localization_health(state, HealthEvent::Saturated, 3);
   EXPECT_FALSE(state.update_bias);
+}
+
+TEST(SweepDeskew, sixty_four_buckets_stay_within_a_centimetre_at_forty_metres)
+{
+  Eigen::Matrix<double, 6, 1> xi;
+  xi << 0.15, -0.08, 0.01, 0.002, -0.003, 1.5 * 3.14159265358979323846 / 180.0;
+  const Eigen::Vector3d point(35.0, 20.0, 2.0);
+  double max_error = 0.0;
+  for (int sample = 0; sample < 1000; ++sample) {
+    const double tau = static_cast<double>(sample) / 999.0;
+    std::vector<Eigen::Vector3d> deskewed;
+    apply_sweep_residual_deskew(
+      {point}, {static_cast<float>(tau)}, xi, deskewed);
+    const Eigen::Vector3d exact = Sophus::SE3d::exp((tau - 1.0) * xi) * point;
+    max_error = std::max(max_error, (deskewed[0] - exact).norm());
+  }
+  EXPECT_GT(max_error, 0.001);
+  EXPECT_LT(max_error, 0.010);
+  std::vector<Eigen::Vector3d> at_end;
+  apply_sweep_residual_deskew({point}, {1.0F}, xi, at_end);
+  EXPECT_LT((at_end[0] - point).norm(), 1.0e-9);
+}
+
+TEST(PlaneClass, one_sided_wall_loosens_the_weak_planar_direction)
+{
+  Eigen::Matrix<double, 6, 6> wall = Eigen::Matrix<double, 6, 6>::Zero();
+  wall(0, 0) = 1.0e6;
+  wall(1, 1) = 1.0e-8;
+  wall(5, 5) = 1.0e6 * 225.0;
+  const Eigen::Matrix3d straight = adaptive_planar_covariance(wall, 0.08, 0.9, 0.0);
+  EXPECT_LT(straight(0, 0), straight(1, 1));
+  EXPECT_GT(straight(1, 1), 0.5);
+  EXPECT_GE(straight(2, 2), 0.015 * 0.015 - 1.0e-12);
+  EXPECT_LE(straight(2, 2), 0.12 * 0.12 + 1.0e-12);
+
+  // A moderate eigenvalue sits inside the variance clamps, so a turn can still inflate it.
+  Eigen::Matrix<double, 6, 6> moderate = Eigen::Matrix<double, 6, 6>::Zero();
+  moderate(0, 0) = 0.18;
+  moderate(1, 1) = 0.18;
+  moderate(5, 5) = 0.18 * 225.0;
+  const Eigen::Matrix3d cruising = adaptive_planar_covariance(moderate, 0.08, 0.9, 0.0);
+  const Eigen::Matrix3d turning = adaptive_planar_covariance(moderate, 0.08, 0.5, 0.15);
+  EXPECT_GT(turning.trace(), cruising.trace());
+
+  const std::array<double, 36> pose =
+    pose_covariance_with_planar(straight, 1.5707963267948966, 0.64, 0.04);
+  EXPECT_NEAR(pose[0], straight(1, 1), 1.0e-9);
+  EXPECT_NEAR(pose[7], straight(0, 0), 1.0e-9);
+  EXPECT_DOUBLE_EQ(pose[14], 0.64);
+  EXPECT_DOUBLE_EQ(pose[21], 0.04);
+  EXPECT_DOUBLE_EQ(pose[28], 0.04);
 }
 
 }  // namespace back_odom

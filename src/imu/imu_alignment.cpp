@@ -27,7 +27,9 @@ constexpr double k_min_plausible_gravity = 8.0;
 constexpr double k_max_plausible_gravity = 11.0;
 constexpr double k_pi = 3.14159265358979323846;
 
-Sophus::SO3d rotation_aligning_vectors(const Eigen::Vector3d & from, const Eigen::Vector3d & to)
+}  // namespace
+
+Sophus::SO3d rotation_aligning_directions(const Eigen::Vector3d & from, const Eigen::Vector3d & to)
 {
   const double cos_theta = from.dot(to);
   const Eigen::Vector3d axis = from.cross(to);
@@ -47,8 +49,6 @@ Sophus::SO3d rotation_aligning_vectors(const Eigen::Vector3d & from, const Eigen
   return Sophus::SO3d(quaternion);
 }
 
-}  // namespace
-
 Sophus::SO3d compute_initial_alignment(const std::vector<Eigen::Vector3d> & linear_accelerations)
 {
   if (linear_accelerations.empty()) {
@@ -65,7 +65,7 @@ Sophus::SO3d compute_initial_alignment(const std::vector<Eigen::Vector3d> & line
     throw std::invalid_argument("mean linear acceleration is too small to define an up direction");
   }
   acceleration_mean.normalize();
-  return rotation_aligning_vectors(acceleration_mean, -Eigen::Vector3d::UnitZ());
+  return rotation_aligning_directions(acceleration_mean, -Eigen::Vector3d::UnitZ());
 }
 
 ImuSample to_right_handed_imu(const ImuSample & sample)

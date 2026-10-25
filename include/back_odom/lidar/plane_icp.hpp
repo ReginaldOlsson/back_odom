@@ -37,6 +37,12 @@ struct PlaneIcpParams
   double kernel_scale{0.5};
   int max_iterations{20};
   double convergence_criterion{1.0e-3};
+  /// |yaw rate| above about 0.1 rad/s gives the ground block only z, roll, and pitch.
+  double yaw_rate{0.0};
+  /// Rear axle in the body frame. Used with `longitudinal_sigma` as a soft along-track prior.
+  Eigen::Vector3d axle_in_body{Eigen::Vector3d::Zero()};
+  /// Non-positive disables the rear-axle prior and leaves the post-solve clamp in charge.
+  double longitudinal_sigma{0.0};
 };
 
 [[nodiscard]] inline double correspondence_distance_for_iteration(
@@ -48,6 +54,22 @@ struct PlaneIcpParams
     return params.coarse_correspondence_distance;
   }
   return params.max_correspondence_distance;
+}
+
+/// Coarse iterations accept smeared walls, then the kernel tightens after each residual deskew.
+[[nodiscard]] inline double kernel_scale_for_iteration(
+  const PlaneIcpParams & params, const int iteration, const bool residual_deskew)
+{
+  if (!residual_deskew) {
+    return params.kernel_scale;
+  }
+  if (iteration < 2) {
+    return params.kernel_scale < 1.5 ? 1.5 : params.kernel_scale;
+  }
+  if (iteration < 4) {
+    return params.kernel_scale < 0.8 ? 0.8 : params.kernel_scale;
+  }
+  return params.kernel_scale;
 }
 
 struct PlaneIcpResult
@@ -70,6 +92,12 @@ struct PlaneIcpResult
   bool saturated{false};
   /// Final 6x6 normal matrix (body frame), for downstream covariance / observability use.
   Eigen::Matrix<double, 6, 6> hessian{Eigen::Matrix<double, 6, 6>::Zero()};
+  /// Wall block before the ground mask and the axle prior. Feeds the planar pose covariance.
+  Eigen::Matrix<double, 6, 6> wall_hessian{Eigen::Matrix<double, 6, 6>::Zero()};
+  /// Weighted RMS of the point-to-plane residual at the last system, in metres.
+  double robust_rms{0.08};
+  /// Wall correspondences divided by all plane correspondences.
+  double wall_inlier_fraction{0.0};
 };
 
 /// Point-to-plane ICP. Closest point from `map`, plane normal from the `surface` cache of the
@@ -77,7 +105,8 @@ struct PlaneIcpResult
 [[nodiscard]] PlaneIcpResult align_to_surface(
   const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const Sophus::SE3d & initial_guess, const PlaneIcpParams & params,
-  const std::chrono::steady_clock::time_point * deadline = nullptr);
+  const std::chrono::steady_clock::time_point * deadline = nullptr,
+  const std::vector<float> * tau = nullptr);
 
 /// Mean robust plane cost at `pose` with the same association as align_to_surface.
 [[nodiscard]] double surface_plane_cost(

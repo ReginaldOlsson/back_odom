@@ -34,6 +34,11 @@ struct ImuSample
 struct ProcessorParams
 {
   std::size_t alignment_sample_count{100};
+  /// When `alignment_max_duration` is positive, align after a stationary span of that many
+  /// seconds, or when motion starts after `alignment_min_duration`. Zero keeps the fixed
+  /// sample-count window.
+  double alignment_min_duration{0.0};
+  double alignment_max_duration{0.0};
   double stationary_gyro_thresh{0.05};
   double stationary_accel_dev_thresh{0.5};
   double gravity{9.81};

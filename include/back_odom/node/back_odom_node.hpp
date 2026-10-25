@@ -64,6 +64,10 @@ public:
 private:
   void callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void callback_ekf_twist(const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg);
+  void callback_ekf_pose(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+  [[nodiscard]] Sophus::SO3d lidar_tilt_from_ground(
+    const std::vector<Eigen::Vector3d> & points, const Sophus::SO3d & base_from_lidar,
+    const Eigen::Vector3d & specific_force) const;
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void callback_ground_truth(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
   /// Requires state_mutex_. Locks map_from_local_ on the earliest ground-truth stamp the IMU covers.
@@ -85,7 +89,8 @@ private:
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & publisher,
     const ProcessorOutput & output, const rclcpp::Time & stamp);
   void publish_twist(const ProcessorOutput & output, const rclcpp::Time & stamp);
-  void publish_pose(const ProcessorOutput & output, const rclcpp::Time & stamp);
+  void publish_pose(
+    const ProcessorOutput & output, const rclcpp::Time & stamp, const MatchResult * matched = nullptr);
   [[nodiscard]] LidarScan scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cloud) const;
   [[nodiscard]] bool base_from_frame(
     const std::string & source_frame, Sophus::SE3d & target_from_source);
@@ -115,6 +120,7 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr ekf_twist_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr ekf_pose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr ground_truth_sub_;
   rclcpp::TimerBase::SharedPtr map_timer_;
@@ -167,6 +173,13 @@ private:
   /// Body twists from the RI-EKF. Never acquire state_mutex_ while holding this.
   std::mutex twist_mutex_;
   std::deque<BodyTwistSample> ekf_twists_;
+  bool use_ekf_pose_prior_{false};
+  std::string ekf_pose_topic_{"/debug/odom_pose"};
+  /// Odom-frame EKF poses. Never acquire state_mutex_ or twist_mutex_ while holding this.
+  std::mutex pose_mutex_;
+  std::deque<StampedPose> ekf_poses_;
+  Sophus::SO3d lidar_tilt_{};
+  bool lidar_tilt_set_{false};
   bool pointcloud_reliable_{true};
   std::string parent_frame_;
   std::string child_frame_;
@@ -174,6 +187,9 @@ private:
   double previous_angular_velocity_stamp_{0.0};
   bool has_previous_angular_velocity_{false};
   std::size_t alignment_sample_count_{100};
+  double alignment_min_duration_{0.0};
+  double alignment_max_duration_{0.0};
+  double pose_tilt_noise_scale_{0.0};
   std::size_t path_max_poses_{1000};
   double imu_max_pair_dt_{0.05};
   double imu_wait_timeout_{0.5};

@@ -15,6 +15,7 @@
 #ifndef BACK_ODOM__IMU_PROCESSOR_HPP_
 #define BACK_ODOM__IMU_PROCESSOR_HPP_
 
+#include "back_odom/imu/imu_alignment.hpp"
 #include "back_odom/imu/imu_dead_reckoning.hpp"
 #include "back_odom/imu/imu_types.hpp"
 
@@ -56,6 +57,8 @@ public:
     double since_stamp);
   [[nodiscard]] Eigen::Vector3d gyro_bias() const;
   [[nodiscard]] Eigen::Vector3d accel_bias() const;
+  /// Mean specific force of the stationary window that finished alignment. Level reads about -g on z.
+  [[nodiscard]] Eigen::Vector3d alignment_specific_force() const;
   void set_gyro_bias(const Eigen::Vector3d & gyro_bias);
   void set_accel_bias(const Eigen::Vector3d & accel_bias);
 
@@ -65,8 +68,13 @@ private:
   [[nodiscard]] ProcessorOutput process_tracking(const ImuSample & sample);
   [[nodiscard]] ProcessorOutput make_tracking_output(const ImuSample & sample) const;
 
+  void begin_tracking(const AlignmentResult & alignment, double origin_stamp);
+  [[nodiscard]] ProcessorOutput process_collecting_count(const ImuSample & sample);
+  [[nodiscard]] ProcessorOutput process_collecting_duration(const ImuSample & sample);
+
   ProcessorParams params_;
   std::vector<ImuSample> window_;
+  Eigen::Vector3d alignment_specific_force_{Eigen::Vector3d::Zero()};
   std::optional<ImuDeadReckoning> dead_reckoning_;
   std::vector<StampedPose> trajectory_;
   double previous_stamp_{0.0};

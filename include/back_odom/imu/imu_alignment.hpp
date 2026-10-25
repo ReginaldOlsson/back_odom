@@ -33,6 +33,10 @@ struct AlignmentResult
   double gravity{9.81};
 };
 
+/// Smallest rotation that maps `from` onto `to`. Both vectors are normalized inside.
+[[nodiscard]] Sophus::SO3d rotation_aligning_directions(
+  const Eigen::Vector3d & from, const Eigen::Vector3d & to);
+
 /// Rotation that maps the mean acceleration onto world -Z (gravity).
 /// Body +Z stays parallel to map +Z when the vehicle is level.
 [[nodiscard]] Sophus::SO3d compute_initial_alignment(

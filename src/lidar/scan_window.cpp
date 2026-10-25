@@ -14,6 +14,8 @@
 
 #include "back_odom/lidar/scan_window.hpp"
 
+#include "back_odom/lidar/plane_class.hpp"
+
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 
 #include <Eigen/Dense>
@@ -74,6 +76,44 @@ bool estimate_plane(const std::vector<Eigen::Vector3d> & neighbors, Eigen::Vecto
   return true;
 }
 
+void add_classed_plane(
+  Eigen::Matrix<double, 6, 6> & ground_h, Eigen::Matrix<double, 6, 6> & wall_h,
+  Eigen::Matrix<double, 6, 6> & other_h, Eigen::Matrix<double, 6, 1> & ground_g,
+  Eigen::Matrix<double, 6, 1> & wall_g, Eigen::Matrix<double, 6, 1> & other_g, double & ground_weight,
+  double & wall_weight, const Eigen::Matrix<double, 1, 6> & jacobian, const double weight,
+  const double residual, const PlaneClass kind)
+{
+  const Eigen::Matrix<double, 6, 6> term = jacobian.transpose() * weight * jacobian;
+  const Eigen::Matrix<double, 6, 1> grad = jacobian.transpose() * weight * residual;
+  if (kind == PlaneClass::Ground) {
+    ground_h += term;
+    ground_g += grad;
+    ground_weight += weight;
+  } else if (kind == PlaneClass::Wall) {
+    wall_h += term;
+    wall_g += grad;
+    wall_weight += weight;
+  } else {
+    other_h += term;
+    other_g += grad;
+  }
+}
+
+void commit_balanced(
+  Eigen::Matrix<double, 6, 6> & hessian, Eigen::Matrix<double, 6, 1> & gradient,
+  const Eigen::Matrix<double, 6, 6> & ground_h, const Eigen::Matrix<double, 6, 6> & wall_h,
+  const Eigen::Matrix<double, 6, 6> & other_h, const Eigen::Matrix<double, 6, 1> & ground_g,
+  const Eigen::Matrix<double, 6, 1> & wall_g, const Eigen::Matrix<double, 6, 1> & other_g)
+{
+  Eigen::Matrix<double, 6, 6> combined = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> combined_gradient = Eigen::Matrix<double, 6, 1>::Zero();
+  compose_class_system(
+    ground_h, wall_h, other_h, ground_g, wall_g, other_g, CurveConstraint{}, combined,
+    combined_gradient);
+  hessian += combined;
+  gradient += combined_gradient;
+}
+
 void accumulate_scan(
   Eigen::MatrixXd & hessian, Eigen::VectorXd & gradient, const int pose_index,
   const std::vector<Eigen::Vector3d> & points, const Sophus::SE3d & pose,
@@ -82,6 +122,14 @@ void accumulate_scan(
 {
   const int offset = 6 * pose_index;
   const double kernel2 = kernel_scale * kernel_scale;
+  Eigen::Matrix<double, 6, 6> ground_h = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> wall_h = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> other_h = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> ground_g = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> wall_g = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> other_g = Eigen::Matrix<double, 6, 1>::Zero();
+  double ground_weight = 0.0;
+  double wall_weight = 0.0;
   for (const Eigen::Vector3d & point_body : points) {
     const Eigen::Vector3d point_world = pose * point_body;
     std::vector<Eigen::Vector3d> neighbors;
@@ -115,9 +163,16 @@ void accumulate_scan(
     jacobian.block<1, 3>(0, 3) = point_body.cross(normal_body).transpose();
     const double denom = kernel_scale + residual * residual;
     const double weight = kernel2 / (denom * denom);
-    hessian.block<6, 6>(offset, offset) += jacobian.transpose() * weight * jacobian;
-    gradient.segment<6>(offset) += jacobian.transpose() * weight * residual;
+    add_classed_plane(
+      ground_h, wall_h, other_h, ground_g, wall_g, other_g, ground_weight, wall_weight, jacobian,
+      weight, residual, classify_plane_normal(normal.z()));
   }
+  Eigen::Matrix<double, 6, 6> balanced = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> balanced_gradient = Eigen::Matrix<double, 6, 1>::Zero();
+  commit_balanced(
+    balanced, balanced_gradient, ground_h, wall_h, other_h, ground_g, wall_g, other_g);
+  hessian.block<6, 6>(offset, offset) += balanced;
+  gradient.segment<6>(offset) += balanced_gradient;
 }
 
 Eigen::Matrix<double, 6, 6> imu_weight()
@@ -539,6 +594,14 @@ Sophus::SE3d refine_one_pose(
     Eigen::Matrix<double, 6, 6> hessian = Eigen::Matrix<double, 6, 6>::Zero();
     Eigen::Matrix<double, 6, 1> gradient = Eigen::Matrix<double, 6, 1>::Zero();
     if (params.kernel_scale > 0.0) {
+      Eigen::Matrix<double, 6, 6> ground_h = Eigen::Matrix<double, 6, 6>::Zero();
+      Eigen::Matrix<double, 6, 6> wall_h = Eigen::Matrix<double, 6, 6>::Zero();
+      Eigen::Matrix<double, 6, 6> other_h = Eigen::Matrix<double, 6, 6>::Zero();
+      Eigen::Matrix<double, 6, 1> ground_g = Eigen::Matrix<double, 6, 1>::Zero();
+      Eigen::Matrix<double, 6, 1> wall_g = Eigen::Matrix<double, 6, 1>::Zero();
+      Eigen::Matrix<double, 6, 1> other_g = Eigen::Matrix<double, 6, 1>::Zero();
+      double ground_weight = 0.0;
+      double wall_weight = 0.0;
       for (const Eigen::Vector3d & point_body : points) {
         const Eigen::Vector3d point_world = pose * point_body;
         Eigen::Vector3d mean = Eigen::Vector3d::Zero();
@@ -553,9 +616,12 @@ Sophus::SE3d refine_one_pose(
         jacobian.block<1, 3>(0, 3) = point_body.cross(normal_body).transpose();
         const double denom = params.kernel_scale + residual * residual;
         const double weight = kernel2 / (denom * denom);
-        hessian += jacobian.transpose() * weight * jacobian;
-        gradient += jacobian.transpose() * weight * residual;
+        add_classed_plane(
+          ground_h, wall_h, other_h, ground_g, wall_g, other_g, ground_weight, wall_weight, jacobian,
+          weight, residual, classify_plane_normal(normal.z()));
       }
+      commit_balanced(
+        hessian, gradient, ground_h, wall_h, other_h, ground_g, wall_g, other_g);
     }
     add_right_factor(hessian, gradient, pose, prior_weight, [&](const Sophus::SE3d & value) {
       return (prior.inverse() * value).log();

@@ -41,6 +41,9 @@ namespace
 
 constexpr int k_threads = 128;
 constexpr int k_max_blocks = 1024;
+// Same gates as plane_class.hpp: cos(15°) ground, sin(15°) wall.
+constexpr double kGroundNormalZ = 0.9659258262890683;
+constexpr double kWallNormalZ = 0.25881904510252074;
 constexpr double k_sophus_epsilon_sq = 1.0e-20;
 constexpr std::uint64_t k_outside_key = ~0ULL;
 
@@ -353,7 +356,57 @@ struct Partial
   double jtr[6];
   int correspondences;
   double cost;
+  double ground_jtj[21];
+  double ground_jtr[6];
+  double ground_weight;
+  int ground_count;
+  double wall_jtj[21];
+  double wall_jtr[6];
+  double wall_weight;
+  int wall_count;
 };
+
+__device__ int device_plane_kind(const double normal_z)
+{
+  const double abs_z = fabs(normal_z);
+  if (abs_z >= kGroundNormalZ) {
+    return 2;
+  }
+  if (abs_z <= kWallNormalZ) {
+    return 1;
+  }
+  return 0;
+}
+
+template <int Threads>
+__device__ void reduce_upper(
+  const double jtj[21], const double jtr[6], const double weight, const int count,
+  double shared_jtj[][21], double shared_jtr[][6], double shared_weight[], int shared_count[])
+{
+  const int thread = threadIdx.x;
+  for (int item = 0; item < 21; ++item) {
+    shared_jtj[thread][item] = jtj[item];
+  }
+  for (int item = 0; item < 6; ++item) {
+    shared_jtr[thread][item] = jtr[item];
+  }
+  shared_weight[thread] = weight;
+  shared_count[thread] = count;
+  __syncthreads();
+  for (int stride = Threads / 2; stride > 0; stride >>= 1) {
+    if (thread < stride) {
+      for (int item = 0; item < 21; ++item) {
+        shared_jtj[thread][item] += shared_jtj[thread + stride][item];
+      }
+      for (int item = 0; item < 6; ++item) {
+        shared_jtr[thread][item] += shared_jtr[thread + stride][item];
+      }
+      shared_weight[thread] += shared_weight[thread + stride];
+      shared_count[thread] += shared_count[thread + stride];
+    }
+    __syncthreads();
+  }
+}
 
 /// Closest map point in the 27-voxel neighbourhood (float ranking), plane from that voxel's
 /// cached normal, residual and Jacobian in double. Same association as align_to_surface.
@@ -364,6 +417,14 @@ __global__ void plane_kernel(
   double kernel_scale, Partial * partials)
 {
   Partial local{};
+  double ground_jtj[21] = {};
+  double ground_jtr[6] = {};
+  double ground_weight = 0.0;
+  int ground_count = 0;
+  double wall_jtj[21] = {};
+  double wall_jtr[6] = {};
+  double wall_weight = 0.0;
+  int wall_count = 0;
   const double kernel2 = kernel_scale * kernel_scale;
   const float max_distance_sq = static_cast<float>(max_distance * max_distance);
   for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < frame_count;
@@ -437,57 +498,101 @@ __global__ void plane_kernel(
       body[0] * normal_body[1] - body[1] * normal_body[0]};
     const double weight = kernel2 / (denom * denom);
     ++local.correspondences;
+    const int kind = device_plane_kind(normal[2]);
+    double * class_jtj = local.jtj;
+    double * class_jtr = local.jtr;
+    if (kind == 2) {
+      class_jtj = ground_jtj;
+      class_jtr = ground_jtr;
+      ground_weight += weight;
+      ++ground_count;
+    } else if (kind == 1) {
+      class_jtj = wall_jtj;
+      class_jtr = wall_jtr;
+      wall_weight += weight;
+      ++wall_count;
+    }
     for (int row = 0; row < 6; ++row) {
-      local.jtr[row] += jacobian[row] * weight * residual;
+      class_jtr[row] += jacobian[row] * weight * residual;
       for (int col = row; col < 6; ++col) {
-        local.jtj[upper_index(row, col)] += weight * jacobian[row] * jacobian[col];
+        class_jtj[upper_index(row, col)] += weight * jacobian[row] * jacobian[col];
       }
     }
   }
 
   __shared__ double shared_jtj[k_threads][21];
   __shared__ double shared_jtr[k_threads][6];
+  __shared__ double shared_weight[k_threads];
   __shared__ int shared_count[k_threads];
   __shared__ double shared_cost[k_threads];
   const int thread = threadIdx.x;
-  for (int item = 0; item < 21; ++item) {
-    shared_jtj[thread][item] = local.jtj[item];
-  }
-  for (int item = 0; item < 6; ++item) {
-    shared_jtr[thread][item] = local.jtr[item];
-  }
-  shared_count[thread] = local.correspondences;
   shared_cost[thread] = local.cost;
   __syncthreads();
   for (int stride = k_threads / 2; stride > 0; stride >>= 1) {
     if (thread < stride) {
-      for (int item = 0; item < 21; ++item) {
-        shared_jtj[thread][item] += shared_jtj[thread + stride][item];
-      }
-      for (int item = 0; item < 6; ++item) {
-        shared_jtr[thread][item] += shared_jtr[thread + stride][item];
-      }
-      shared_count[thread] += shared_count[thread + stride];
       shared_cost[thread] += shared_cost[thread + stride];
     }
     __syncthreads();
   }
+  const double reduced_cost = shared_cost[0];
+
+  reduce_upper<k_threads>(
+    local.jtj, local.jtr, 0.0, local.correspondences, shared_jtj, shared_jtr, shared_weight,
+    shared_count);
+  double other_jtj[21];
+  double other_jtr[6];
+  int other_count = 0;
+  if (thread == 0) {
+    for (int item = 0; item < 21; ++item) {
+      other_jtj[item] = shared_jtj[0][item];
+    }
+    for (int item = 0; item < 6; ++item) {
+      other_jtr[item] = shared_jtr[0][item];
+    }
+    other_count = shared_count[0];
+  }
+  __syncthreads();
+
+  reduce_upper<k_threads>(
+    ground_jtj, ground_jtr, ground_weight, ground_count, shared_jtj, shared_jtr, shared_weight,
+    shared_count);
+  double reduced_ground_jtj[21];
+  double reduced_ground_jtr[6];
+  double reduced_ground_weight = 0.0;
+  int reduced_ground_count = 0;
+  if (thread == 0) {
+    for (int item = 0; item < 21; ++item) {
+      reduced_ground_jtj[item] = shared_jtj[0][item];
+    }
+    for (int item = 0; item < 6; ++item) {
+      reduced_ground_jtr[item] = shared_jtr[0][item];
+    }
+    reduced_ground_weight = shared_weight[0];
+    reduced_ground_count = shared_count[0];
+  }
+  __syncthreads();
+
+  reduce_upper<k_threads>(
+    wall_jtj, wall_jtr, wall_weight, wall_count, shared_jtj, shared_jtr, shared_weight, shared_count);
   if (thread == 0) {
     Partial & out = partials[blockIdx.x];
     for (int item = 0; item < 21; ++item) {
-      out.jtj[item] = shared_jtj[0][item];
+      out.jtj[item] = other_jtj[item];
+      out.ground_jtj[item] = reduced_ground_jtj[item];
+      out.wall_jtj[item] = shared_jtj[0][item];
     }
     for (int item = 0; item < 6; ++item) {
-      out.jtr[item] = shared_jtr[0][item];
+      out.jtr[item] = other_jtr[item];
+      out.ground_jtr[item] = reduced_ground_jtr[item];
+      out.wall_jtr[item] = shared_jtr[0][item];
     }
-    out.correspondences = shared_count[0];
-    out.cost = shared_cost[0];
+    out.correspondences = other_count;
+    out.cost = reduced_cost;
+    out.ground_weight = reduced_ground_weight;
+    out.ground_count = reduced_ground_count;
+    out.wall_weight = shared_weight[0];
+    out.wall_count = shared_count[0];
   }
-}
-
-int upper_host(int row, int col)
-{
-  return row * 6 - (row * (row - 1)) / 2 + (col - row);
 }
 
 struct FrontPoint
@@ -862,23 +967,20 @@ bool cuda_plane_system(
           cudaMemcpyDeviceToHost))) {
     return false;
   }
-  double upper[21] = {};
   for (const Partial & partial : g_plane.host_partials) {
     for (int item = 0; item < 21; ++item) {
-      upper[item] += partial.jtj[item];
+      system.other_jtj[item] += partial.jtj[item];
+      system.ground_jtj[item] += partial.ground_jtj[item];
+      system.wall_jtj[item] += partial.wall_jtj[item];
     }
     for (int item = 0; item < 6; ++item) {
-      system.jtr[item] += partial.jtr[item];
+      system.other_jtr[item] += partial.jtr[item];
+      system.ground_jtr[item] += partial.ground_jtr[item];
+      system.wall_jtr[item] += partial.wall_jtr[item];
     }
     system.correspondences += partial.correspondences;
+    system.wall_correspondences += partial.wall_count;
     system.robust_cost_sum += partial.cost;
-  }
-  for (int row = 0; row < 6; ++row) {
-    for (int col = row; col < 6; ++col) {
-      const double value = upper[upper_host(row, col)];
-      system.jtj[row * 6 + col] = value;
-      system.jtj[col * 6 + row] = value;
-    }
   }
   return true;
 }
@@ -954,11 +1056,12 @@ bool cuda_front_downsample(
   const double end_inverse_translation[3], const double body_rotation[9],
   const double body_translation[3], const double half_longitudinal, const double half_lateral,
   const double fine_voxel, const double coarse_voxel, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz, std::vector<int> & coarse_index)
 {
   fine_xyz.clear();
   fine_index.clear();
   coarse_xyz.clear();
+  coarse_index.clear();
   if (!cuda_available() || count <= 0 || !(fine_voxel > 0.0) || !(coarse_voxel > 0.0)) {
     return cuda_available() && count > 0 && fine_voxel > 0.0 && coarse_voxel > 0.0;
   }
@@ -1056,10 +1159,12 @@ bool cuda_front_downsample(
       return false;
     }
     coarse_xyz.reserve(coarse_host.size() * 3);
+    coarse_index.reserve(coarse_host.size());
     for (const FrontPoint & point : coarse_host) {
       coarse_xyz.push_back(point.x);
       coarse_xyz.push_back(point.y);
       coarse_xyz.push_back(point.z);
+      coarse_index.push_back(point.index);
     }
   } catch (const std::exception & error) {
     std::fprintf(stderr, "back_odom CUDA disabled after front downsample: %s\n", error.what());
@@ -1067,6 +1172,7 @@ bool cuda_front_downsample(
     fine_xyz.clear();
     fine_index.clear();
     coarse_xyz.clear();
+    coarse_index.clear();
     return false;
   }
   return true;

@@ -14,6 +14,9 @@
     parent_frame: "map"
     child_frame: "base_link"
     alignment_sample_count: 500
+    # Stationary window for gravity and the lidar roll/pitch residual. Motion still starts near 26 s.
+    alignment_min_duration: 2.0
+    alignment_max_duration: 20.0
     stationary_gyro_thresh: 0.05
     stationary_accel_dev_thresh: 0.5
     gravity: 9.81
@@ -93,6 +96,11 @@
     # body motion as the ICP initial guess. The IMU step is used when the twist does not cover
     # the interval (ekf_twist_max_gap) or the integrated motion exceeds the vehicle limits.
     use_ekf_twist_prior: true
+    # Off: the ri_ekf pose must not deskew the sweep or seed ICP, or lidar odometry tracks
+    # the filter. Deskew stays on the IMU trajectory. The seed is the last lidar pose plus
+    # the EKF body twist when that buffer covers the scan, otherwise the IMU step.
+    use_ekf_pose_prior: false
+    ekf_pose_topic: "/debug/odom_pose"
     ekf_twist_topic: "/ekf_twist_with_covariance"
     ekf_twist_max_gap: 0.05
     ekf_twist_horizon: 2.0
@@ -100,7 +108,10 @@
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
     speed_correction_gain: 0.5
-    # Lidar keeps lateral shift and yaw. Forward motion stays with the IMU inside this band.
+    # Rear axle in base_link. x/z follow the Boreas DMI lever (y is the axle center, z is up).
+    # longitudinal_sigma is the soft along-track trust region and replaces the hard x clamp.
+    rear_axle_in_base: [-0.65, 0.0, -1.80]
+    longitudinal_sigma: 0.08
     max_longitudinal_correction: 0.15
     max_gyro_bias: 0.05
     max_accel_bias: 1.0
@@ -117,14 +128,17 @@
     # mean NDT is below 2*max_ndt_cost and inliers stay above min_ndt_inlier_fraction.
     min_ndt_inlier_fraction: 0.5
     min_inlier_ratio: 0.3
-    # Full SE(3) pose and body velocity update the RI-EKF. Roll and pitch are 0.05 rad.
+    # Full SE(3) pose and body velocity update the RI-EKF.
     # Twist is in base_link and includes the lateral speed from yaw rate ahead of the rear axle.
     twist_variance_vx: 0.04
     twist_variance_vy: 0.01
     twist_variance_vz: 0.01
     twist_variance_wz: 0.01
-    # Horizontal position std 0.08 m, yaw std 0.02 rad. Vertical std stays looser at 0.25 m.
+    # Horizontal position std 0.08 m, yaw std 0.02 rad. These are the floors.
+    # The wall Hessian replaces x, y, and yaw per scan. z and roll/pitch stay at 100x so a
+    # tilted lidar altitude cannot pull the IMU off gravity.
     pose_variance_xy: 0.0064
-    pose_variance_z: 0.0625
-    pose_variance_roll_pitch: 0.0025
+    pose_variance_z: 0.64
+    pose_variance_roll_pitch: 0.04
     pose_variance_yaw: 0.0004
+    pose_tilt_noise_scale: 100.0

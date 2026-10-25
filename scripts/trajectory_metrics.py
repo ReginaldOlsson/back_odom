@@ -420,7 +420,8 @@ def format_report(report: EvalReport) -> str:
 # --- SE(3) evaluation against Boreas lidar ground truth -------------------------
 
 # sensor_kit_base_link -> lidar yaw. T_enu_base = T_enu_lidar * Rz(-this).
-DEFAULT_LIDAR_TO_BASE_YAW = -math.pi / 4.0
+# Calibrated mount: nominal -45 deg plus the +1.85 deg residual.
+DEFAULT_LIDAR_TO_BASE_YAW = -0.7531
 KITTI_LENGTHS_M: tuple[float, ...] = (100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0)
 KITTI_STEP = 10
 

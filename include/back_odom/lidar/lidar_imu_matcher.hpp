@@ -80,10 +80,14 @@ struct LidarMatchParams
   // Fraction of the vehicle-frame residual turned into a bias step each accepted scan.
   double gyro_bias_gain{0.1};
   double accel_bias_gain{0.02};
-  // How much of the speed comes from the lidar displacement. Direction stays with the IMU.
+  /// How much of the forward speed comes from the screw velocity of the accepted pose.
   double speed_correction_gain{0.5};
-  /// ICP may nudge the IMU step by at most this many metres along the vehicle.
-  /// Lateral shift and yaw stay with the lidar match.
+  /// Rear axle in the body frame. A positive `longitudinal_sigma` restrains along-track slip
+  /// there inside the normal equations.
+  Eigen::Vector3d axle_in_body{Eigen::Vector3d::Zero()};
+  double longitudinal_sigma{0.0};
+  /// Used while `longitudinal_sigma` is not positive. ICP may nudge the IMU step by at most
+  /// this many metres along the vehicle. Lateral shift and yaw stay with the lidar match.
   double max_longitudinal_correction{0.15};
   double max_gyro_bias{0.05};
   double max_accel_bias{1.0};
@@ -168,7 +172,7 @@ struct InertialCorrection
 [[nodiscard]] InertialCorrection inertial_correction_from_match(
   const Sophus::SE3d & vehicle_delta, const Sophus::SO3d & orientation_correction,
   const Sophus::SE3d & corrected_pose, const Eigen::Vector3d & imu_velocity_world,
-  const Eigen::Vector3d & previous_position, double dt, double gyro_bias_gain,
+  const Sophus::SE3d & previous_pose, double dt, double gyro_bias_gain,
   double accel_bias_gain, double speed_gain);
 
 struct MatchResult
@@ -206,6 +210,8 @@ struct MatchResult
   bool partial_used{false};
   /// The ICP seed was the lidar anchor composed with the integrated EKF body twist.
   bool ekf_twist_prior{false};
+  /// The ICP seed was the lidar anchor composed with the relative EKF pose.
+  bool ekf_pose_prior{false};
   bool refined_window{false};
   double refine_shift{0.0};
   int refine_scans{0};
@@ -216,6 +222,9 @@ struct MatchResult
   double cost_ms{0.0};
   double refine_ms{0.0};
   double map_ms{0.0};
+  /// Body-frame [x, y, yaw] covariance from the wall Hessian. z, roll, and pitch stay separate.
+  bool has_planar_covariance{false};
+  Eigen::Matrix3d planar_covariance{Eigen::Matrix3d::Zero()};
 };
 
 struct LocalMapPoint
@@ -236,6 +245,8 @@ struct ScanAlignment
   std::vector<Eigen::Vector3d> map_points;
   std::vector<float> map_intensities;
   std::vector<Eigen::Vector3d> source;
+  /// Normalized time of each source point. Empty skips in-loop residual deskew.
+  std::vector<float> source_tau;
   /// Seed pose used for ICP (lidar anchor plus EKF twist, or IMU motion when twist is missing).
   Sophus::SE3d predicted{};
   MatchCandidate candidate;
@@ -268,7 +279,8 @@ public:
   /// snapshot while the live integrator keeps going on another thread.
   [[nodiscard]] ScanAlignment align_scan(
     const LidarScan & scan, const ImuProcessor & imu,
-    const std::vector<BodyTwistSample> & body_twists = {});
+    const std::vector<BodyTwistSample> & body_twists = {},
+    const std::vector<StampedPose> & ekf_poses = {});
   /// Light half: apply the IMU correction and advance health. Map insertion is queued; call
   /// `flush_pending_insert` after releasing the IMU lock.
   [[nodiscard]] MatchResult commit_scan(ScanAlignment && alignment, ImuProcessor & imu);
@@ -277,7 +289,8 @@ public:
   /// align_scan, commit_scan, then flush_pending_insert.
   [[nodiscard]] MatchResult on_scan(
     const LidarScan & scan, ImuProcessor & imu,
-    const std::vector<BodyTwistSample> & body_twists = {});
+    const std::vector<BodyTwistSample> & body_twists = {},
+    const std::vector<StampedPose> & ekf_poses = {});
 
   /// The integrator crossed the speed limit. Hold the last healthy speed.
   void notify_speed_limit(ImuProcessor & imu);
@@ -292,6 +305,7 @@ private:
     std::vector<Eigen::Vector3d> map_points;
     std::vector<float> map_intensities;
     std::vector<Eigen::Vector3d> source;
+    std::vector<float> source_tau;
   };
 
   void apply_correction(
@@ -299,7 +313,8 @@ private:
     bool update_bias, const std::optional<Eigen::Vector3d> & velocity_override);
   [[nodiscard]] PlaneIcpResult align(
     const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
-    double max_correspondence_distance, const std::chrono::steady_clock::time_point * deadline);
+    double max_correspondence_distance, const std::chrono::steady_clock::time_point * deadline,
+    const std::vector<float> * tau);
   void hold_to_imu_prior(ImuProcessor & imu, const Sophus::SE3d & predicted, double scan_end);
   [[nodiscard]] PreparedClouds prepare_scan(
     const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing);
@@ -308,7 +323,7 @@ private:
   void note_health(ImuProcessor & imu, HealthEvent event);
   [[nodiscard]] MatchCandidate score_alignment(
     const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess, MatchResult & timing,
-    const std::chrono::steady_clock::time_point * deadline);
+    const std::chrono::steady_clock::time_point * deadline, const std::vector<float> * tau);
   [[nodiscard]] bool should_insert(const Sophus::SE3d & pose) const;
   void queue_insert(
     const Sophus::SE3d & pose, double stamp, std::vector<Eigen::Vector3d> && points,
@@ -366,7 +381,8 @@ private:
   double anchor_stamp_{0.0};
   Sophus::SE3d last_keyframe_pose_{};
   double last_correction_stamp_{0.0};
-  Eigen::Vector3d last_correction_position_{Eigen::Vector3d::Zero()};
+  Sophus::SE3d last_correction_pose_{};
+  double seed_yaw_rate_{0.0};
   Eigen::Vector3d gyro_bias_prior_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d accel_bias_prior_{Eigen::Vector3d::Zero()};
   bool has_bias_prior_{false};

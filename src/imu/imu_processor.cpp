@@ -47,6 +47,13 @@ ImuProcessor::ImuProcessor(const ProcessorParams & params) : params_(params)
   if (!(params_.max_pair_dt > 0.0) || !std::isfinite(params_.max_pair_dt)) {
     throw std::invalid_argument("max_pair_dt must be positive and finite");
   }
+  if (params_.alignment_max_duration > 0.0) {
+    if (
+      !(params_.alignment_min_duration >= 0.0) ||
+      params_.alignment_min_duration > params_.alignment_max_duration) {
+      throw std::invalid_argument("alignment_min_duration must sit inside alignment_max_duration");
+    }
+  }
 }
 
 ProcessorOutput ImuProcessor::process(const ImuSample & sample)
@@ -57,7 +64,34 @@ ProcessorOutput ImuProcessor::process(const ImuSample & sample)
   return process_tracking(sample);
 }
 
+void ImuProcessor::begin_tracking(const AlignmentResult & alignment, const double origin_stamp)
+{
+  Eigen::Vector3d mean_specific = Eigen::Vector3d::Zero();
+  for (const ImuSample & stored : window_) {
+    mean_specific += stored.linear_acceleration;
+  }
+  if (!window_.empty()) {
+    mean_specific /= static_cast<double>(window_.size());
+  }
+  alignment_specific_force_ = mean_specific;
+  dead_reckoning_.emplace(alignment.gravity);
+  dead_reckoning_->set_initial_orientation(alignment.orientation);
+  dead_reckoning_->set_gyro_bias(alignment.gyro_bias);
+  window_.clear();
+  has_previous_stamp_ = true;
+  previous_stamp_ = origin_stamp;
+  record_pose(origin_stamp);
+}
+
 ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
+{
+  if (params_.alignment_max_duration > 0.0) {
+    return process_collecting_duration(sample);
+  }
+  return process_collecting_count(sample);
+}
+
+ProcessorOutput ImuProcessor::process_collecting_count(const ImuSample & sample)
 {
   window_.push_back(sample);
   if (window_.size() > params_.alignment_sample_count) {
@@ -79,17 +113,53 @@ ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
   }
 
   const AlignmentResult alignment = align_stationary_window(window_, params_.gravity);
-  dead_reckoning_.emplace(alignment.gravity);
-  dead_reckoning_->set_initial_orientation(alignment.orientation);
-  dead_reckoning_->set_gyro_bias(alignment.gyro_bias);
-  window_.clear();
-  has_previous_stamp_ = true;
-  previous_stamp_ = sample.stamp;
-
+  begin_tracking(alignment, sample.stamp);
   output = make_tracking_output(sample);
   output.sample_count = params_.alignment_sample_count;
-  record_pose(sample.stamp);
   return output;
+}
+
+ProcessorOutput ImuProcessor::process_collecting_duration(const ImuSample & sample)
+{
+  auto collecting = [&](const std::size_t count) {
+    ProcessorOutput output;
+    output.phase = ProcessorPhase::Collecting;
+    output.aligned = false;
+    output.sample_count = count;
+    output.specific_force_body = sample.linear_acceleration;
+    output.angular_velocity_body = sample.angular_velocity;
+    output.gravity = params_.gravity;
+    return output;
+  };
+
+  window_.push_back(sample);
+  constexpr std::size_t k_max_window = 20000;
+  if (window_.size() > k_max_window) {
+    window_.erase(window_.begin(), window_.begin() + static_cast<std::ptrdiff_t>(window_.size() - k_max_window));
+  }
+  if (!is_stationary(window_, params_.stationary_gyro_thresh, params_.stationary_accel_dev_thresh)) {
+    window_.pop_back();
+    const double span =
+      window_.size() < 2 ? 0.0 : window_.back().stamp - window_.front().stamp;
+    if (window_.size() >= 2 && span + 1.0e-9 >= params_.alignment_min_duration) {
+      const ImuSample origin = window_.back();
+      const AlignmentResult alignment = align_stationary_window(window_, params_.gravity);
+      begin_tracking(alignment, origin.stamp);
+      return process_tracking(sample);
+    }
+    window_.clear();
+    return collecting(0);
+  }
+
+  const double span = window_.size() < 2 ? 0.0 : window_.back().stamp - window_.front().stamp;
+  if (window_.size() >= 2 && span + 1.0e-9 >= params_.alignment_max_duration) {
+    const AlignmentResult alignment = align_stationary_window(window_, params_.gravity);
+    begin_tracking(alignment, sample.stamp);
+    ProcessorOutput output = make_tracking_output(sample);
+    output.sample_count = params_.alignment_sample_count;
+    return output;
+  }
+  return collecting(window_.size());
 }
 
 ProcessorOutput ImuProcessor::process_tracking(const ImuSample & sample)
@@ -279,6 +349,11 @@ Eigen::Vector3d ImuProcessor::gyro_bias() const
     return Eigen::Vector3d::Zero();
   }
   return dead_reckoning_->gyro_bias();
+}
+
+Eigen::Vector3d ImuProcessor::alignment_specific_force() const
+{
+  return alignment_specific_force_;
 }
 
 Eigen::Vector3d ImuProcessor::accel_bias() const

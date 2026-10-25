@@ -51,9 +51,17 @@
 
     velocity_update:
       # Body vx, vy, and vz from /back_odom/twist_with_covariance, already in base_link.
-      # nonholonomic_stddev > 0 would replace vy and vz with zero; leave it at 0.
+      # Lateral and vertical velocity are pulled to zero. The stddev loosens to
+      # nonholonomic_stddev_max when stopped and tightens toward nonholonomic_stddev at speed.
       enable: true
-      nonholonomic_stddev: 0.0
+      nonholonomic_stddev: 0.05
+      nonholonomic_stddev_max: 0.5
+      nonholonomic_speed_scale: 2.0
+      # Rear-axle contact in base_link. x/z follow the Boreas DMI lever; y is the axle center.
+      # Lateral and vertical velocity are zero at this point, so a turn may keep vy at base_link.
+      nonholonomic_axle_in_base: [-0.65, 0.0, -1.80]
+      nonholonomic_centripetal_slip: 0.04
+      nonholonomic_vz_stddev: 0.08
 
     gnss_window:
       window_size: 50
@@ -69,11 +77,22 @@
       prior_stddev_z: 0.3
       yaw_lock_variance: 1.0e-12
 
+    zupt:
+      enable: true
+      duration: 0.3
+      velocity_stddev: 0.02
+      gyro_bias_stddev: 0.001
+      accel_bias_stddev: 0.05
+      speed_threshold: 0.3
+      accel_dev_threshold: 0.5
+
     initialization:
       static_init_duration: 0.5
       static_gyro_threshold: 0.05
-      # The aligned pose arrives after the vehicle is moving. Copy it into the state.
-      # Stationary IMU before that pose can still set the gyro bias and does not move position.
+      # Hold the first pose until this stationary window closes, or until motion after the minimum.
+      # Roll and pitch come from specific force. Yaw and position come from the pose.
+      gravity_window_duration: 20.0
+      gravity_window_min_duration: 2.0
       initialize_state_from_pose: true
       initial_stddev_xy: 1.0
       initial_stddev_z: 1.0

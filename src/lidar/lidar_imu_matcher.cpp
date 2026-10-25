@@ -17,6 +17,7 @@
 #include "back_odom/lidar/device_accel.hpp"
 #include "back_odom/lidar/lidar_preprocess.hpp"
 #include "back_odom/lidar/ndt_health.hpp"
+#include "back_odom/lidar/plane_class.hpp"
 #include "back_odom/lidar/plane_icp.hpp"
 #include "back_odom/lidar/scan_window.hpp"
 
@@ -189,21 +190,23 @@ bool similar_size(const std::size_t left, const std::size_t right, const double 
 InertialCorrection inertial_correction_from_match(
   const Sophus::SE3d & vehicle_delta, const Sophus::SO3d & orientation_correction,
   const Sophus::SE3d & corrected_pose, const Eigen::Vector3d & imu_velocity_world,
-  const Eigen::Vector3d & previous_position, const double dt, const double gyro_bias_gain,
+  const Sophus::SE3d & previous_pose, const double dt, const double gyro_bias_gain,
   const double accel_bias_gain, const double speed_gain)
 {
   InertialCorrection correction;
   const Eigen::Vector3d turned_velocity = orientation_correction * imu_velocity_world;
   const Sophus::SO3d & orientation = corrected_pose.so3();
   const Eigen::Vector3d imu_body = orientation.inverse() * turned_velocity;
-  // The matched heading owns the direction. Lateral IMU velocity is what pulls the next guess
-  // off the pose ICP just accepted.
-  Eigen::Vector3d velocity_body(imu_body.x(), 0.0, imu_body.z());
-  const Eigen::Vector3d displacement = corrected_pose.translation() - previous_position;
-  const Eigen::Vector3d disp_body = orientation.inverse() * displacement;
+  // log(T_prev^{-1} T) / dt is the constant body twist. Projecting the chord onto the final
+  // heading shortens the arc and invents an inward lateral speed.
+  Eigen::Vector3d screw_body = Eigen::Vector3d::Zero();
+  if (dt > 1.0e-3) {
+    screw_body = (previous_pose.inverse() * corrected_pose).log().head<3>() / dt;
+  }
+  Eigen::Vector3d velocity_body = screw_body;
   if (dt > 1e-3) {
-    velocity_body.x() = (1.0 - speed_gain) * imu_body.x() + speed_gain * (disp_body.x() / dt);
-    velocity_body.z() = (1.0 - speed_gain) * imu_body.z() + speed_gain * (disp_body.z() / dt);
+    velocity_body.x() = (1.0 - speed_gain) * imu_body.x() + speed_gain * screw_body.x();
+    velocity_body.z() = (1.0 - speed_gain) * imu_body.z() + speed_gain * screw_body.z();
   }
   correction.velocity_world = orientation * velocity_body;
   if (dt <= 1e-3) {
@@ -216,7 +219,7 @@ InertialCorrection inertial_correction_from_match(
     clamp_vector(-gyro_bias_gain * vehicle_delta.so3().log() / dt, k_max_gyro_bias_step);
 
   Eigen::Vector3d accel_error(
-    (imu_body.x() - disp_body.x() / dt) / dt, 0.0, (imu_body.z() - disp_body.z() / dt) / dt);
+    (imu_body.x() - screw_body.x()) / dt, 0.0, (imu_body.z() - screw_body.z()) / dt);
   correction.accel_bias_delta = clamp_vector(accel_bias_gain * accel_error, k_max_accel_bias_step);
   return correction;
 }
@@ -604,7 +607,8 @@ void LidarImuMatcher::insert_scan(
 }
 
 ScanAlignment LidarImuMatcher::align_scan(
-  const LidarScan & scan, const ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists)
+  const LidarScan & scan, const ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists,
+  const std::vector<StampedPose> & ekf_poses)
 {
   ScanAlignment alignment;
   MatchResult & result = alignment.result;
@@ -620,7 +624,12 @@ ScanAlignment LidarImuMatcher::align_scan(
     return alignment;
   }
   ++scan_count_;
-  PreparedClouds clouds = prepare_scan(scan, imu.trajectory(), result);
+  const auto [sweep_begin, sweep_end] =
+    std::minmax_element(scan.timestamps.cbegin(), scan.timestamps.cend());
+  const bool ekf_deskew = pose_buffer_covers(
+    ekf_poses, *sweep_begin, *sweep_end, params_.ekf_twist_max_gap);
+  PreparedClouds clouds = prepare_scan(
+    scan, ekf_deskew ? ekf_poses : imu.trajectory(), result);
   if (clouds.source.empty()) {
     result.skipped = true;
     result.skip_reason = "deskew/crop/voxel left no source points";
@@ -643,6 +652,7 @@ ScanAlignment LidarImuMatcher::align_scan(
   alignment.map_points = std::move(clouds.map_points);
   alignment.map_intensities = std::move(clouds.map_intensities);
   alignment.source = std::move(clouds.source);
+  alignment.source_tau = std::move(clouds.source_tau);
 
   if (!has_reference_) {
     alignment.first_scan = true;
@@ -659,19 +669,43 @@ ScanAlignment LidarImuMatcher::align_scan(
       anchor_stamp_ <= scan_end) {
     predicted = anchor_pose_ * (imu.interpolate_pose(anchor_stamp_).inverse() * imu_pose);
   }
-  // A covered EKF twist replaces that IMU step. The anchor stays the last lidar pose, so the
-  // filter's absolute frame cannot drag the seed off the local map.
-  if (const std::optional<Sophus::SE3d> motion = integrate_body_twist(
-        body_twists, anchor_stamp_, scan_end, params_.ekf_twist_max_gap)) {
+  // A covered EKF pose replaces that IMU step. The anchor stays the last lidar pose, so the
+  // filter's absolute frame cannot drag the seed off the local map. Twist is the fallback.
+  bool seeded_from_ekf = false;
+  seed_yaw_rate_ = 0.0;
+  if (pose_buffer_covers(ekf_poses, anchor_stamp_, scan_end, params_.ekf_twist_max_gap)) {
+    const Sophus::SE3d motion = interpolate_stamped_pose(ekf_poses, anchor_stamp_).inverse() *
+                                interpolate_stamped_pose(ekf_poses, scan_end);
     const double dt = std::max(0.0, scan_end - anchor_stamp_);
-    const double translation = motion->translation().norm();
-    const double rotation = motion->so3().log().norm();
+    const double translation = motion.translation().norm();
+    const double rotation = motion.so3().log().norm();
     if (
-      translation <= params_.limits.max_speed * dt + 1.0 &&
+      motion.matrix().allFinite() && translation <= params_.limits.max_speed * dt + 1.0 &&
       rotation <= params_.limits.max_yaw_rate * dt + 0.5) {
-      predicted = anchor_pose_ * *motion;
-      result.ekf_twist_prior = true;
+      predicted = anchor_pose_ * motion;
+      result.ekf_pose_prior = true;
+      seeded_from_ekf = true;
+      seed_yaw_rate_ = motion.so3().log().z() / std::max(dt, 1.0e-3);
     }
+  }
+  if (!seeded_from_ekf) {
+    if (const std::optional<Sophus::SE3d> motion = integrate_body_twist(
+          body_twists, anchor_stamp_, scan_end, params_.ekf_twist_max_gap)) {
+      const double dt = std::max(0.0, scan_end - anchor_stamp_);
+      const double translation = motion->translation().norm();
+      const double rotation = motion->so3().log().norm();
+      if (
+        translation <= params_.limits.max_speed * dt + 1.0 &&
+        rotation <= params_.limits.max_yaw_rate * dt + 0.5) {
+        predicted = anchor_pose_ * *motion;
+        result.ekf_twist_prior = true;
+        seed_yaw_rate_ = motion->so3().log().z() / std::max(dt, 1.0e-3);
+      }
+    }
+  }
+  if (!result.ekf_pose_prior && !result.ekf_twist_prior) {
+    const double interval = std::max(1.0e-3, scan_end - anchor_stamp_);
+    seed_yaw_rate_ = (anchor_pose_.inverse() * predicted).so3().log().z() / interval;
   }
   alignment.predicted = predicted;
 
@@ -680,7 +714,8 @@ ScanAlignment LidarImuMatcher::align_scan(
     std::chrono::steady_clock::now() +
     std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double>(1.0 / params_.align_rate_hz));
-  alignment.candidate = score_alignment(alignment.source, predicted, result, &alignment.deadline);
+  alignment.candidate = score_alignment(
+    alignment.source, predicted, result, &alignment.deadline, &alignment.source_tau);
 
   const MatchCandidate & candidate = alignment.candidate;
   result.has_lidar_debug = candidate.present;
@@ -716,7 +751,7 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
     anchor_pose_ = predicted;
     anchor_stamp_ = scan_end;
     last_correction_stamp_ = imu.latest_stamp();
-    last_correction_position_ = imu.pose().translation();
+    last_correction_pose_ = imu.pose();
     result.applied = true;
     result.inserted_scan = true;
     result.first_scan = true;
@@ -767,7 +802,9 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
   const bool update_bias = health_.update_bias;
 
   const Sophus::SE3d limited =
-    limit_longitudinal_correction(predicted, candidate.pose, params_.max_longitudinal_correction);
+    params_.longitudinal_sigma > 0.0
+      ? candidate.pose
+      : limit_longitudinal_correction(predicted, candidate.pose, params_.max_longitudinal_correction);
   Sophus::SE3d committed = limited;
   if (should_insert(committed)) {
     queue_insert(
@@ -788,7 +825,7 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
     apply_correction(imu, imu_delta, scan_end, last_correction_stamp_, update_bias, std::nullopt);
   } else {
     last_correction_stamp_ = imu.latest_stamp();
-    last_correction_position_ = imu.pose().translation();
+    last_correction_pose_ = imu.pose();
   }
   anchor_pose_ = committed;
   anchor_stamp_ = scan_end;
@@ -802,9 +839,10 @@ MatchResult LidarImuMatcher::commit_scan(ScanAlignment && alignment, ImuProcesso
 }
 
 MatchResult LidarImuMatcher::on_scan(
-  const LidarScan & scan, ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists)
+  const LidarScan & scan, ImuProcessor & imu, const std::vector<BodyTwistSample> & body_twists,
+  const std::vector<StampedPose> & ekf_poses)
 {
-  MatchResult result = commit_scan(align_scan(scan, imu, body_twists), imu);
+  MatchResult result = commit_scan(align_scan(scan, imu, body_twists, ekf_poses), imu);
   flush_pending_insert(result);
   return result;
 }
@@ -834,7 +872,7 @@ void LidarImuMatcher::apply_correction(
   const Sophus::SO3d orientation_correction = corrected.so3() * imu.pose().so3().inverse();
   const double dt = std::max(1.0e-3, imu.latest_stamp() - last_correction_stamp_);
   const InertialCorrection inertial = inertial_correction_from_match(
-    vehicle_delta, orientation_correction, corrected, imu.velocity(), last_correction_position_, dt,
+    vehicle_delta, orientation_correction, corrected, imu.velocity(), last_correction_pose_, dt,
     params_.gyro_bias_gain, params_.accel_bias_gain, params_.speed_correction_gain);
   Eigen::Vector3d velocity = velocity_override.value_or(inertial.velocity_world);
   const Eigen::Vector3d body = clamp_body_velocity(corrected.so3().inverse() * velocity, params_.limits.max_speed);
@@ -853,7 +891,7 @@ void LidarImuMatcher::apply_correction(
     imu.set_accel_bias(accel_bias);
   }
   last_correction_stamp_ = imu.latest_stamp();
-  last_correction_position_ = imu.pose().translation();
+  last_correction_pose_ = imu.pose();
 }
 
 void LidarImuMatcher::remember_healthy(
@@ -898,13 +936,13 @@ void LidarImuMatcher::note_health(ImuProcessor & imu, const HealthEvent event)
 
 MatchCandidate LidarImuMatcher::score_alignment(
   const std::vector<Eigen::Vector3d> & source, const Sophus::SE3d & guess, MatchResult & timing,
-  const std::chrono::steady_clock::time_point * const deadline)
+  const std::chrono::steady_clock::time_point * const deadline, const std::vector<float> * const tau)
 {
   MatchCandidate candidate;
   candidate.present = true;
   const bool recovering = health_.health != LocalizationHealth::Healthy;
   const auto align_start = std::chrono::steady_clock::now();
-  const PlaneIcpResult icp = align(source, guess, params_.max_correspondence_distance, deadline);
+  const PlaneIcpResult icp = align(source, guess, params_.max_correspondence_distance, deadline, tau);
   timing.align_ms += elapsed_ms(align_start);
 
   candidate.iterations = icp.iterations;
@@ -929,14 +967,26 @@ MatchCandidate LidarImuMatcher::score_alignment(
   candidate.cost = icp.robust_cost;
 
   const auto cost_start = std::chrono::steady_clock::now();
+  std::vector<Eigen::Vector3d> redeskewed_source;
+  const std::vector<Eigen::Vector3d> * scored = &source;
+  if (tau != nullptr && tau->size() == source.size() && icp.iterations >= 3.0) {
+    apply_sweep_residual_deskew(
+      source, *tau, (guess.inverse() * candidate.pose).log(), redeskewed_source);
+    scored = &redeskewed_source;
+  }
   const NdtScore ndt = ndt_score(
-    source, candidate.pose, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences);
+    *scored, candidate.pose, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences);
   const NdtScore ndt_seed =
     recovering ? ndt_score(source, guess, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences)
                : NdtScore{};
   timing.cost_ms += elapsed_ms(cost_start);
   candidate.ndt_cost = ndt.mean_cost;
   candidate.ndt_inlier_fraction = ndt.inlier_fraction;
+  if (icp.iterations > 0.0) {
+    timing.planar_covariance = adaptive_planar_covariance(
+      icp.wall_hessian, icp.robust_rms, icp.wall_inlier_fraction, seed_yaw_rate_);
+    timing.has_planar_covariance = timing.planar_covariance.allFinite();
+  }
 
   const Sophus::SE3d imu_delta = guess.inverse() * candidate.pose;
   const bool small_step = imu_delta.translation().norm() <= k_small_step_translation &&
@@ -978,12 +1028,16 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
 
   const auto cpu_prepare = [&](PreparedClouds & out) {
     const auto deskew_start = std::chrono::steady_clock::now();
+    std::vector<float> deskew_tau;
+    const std::vector<Eigen::Vector3d> deskewed = deskew_to_scan_end(
+      scan.points, scan.timestamps, trajectory, body_from_lidar_, &deskew_tau);
+    std::vector<float> cropped_tau;
     const IntensityCloud cropped = crop_lidar_box(
-      deskew_to_scan_end(scan.points, scan.timestamps, trajectory, body_from_lidar_),
-      scan.intensities, half_longitudinal_, half_lateral_);
+      deskewed, scan.intensities, half_longitudinal_, half_lateral_, &deskew_tau, &cropped_tau);
     const double deskew_ms = elapsed_ms(deskew_start);
     const auto voxel_start = std::chrono::steady_clock::now();
     IntensityCloud map_cloud;
+    std::vector<float> fine_tau;
     if (params_.use_random_grid_downsampling) {
       const double rate = params_.random_downsample_target > 0
                             ? static_cast<double>(params_.random_downsample_target) /
@@ -992,9 +1046,16 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
       map_cloud = randomgrid_downsample_with_intensity(
         cropped.points, cropped.intensities, fine_voxel, rate, downsample_rng_);
     } else {
-      map_cloud = voxel_downsample_with_intensity(cropped.points, cropped.intensities, fine_voxel);
+      map_cloud = voxel_downsample_with_intensity(
+        cropped.points, cropped.intensities, fine_voxel, &cropped_tau, &fine_tau);
     }
-    out.source = kiss_icp::VoxelDownsample(map_cloud.points, coarse_voxel);
+    if (fine_tau.size() == map_cloud.points.size()) {
+      IntensityCloud source_cloud = voxel_downsample_with_intensity(
+        map_cloud.points, {}, coarse_voxel, &fine_tau, &out.source_tau);
+      out.source = std::move(source_cloud.points);
+    } else {
+      out.source = kiss_icp::VoxelDownsample(map_cloud.points, coarse_voxel);
+    }
     out.map_points = std::move(map_cloud.points);
     out.map_intensities = std::move(map_cloud.intensities);
     return std::make_pair(deskew_ms, elapsed_ms(voxel_start));
@@ -1030,7 +1091,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
       timing.deskew_ms += device->deskew_ms;
       timing.voxel_ms += device->voxel_ms;
       return PreparedClouds{
-        std::move(device->map_points), std::move(device->map_intensities), std::move(device->source)};
+        std::move(device->map_points), std::move(device->map_intensities), std::move(device->source),
+        std::move(device->source_tau)};
     }
     timing.deskew_ms += cpu_deskew_ms;
     timing.voxel_ms += cpu_voxel_ms;
@@ -1041,7 +1103,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
       timing.deskew_ms += device->deskew_ms;
       timing.voxel_ms += device->voxel_ms;
       return PreparedClouds{
-        std::move(device->map_points), std::move(device->map_intensities), std::move(device->source)};
+        std::move(device->map_points), std::move(device->map_intensities), std::move(device->source),
+        std::move(device->source_tau)};
     }
     device_front_use_ = false;
   }
@@ -1054,7 +1117,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
 
 PlaneIcpResult LidarImuMatcher::align(
   const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
-  const double max_correspondence_distance, const std::chrono::steady_clock::time_point * const deadline)
+  const double max_correspondence_distance, const std::chrono::steady_clock::time_point * const deadline,
+  const std::vector<float> * const tau)
 {
   PlaneIcpParams icp_params;
   icp_params.max_correspondence_distance = max_correspondence_distance;
@@ -1067,11 +1131,14 @@ PlaneIcpResult LidarImuMatcher::align(
   icp_params.kernel_scale = params_.kernel_scale;
   icp_params.max_iterations = params_.max_iterations;
   icp_params.convergence_criterion = params_.convergence_criterion;
+  icp_params.yaw_rate = seed_yaw_rate_;
+  icp_params.axle_in_body = params_.axle_in_body;
+  icp_params.longitudinal_sigma = params_.longitudinal_sigma;
 
   const bool device_ok = params_.device_bakeoff_scan > 0 && device_available() &&
                          scan.size() >= static_cast<std::size_t>(k_min_device_points) && !map_.Empty();
   if (!device_ok) {
-    return align_to_surface(scan, map_, surface_, guess, icp_params, deadline);
+    return align_to_surface(scan, map_, surface_, guess, icp_params, deadline, tau);
   }
   const bool bakeoff_due =
     !device_align_decided_
@@ -1087,22 +1154,22 @@ PlaneIcpResult LidarImuMatcher::align(
     device_align_decided_at_ = scan_count_;
     const auto device_start = std::chrono::steady_clock::now();
     const std::optional<PlaneIcpResult> device =
-      align_points_on_device(scan, map_, surface_, map_epoch_, guess, bakeoff, deadline);
+      align_points_on_device(scan, map_, surface_, map_epoch_, guess, bakeoff, deadline, tau);
     const double device_ms = elapsed_ms(device_start);
     const auto cpu_start = std::chrono::steady_clock::now();
-    const PlaneIcpResult cpu = align_to_surface(scan, map_, surface_, guess, bakeoff, deadline);
+    const PlaneIcpResult cpu = align_to_surface(scan, map_, surface_, guess, bakeoff, deadline, tau);
     const double cpu_ms = elapsed_ms(cpu_start);
     device_align_use_ = device.has_value() && close_poses(cpu.pose, device->pose) && device_ms < 0.8 * cpu_ms;
     return device_align_use_ ? *device : cpu;
   }
   if (device_align_use_) {
     if (const std::optional<PlaneIcpResult> device =
-          align_points_on_device(scan, map_, surface_, map_epoch_, guess, icp_params, deadline)) {
+          align_points_on_device(scan, map_, surface_, map_epoch_, guess, icp_params, deadline, tau)) {
       return *device;
     }
     device_align_use_ = false;
   }
-  return align_to_surface(scan, map_, surface_, guess, icp_params, deadline);
+  return align_to_surface(scan, map_, surface_, guess, icp_params, deadline, tau);
 }
 
 }  // namespace back_odom

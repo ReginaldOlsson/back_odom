@@ -913,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
         "--lidar-to-base-yaw",
         type=float,
         default=DEFAULT_LIDAR_TO_BASE_YAW,
-        help="base_link to lidar yaw [rad]. Default is -pi/4.",
+        help="base_link to lidar yaw [rad]. Default is the calibrated -0.7531 rad mount.",
     )
     parser.add_argument("--max-dt", type=float, default=0.05, help="Association gate [s]")
     parser.add_argument("--out", type=Path, default=None, help="Output directory")

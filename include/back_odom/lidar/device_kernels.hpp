@@ -68,9 +68,15 @@ struct CudaVoxelPlane
 
 struct CudaPlaneSystem
 {
-  double jtj[36]{};
-  double jtr[6]{};
+  /// Upper triangles of the ground, wall, and other blocks, row-major from (0,0).
+  double other_jtj[21]{};
+  double ground_jtj[21]{};
+  double wall_jtj[21]{};
+  double other_jtr[6]{};
+  double ground_jtr[6]{};
+  double wall_jtr[6]{};
   int correspondences{0};
+  int wall_correspondences{0};
   double robust_cost_sum{0.0};
   int point_count{0};
 };
@@ -103,7 +109,8 @@ struct CudaPlaneSystem
   const double end_inverse_translation[3], const double body_rotation[9],
   const double body_translation[3], double half_longitudinal, double half_lateral,
   double fine_voxel, double coarse_voxel, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz);
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz,
+  std::vector<int> & coarse_index);
 
 [[nodiscard]] bool cuda_deskew(
   const double * points_xyz, const double * stamps, int count, const CudaSegment * segments,

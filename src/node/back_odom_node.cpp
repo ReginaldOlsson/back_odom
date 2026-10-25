@@ -16,6 +16,8 @@
 
 #include "back_odom/imu/imu_alignment.hpp"
 #include "back_odom/lidar/device_accel.hpp"
+#include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/plane_class.hpp"
 
 #include <Eigen/Geometry>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -192,6 +194,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu/data");
   pointcloud_topic_ = this->declare_parameter<std::string>("pointcloud_topic", "/pointcloud");
   use_ekf_twist_prior_ = this->declare_parameter<bool>("use_ekf_twist_prior", true);
+  use_ekf_pose_prior_ = this->declare_parameter<bool>("use_ekf_pose_prior", false);
+  ekf_pose_topic_ = this->declare_parameter<std::string>("ekf_pose_topic", "/debug/odom_pose");
   ekf_twist_topic_ =
     this->declare_parameter<std::string>("ekf_twist_topic", "/ekf_twist_with_covariance");
   ekf_twist_max_gap_ = this->declare_parameter<double>("ekf_twist_max_gap", 0.05);
@@ -207,6 +211,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   pose_variance_z_ = this->declare_parameter<double>("pose_variance_z", 0.40);
   pose_variance_roll_pitch_ = this->declare_parameter<double>("pose_variance_roll_pitch", 0.01);
   pose_variance_yaw_ = this->declare_parameter<double>("pose_variance_yaw", 0.01);
+  pose_tilt_noise_scale_ = this->declare_parameter<double>("pose_tilt_noise_scale", 0.0);
+  if (pose_tilt_noise_scale_ > 0.0) {
+    pose_variance_z_ = pose_variance_xy_ * pose_tilt_noise_scale_;
+    pose_variance_roll_pitch_ = pose_variance_yaw_ * pose_tilt_noise_scale_;
+  }
   if (
     twist_variance_vx_ < 0.01 || twist_variance_vy_ <= 0.0 || twist_variance_vz_ <= 0.0 ||
     twist_variance_wz_ <= 0.0 || pose_variance_xy_ < 0.0025 || pose_variance_z_ < 0.0025 ||
@@ -218,6 +227,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
   child_frame_ = this->declare_parameter<std::string>("child_frame", "base_link");
   const int alignment_sample_count = this->declare_parameter<int>("alignment_sample_count", 100);
+  alignment_min_duration_ = this->declare_parameter<double>("alignment_min_duration", 0.0);
+  alignment_max_duration_ = this->declare_parameter<double>("alignment_max_duration", 0.0);
   const double stationary_gyro_thresh =
     this->declare_parameter<double>("stationary_gyro_thresh", 0.05);
   const double stationary_accel_dev_thresh =
@@ -285,6 +296,13 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("speed_correction_gain", 0.5);
   lidar_params.max_longitudinal_correction =
     this->declare_parameter<double>("max_longitudinal_correction", 0.15);
+  const std::vector<double> rear_axle = this->declare_parameter<std::vector<double>>(
+    "rear_axle_in_base", std::vector<double>{0.0, 0.0, 0.0});
+  if (rear_axle.size() != 3) {
+    throw std::invalid_argument("rear_axle_in_base must contain 3 values");
+  }
+  lidar_params.axle_in_body = Eigen::Vector3d(rear_axle[0], rear_axle[1], rear_axle[2]);
+  lidar_params.longitudinal_sigma = this->declare_parameter<double>("longitudinal_sigma", 0.0);
   lidar_params.max_gyro_bias = this->declare_parameter<double>("max_gyro_bias", 0.05);
   lidar_params.max_accel_bias = this->declare_parameter<double>("max_accel_bias", 1.0);
   lidar_params.limits.max_speed = this->declare_parameter<double>("max_speed", 20.0);
@@ -301,6 +319,12 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.min_inlier_ratio = this->declare_parameter<double>("min_inlier_ratio", 0.3);
   if (alignment_sample_count <= 0) {
     throw std::invalid_argument("alignment_sample_count must be positive");
+  }
+  if (alignment_min_duration_ < 0.0 || alignment_max_duration_ < 0.0) {
+    throw std::invalid_argument("alignment durations must be non-negative");
+  }
+  if (alignment_max_duration_ > 0.0 && alignment_min_duration_ > alignment_max_duration_) {
+    throw std::invalid_argument("alignment_min_duration cannot exceed alignment_max_duration");
   }
   if (path_max_poses <= 0) {
     throw std::invalid_argument("path_max_poses must be positive");
@@ -340,6 +364,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
 
   ProcessorParams params;
   params.alignment_sample_count = alignment_sample_count_;
+  params.alignment_min_duration = alignment_min_duration_;
+  params.alignment_max_duration = alignment_max_duration_;
   params.stationary_gyro_thresh = stationary_gyro_thresh;
   params.stationary_accel_dev_thresh = stationary_accel_dev_thresh;
   params.gravity = gravity;
@@ -362,6 +388,13 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
       ekf_twist_topic_, rclcpp::QoS(rclcpp::KeepLast(200)).reliable(),
       [this](const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg) {
         this->callback_ekf_twist(msg);
+      });
+  }
+  if (use_ekf_pose_prior_) {
+    ekf_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+      ekf_pose_topic_, rclcpp::QoS(rclcpp::KeepLast(500)).reliable(),
+      [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+        this->callback_ekf_pose(msg);
       });
   }
   // Scans go through a single-slot mailbox; no point queueing more than the newest two.
@@ -480,6 +513,64 @@ void BackOdomNode::callback_ekf_twist(
   while (!ekf_twists_.empty() && ekf_twists_.front().stamp < oldest) {
     ekf_twists_.pop_front();
   }
+}
+
+void BackOdomNode::callback_ekf_pose(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+{
+  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  const Eigen::Quaterniond rotation(
+    msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y,
+    msg->pose.orientation.z);
+  const Eigen::Vector3d translation(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+  if (!std::isfinite(stamp) || !rotation.coeffs().allFinite() || !translation.allFinite()) {
+    return;
+  }
+  if (rotation.norm() < 1.0e-6) {
+    return;
+  }
+  StampedPose sample;
+  sample.stamp = stamp;
+  sample.pose = Sophus::SE3d(Sophus::SO3d(rotation.normalized()), translation);
+
+  std::lock_guard<std::mutex> lock(pose_mutex_);
+  if (!ekf_poses_.empty() && stamp + 1.0e-4 < ekf_poses_.back().stamp) {
+    ekf_poses_.clear();
+  }
+  if (!ekf_poses_.empty() && std::abs(stamp - ekf_poses_.back().stamp) <= 1.0e-6) {
+    ekf_poses_.back() = sample;
+  } else {
+    ekf_poses_.push_back(sample);
+  }
+  const double oldest = stamp - ekf_twist_horizon_;
+  while (!ekf_poses_.empty() && ekf_poses_.front().stamp < oldest) {
+    ekf_poses_.pop_front();
+  }
+}
+
+Sophus::SO3d BackOdomNode::lidar_tilt_from_ground(
+  const std::vector<Eigen::Vector3d> & points, const Sophus::SO3d & base_from_lidar,
+  const Eigen::Vector3d & specific_force) const
+{
+  const GroundPlaneFit fit = fit_ground_plane(points, 0.2, 64, 1);
+  Eigen::Vector3d body_up = -specific_force;
+  if (!fit.valid || fit.inlier_ratio < 0.5 || body_up.norm() < 1.0e-6) {
+    return {};
+  }
+  body_up.normalize();
+  Eigen::Vector3d normal_body = base_from_lidar * fit.normal;
+  if (normal_body.dot(body_up) < 0.0) {
+    normal_body = -normal_body;
+  }
+  if (normal_body.norm() < 1.0e-6) {
+    return {};
+  }
+  normal_body.normalize();
+  const Sophus::SO3d tilt = rotation_aligning_directions(normal_body, body_up);
+  constexpr double k_max_tilt = 2.0 * 3.14159265358979323846 / 180.0;
+  if (!tilt.matrix().allFinite() || tilt.log().norm() > k_max_tilt) {
+    return {};
+  }
+  return tilt;
 }
 
 void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
@@ -742,7 +833,17 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
           "Increase imu_trajectory_horizon.",
           imu_processor_->trajectory().front().stamp, scan_start);
       } else {
-        lidar_matcher_->set_body_from_lidar(base_from_lidar);
+        if (!lidar_tilt_set_) {
+          lidar_tilt_ = lidar_tilt_from_ground(
+            scan.points, base_from_lidar.so3(), imu_processor_->alignment_specific_force());
+          lidar_tilt_set_ = true;
+          RCLCPP_INFO(
+            this->get_logger(), "Lidar roll/pitch residual is %.3f deg.",
+            lidar_tilt_.log().norm() * 180.0 / 3.14159265358979323846);
+        }
+        Sophus::SE3d body_from_lidar = base_from_lidar;
+        body_from_lidar.so3() = lidar_tilt_ * base_from_lidar.so3();
+        lidar_matcher_->set_body_from_lidar(body_from_lidar);
         snapshot.emplace(*imu_processor_);
       }
     }
@@ -757,7 +858,12 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     std::lock_guard<std::mutex> lock(twist_mutex_);
     body_twists.assign(ekf_twists_.begin(), ekf_twists_.end());
   }
-  ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot, body_twists);
+  std::vector<StampedPose> ekf_poses;
+  if (use_ekf_pose_prior_) {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    ekf_poses.assign(ekf_poses_.begin(), ekf_poses_.end());
+  }
+  ScanAlignment alignment = lidar_matcher_->align_scan(scan, *snapshot, body_twists, ekf_poses);
   snapshot.reset();
 
   MatchResult matched;
@@ -791,23 +897,31 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     last_health_stamp_ = stamp;
     has_published_health_ = true;
   }
-  if (use_ekf_twist_prior_ && !matched.skipped && !matched.first_scan) {
-    if (matched.ekf_twist_prior) {
+  if ((use_ekf_pose_prior_ || use_ekf_twist_prior_) && !matched.skipped && !matched.first_scan) {
+    if (matched.ekf_pose_prior) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "ICP initial guess used the relative %s pose (residual %.3f m / %.3f rad, "
+        "%.0f iterations).",
+        ekf_pose_topic_.c_str(), matched.translation_error, matched.rotation_error,
+        matched.iterations);
+    } else if (matched.ekf_twist_prior) {
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "ICP initial guess integrated %s from the last lidar pose (residual %.3f m / %.3f rad, "
         "%.0f iterations).",
         ekf_twist_topic_.c_str(), matched.translation_error, matched.rotation_error,
         matched.iterations);
-    } else if (body_twists.empty()) {
+    } else if (body_twists.empty() && ekf_poses.empty()) {
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "ICP initial guess is the IMU step. %s has not published yet.", ekf_twist_topic_.c_str());
+        "ICP initial guess is the IMU step. %s and %s have not published yet.",
+        ekf_pose_topic_.c_str(), ekf_twist_topic_.c_str());
     } else {
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "ICP initial guess is the IMU step. %s did not cover this scan within %.3f s.",
-        ekf_twist_topic_.c_str(), ekf_twist_max_gap_);
+        ekf_pose_topic_.c_str(), ekf_twist_max_gap_);
     }
   }
   publish_debug_odometry(matched, stamp);
@@ -837,7 +951,7 @@ void BackOdomNode::publish_match(
   if (matched.align_timed_out && !matched.applied) {
     publish_odometry(imu_odom_pub_, prior_map, stamp);
     publish_odometry(odometry_pub_, corrected_map, stamp);
-    publish_pose(corrected_map, stamp);
+    publish_pose(corrected_map, stamp, &matched);
     if (publish_tf_) {
       publish_tf(corrected_map, stamp);
     }
@@ -848,14 +962,15 @@ void BackOdomNode::publish_match(
       this->get_logger(), *this->get_clock(), 2000,
       "ICP correction rejected. Holding the %s seed. health %s, lidar cost %.3f "
       "ndt %.3f (inliers %.2f) ratio %.2f pass %s, icp step %.3f m / %.3f rad, degenerate %d",
-      matched.ekf_twist_prior ? "ekf twist" : "imu", health_name(matched.health), matched.lidar_cost,
+      matched.ekf_pose_prior ? "ekf pose" : (matched.ekf_twist_prior ? "ekf twist" : "imu"),
+      health_name(matched.health), matched.lidar_cost,
       std::isfinite(matched.ndt_cost) ? matched.ndt_cost : -1.0,
       std::isfinite(matched.ndt_inlier_fraction) ? matched.ndt_inlier_fraction : -1.0,
       matched.inlier_ratio, matched.lidar_passed ? "yes" : "no", matched.translation_error,
       matched.rotation_error, matched.degenerate_axes);
     publish_odometry(imu_odom_pub_, prior_map, stamp);
     publish_odometry(odometry_pub_, corrected_map, stamp);
-    publish_pose(corrected_map, stamp);
+    publish_pose(corrected_map, stamp, &matched);
     if (publish_tf_) {
       publish_tf(corrected_map, stamp);
     }
@@ -866,7 +981,7 @@ void BackOdomNode::publish_match(
   }
   publish_odometry(imu_odom_pub_, prior_map, stamp);
   publish_odometry(odometry_pub_, corrected_map, stamp);
-  publish_pose(corrected_map, stamp);
+  publish_pose(corrected_map, stamp, &matched);
   publish_path(corrected_map, stamp);
   if (publish_tf_) {
     publish_tf(corrected_map, stamp);
@@ -1262,7 +1377,8 @@ void BackOdomNode::publish_twist(const ProcessorOutput & output, const rclcpp::T
   twist_pub_->publish(twist);
 }
 
-void BackOdomNode::publish_pose(const ProcessorOutput & output, const rclcpp::Time & stamp)
+void BackOdomNode::publish_pose(
+  const ProcessorOutput & output, const rclcpp::Time & stamp, const MatchResult * const matched)
 {
   geometry_msgs::msg::PoseWithCovarianceStamped pose;
   pose.header.stamp = stamp;
@@ -1271,12 +1387,19 @@ void BackOdomNode::publish_pose(const ProcessorOutput & output, const rclcpp::Ti
   pose.pose.pose.position.y = output.position.y();
   pose.pose.pose.position.z = output.position.z();
   set_quaternion(pose.pose.pose.orientation, output.orientation);
-  pose.pose.covariance[0] = pose_variance_xy_;
-  pose.pose.covariance[7] = pose_variance_xy_;
-  pose.pose.covariance[14] = pose_variance_z_;
-  pose.pose.covariance[21] = pose_variance_roll_pitch_;
-  pose.pose.covariance[28] = pose_variance_roll_pitch_;
-  pose.pose.covariance[35] = pose_variance_yaw_;
+  if (matched != nullptr && matched->has_planar_covariance) {
+    const Eigen::Matrix3d rotation = output.orientation.matrix();
+    const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+    pose.pose.covariance = pose_covariance_with_planar(
+      matched->planar_covariance, yaw, pose_variance_z_, pose_variance_roll_pitch_);
+  } else {
+    pose.pose.covariance[0] = pose_variance_xy_;
+    pose.pose.covariance[7] = pose_variance_xy_;
+    pose.pose.covariance[14] = pose_variance_z_;
+    pose.pose.covariance[21] = pose_variance_roll_pitch_;
+    pose.pose.covariance[28] = pose_variance_roll_pitch_;
+    pose.pose.covariance[35] = pose_variance_yaw_;
+  }
   pose_pub_->publish(pose);
   bool send_initial = false;
   {

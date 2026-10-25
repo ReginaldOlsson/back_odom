@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -315,6 +316,39 @@ TEST(ImuProcessor, closest_pose_picks_nearest_sample_not_the_live_tip)
   EXPECT_NEAR(closest.stamp, query, 0.05);
   EXPECT_LT(std::abs(closest.stamp - query), std::abs(processor.latest_stamp() - query));
   EXPECT_TRUE(processor.has_pose_near(query, 0.05));
+}
+
+TEST(ImuProcessor, duration_window_aligns_once_the_span_reaches_the_cap)
+{
+  ProcessorParams params;
+  params.alignment_sample_count = 500;
+  params.alignment_min_duration = 0.2;
+  params.alignment_max_duration = 0.5;
+  params.gravity = 9.81;
+  params.max_dt = 0.2;
+  ImuProcessor processor(params);
+  ProcessorOutput output;
+  for (int i = 0; i < 5; ++i) {
+    output = processor.process(
+      make_sample(0.1 * i, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+    EXPECT_FALSE(output.aligned);
+  }
+  output = processor.process(
+    make_sample(0.5, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()));
+  EXPECT_TRUE(output.aligned);
+  EXPECT_NEAR(processor.alignment_specific_force().z(), -9.81, 1e-9);
+}
+
+TEST(ImuAlignment, direction_alignment_is_the_shortest_rotation)
+{
+  const Eigen::Vector3d down(0.0, 0.0, -1.0);
+  EXPECT_TRUE(rotation_aligning_directions(down, down).matrix().isApprox(
+    Eigen::Matrix3d::Identity(), 1e-12));
+  const double tilt = 0.02;
+  const Eigen::Vector3d tilted(0.0, std::sin(tilt), -std::cos(tilt));
+  const Sophus::SO3d rotation = rotation_aligning_directions(tilted, down);
+  EXPECT_NEAR(rotation.log().norm(), tilt, 1e-9);
+  EXPECT_TRUE((rotation * tilted).isApprox(down, 1e-9));
 }
 
 }  // namespace back_odom

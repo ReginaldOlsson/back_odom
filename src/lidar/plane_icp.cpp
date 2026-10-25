@@ -14,6 +14,9 @@
 
 #include "back_odom/lidar/plane_icp.hpp"
 
+#include "back_odom/lidar/lidar_preprocess.hpp"
+#include "back_odom/lidar/plane_class.hpp"
+
 #include <kiss_icp_cpp/core/VoxelUtils.hpp>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_reduce.h>
@@ -54,17 +57,44 @@ struct Accumulation
 {
   Matrix6d jtj{Matrix6d::Zero()};
   Vector6d jtr{Vector6d::Zero()};
+  Matrix6d ground_jtj{Matrix6d::Zero()};
+  Matrix6d wall_jtj{Matrix6d::Zero()};
+  Matrix6d other_jtj{Matrix6d::Zero()};
+  Vector6d ground_jtr{Vector6d::Zero()};
+  Vector6d wall_jtr{Vector6d::Zero()};
+  Vector6d other_jtr{Vector6d::Zero()};
+  double ground_weight{0.0};
+  double wall_weight{0.0};
   int correspondences{0};
+  int wall_correspondences{0};
   double cost{0.0};
+  double weighted_residual_sq{0.0};
+  double weight_sum{0.0};
 };
 
 Accumulation join(Accumulation left, const Accumulation & right)
 {
-  left.jtj += right.jtj;
-  left.jtr += right.jtr;
+  left.ground_jtj += right.ground_jtj;
+  left.wall_jtj += right.wall_jtj;
+  left.other_jtj += right.other_jtj;
+  left.ground_jtr += right.ground_jtr;
+  left.wall_jtr += right.wall_jtr;
+  left.other_jtr += right.other_jtr;
+  left.ground_weight += right.ground_weight;
+  left.wall_weight += right.wall_weight;
   left.correspondences += right.correspondences;
+  left.wall_correspondences += right.wall_correspondences;
   left.cost += right.cost;
+  left.weighted_residual_sq += right.weighted_residual_sq;
+  left.weight_sum += right.weight_sum;
   return left;
+}
+
+void balance_classes(Accumulation & system, const CurveConstraint & constraint)
+{
+  compose_class_system(
+    system.ground_jtj, system.wall_jtj, system.other_jtj, system.ground_jtr, system.wall_jtr,
+    system.other_jtr, constraint, system.jtj, system.jtr);
 }
 
 /// Closest map point to `query` within the 27-voxel neighbourhood and the voxel it lives in.
@@ -97,11 +127,11 @@ bool closest_point(
 Accumulation build_system(
   const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const Sophus::SE3d & pose, const double max_distance,
-  const double kernel_scale)
+  const double kernel_scale, const CurveConstraint & constraint)
 {
   const double kernel2 = kernel_scale * kernel_scale;
   const Eigen::Matrix3d rotation_t = pose.so3().inverse().matrix();
-  return tbb::parallel_reduce(
+  Accumulation system = tbb::parallel_reduce(
     tbb::blocked_range<std::size_t>{0, source.size(), 512}, Accumulation{},
     [&](const tbb::blocked_range<std::size_t> & range, Accumulation accumulation) {
       for (std::size_t index = range.begin(); index < range.end(); ++index) {
@@ -130,13 +160,30 @@ Accumulation build_system(
         jacobian.head<3>() = normal_body;
         jacobian.tail<3>() = body.cross(normal_body);
         const double weight = kernel2 / (denom * denom);
-        accumulation.jtj.noalias() += (weight * jacobian) * jacobian.transpose();
-        accumulation.jtr.noalias() += (weight * residual) * jacobian;
+        accumulation.weighted_residual_sq += weight * residual * residual;
+        accumulation.weight_sum += weight;
+        const PlaneClass kind = classify_plane_normal(normal.z());
+        Matrix6d * class_jtj = &accumulation.other_jtj;
+        Vector6d * class_jtr = &accumulation.other_jtr;
+        if (kind == PlaneClass::Ground) {
+          class_jtj = &accumulation.ground_jtj;
+          class_jtr = &accumulation.ground_jtr;
+          accumulation.ground_weight += weight;
+        } else if (kind == PlaneClass::Wall) {
+          class_jtj = &accumulation.wall_jtj;
+          class_jtr = &accumulation.wall_jtr;
+          accumulation.wall_weight += weight;
+          ++accumulation.wall_correspondences;
+        }
+        class_jtj->noalias() += (weight * jacobian) * jacobian.transpose();
+        class_jtr->noalias() += (weight * residual) * jacobian;
         ++accumulation.correspondences;
       }
       return accumulation;
     },
     join);
+  balance_classes(system, constraint);
+  return system;
 }
 
 bool solve_increment(const Matrix6d & hessian_in, const Vector6d & gradient_in, Vector6d & dx, int & dropped)
@@ -176,13 +223,15 @@ bool solve_increment(const Matrix6d & hessian_in, const Vector6d & gradient_in, 
 PlaneIcpResult align_to_surface(
   const std::vector<Eigen::Vector3d> & source, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const Sophus::SE3d & initial_guess, const PlaneIcpParams & params,
-  const std::chrono::steady_clock::time_point * const deadline)
+  const std::chrono::steady_clock::time_point * const deadline, const std::vector<float> * const tau)
 {
   PlaneIcpResult result;
   result.pose = initial_guess;
   if (map.Empty() || source.empty() || !(params.kernel_scale > 0.0) || params.max_iterations < 1) {
     return result;
   }
+  const bool residual_deskew = tau != nullptr && tau->size() == source.size();
+  std::vector<Eigen::Vector3d> working = source;
   const auto past_deadline = [deadline]() {
     return deadline != nullptr && std::chrono::steady_clock::now() >= *deadline;
   };
@@ -194,9 +243,26 @@ PlaneIcpResult align_to_surface(
       result.timed_out = true;
       break;
     }
+    const Eigen::Matrix<double, 6, 1> xi_from_seed = (initial_guess.inverse() * pose).log();
+    if (residual_deskew && (iteration == 2 || iteration == 4)) {
+      apply_sweep_residual_deskew(source, *tau, xi_from_seed, working);
+    }
+    CurveConstraint constraint;
+    constraint.yaw_rate = params.yaw_rate;
+    constraint.axle_in_body = params.axle_in_body;
+    constraint.longitudinal_sigma = params.longitudinal_sigma;
+    constraint.xi_from_seed = xi_from_seed;
     const Accumulation system = build_system(
-      source, map, surface, pose, correspondence_distance_for_iteration(params, iteration),
-      params.kernel_scale);
+      working, map, surface, pose, correspondence_distance_for_iteration(params, iteration),
+      kernel_scale_for_iteration(params, iteration, residual_deskew), constraint);
+    result.wall_hessian = system.wall_jtj;
+    result.wall_inlier_fraction =
+      system.correspondences > 0
+        ? static_cast<double>(system.wall_correspondences) / static_cast<double>(system.correspondences)
+        : 0.0;
+    result.robust_rms = system.weight_sum > 1.0e-12
+                          ? std::sqrt(system.weighted_residual_sq / system.weight_sum)
+                          : 0.08;
     result.correspondences = system.correspondences;
     result.robust_cost = system.cost * inverse_count;
     result.hessian = system.jtj;
@@ -241,7 +307,7 @@ double surface_plane_cost(
     return std::numeric_limits<double>::infinity();
   }
   const Accumulation system =
-    build_system(source, map, surface, pose, max_correspondence_distance, kernel_scale);
+    build_system(source, map, surface, pose, max_correspondence_distance, kernel_scale, CurveConstraint{});
   return system.cost / static_cast<double>(source.size());
 }
 

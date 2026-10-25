@@ -53,11 +53,12 @@ bool cuda_front_downsample(
   const double *, const double *, int, const CudaSegment *, int, double, double, const double[9],
   const double[3], const double[9], const double[3], const double[9], const double[3], const double[9],
   const double[3], double, double, double, double, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz, std::vector<int> & coarse_index)
 {
   fine_xyz.clear();
   fine_index.clear();
   coarse_xyz.clear();
+  coarse_index.clear();
   return false;
 }
 
