@@ -3,8 +3,12 @@
     # The RI-EKF publishes map -> odom -> base_link. Leave this false so both nodes do not publish a pose.
     publish_tf: false
     # When true, wait for ground_truth_odom_topic and left-multiply published map-frame poses
-    # so the first covered pose matches that ground truth. The Boreas launch turns this on.
+    # so they match ground truth. The lock waits until the vehicle has moved
+    # align_min_longitudinal_m in body x, so the stationary initialization residual is not the
+    # published start. The Boreas launch turns alignment on. Zero meters locks on the first
+    # covered pose.
     align_to_ground_truth: false
+    align_min_longitudinal_m: 2.0
     ground_truth_odom_topic: "/boreas/ground_truth/odom"
     # Bags exported before boreas converts imu_raw still contain left-handed samples
     # (x-back, y-left, z-up). The imu extrinsic is a proper rotation from the
@@ -56,15 +60,15 @@
     kernel_scale: 0.5
     # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
     # lidar-anchored seed. Saturated solves are accepted but do not update biases.
-    convergence_criterion: 0.001
-    max_iterations: 200
+    convergence_criterion: 0.0005
+    max_iterations: 2000
     # Target ICP rate. Align budget is wall-clock 1/hz (100 ms at 10), not bag/sim time.
     # First 6 iterations search recovery_max_correspondence_distance, then this radius.
     # A timeout with >= partial_min_iterations is still scored; a small step (≤0.25 m / 0.05
     # rad) may pass even if mean NDT is up to 2*max_ndt_cost, so a slightly-off seed can
     # pull back instead of freezing on the IMU prior. partial_max_step is logging only.
     align_rate_hz: 10.0
-    partial_min_iterations: 3
+    partial_min_iterations: 5
     partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
     # 27-voxel neighbour scan growing past the budget.

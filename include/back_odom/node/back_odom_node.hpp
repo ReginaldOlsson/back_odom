@@ -66,7 +66,8 @@ private:
   void callback_ekf_twist(const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg);
   void callback_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void callback_ground_truth(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
-  /// Requires state_mutex_. Locks map_from_local_ on the earliest ground-truth stamp the IMU covers.
+  /// Requires state_mutex_. Locks map_from_local_ once ground truth has moved
+  /// align_min_longitudinal_m_ in body x from the first pose the IMU covers.
   void try_lock_ground_truth_alignment();
   [[nodiscard]] bool map_frame_ready() const;
   [[nodiscard]] Sophus::SE3d map_from_local() const;
@@ -196,6 +197,8 @@ private:
   bool imu_left_handed_{false};
   std::string time_field_;
   bool align_to_ground_truth_{false};
+  /// Body-x ground-truth travel required before locking map_from_local_. Zero locks immediately.
+  double align_min_longitudinal_m_{2.0};
   std::string ground_truth_odom_topic_{"/boreas/ground_truth/odom"};
 
   struct GroundTruthSample

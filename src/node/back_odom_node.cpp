@@ -16,6 +16,7 @@
 
 #include "back_odom/imu/imu_alignment.hpp"
 #include "back_odom/lidar/device_accel.hpp"
+#include "back_odom/node/ground_truth_alignment.hpp"
 
 #include <Eigen/Geometry>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -240,6 +241,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   const int imu_queue_depth = this->declare_parameter<int>("imu_queue_depth", 2000);
   time_field_ = this->declare_parameter<std::string>("time_field", "time");
   align_to_ground_truth_ = this->declare_parameter<bool>("align_to_ground_truth", false);
+  align_min_longitudinal_m_ = this->declare_parameter<double>("align_min_longitudinal_m", 2.0);
   ground_truth_odom_topic_ =
     this->declare_parameter<std::string>("ground_truth_odom_topic", "/boreas/ground_truth/odom");
   LidarMatchParams lidar_params;
@@ -334,6 +336,9 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   if (min_range_ < 0.0 || max_range_ < 0.0) {
     throw std::invalid_argument("min_range and max_range must be non-negative");
   }
+  if (!(align_min_longitudinal_m_ >= 0.0) || !std::isfinite(align_min_longitudinal_m_)) {
+    throw std::invalid_argument("align_min_longitudinal_m must be non-negative and finite");
+  }
 
   alignment_sample_count_ = static_cast<std::size_t>(alignment_sample_count);
   path_max_poses_ = static_cast<std::size_t>(path_max_poses);
@@ -426,11 +431,11 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   RCLCPP_INFO(
     this->get_logger(),
     "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s align_to_gt=%s "
-    "ekf_twist_prior=%s topic=%s",
+    "align_min_longitudinal_m=%.2f ekf_twist_prior=%s topic=%s",
     imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
     pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort",
-    align_to_ground_truth_ ? "true" : "false", use_ekf_twist_prior_ ? "true" : "false",
-    ekf_twist_topic_.c_str());
+    align_to_ground_truth_ ? "true" : "false", align_min_longitudinal_m_,
+    use_ekf_twist_prior_ ? "true" : "false", ekf_twist_topic_.c_str());
 }
 
 BackOdomNode::~BackOdomNode()
@@ -1574,28 +1579,40 @@ void BackOdomNode::try_lock_ground_truth_alignment()
     return;
   }
 
-  for (const GroundTruthSample & sample : samples) {
-    if (!imu_processor_->has_pose_near(sample.stamp, imu_max_pair_dt_)) {
-      continue;
+  const GroundTruthAlignmentChoice choice = select_ground_truth_alignment(
+    samples, align_min_longitudinal_m_,
+    [this](const double stamp) { return imu_processor_->has_pose_near(stamp, imu_max_pair_dt_); });
+  if (!choice.ready) {
+    const double travelled = std::abs(choice.longitudinal_m);
+    if (!choice.anchor_found || travelled + 1.0e-9 >= align_min_longitudinal_m_) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Waiting until the IMU trajectory covers a pose from %s.",
+        ground_truth_odom_topic_.c_str());
+      return;
     }
-    const Sophus::SE3d local = imu_processor_->interpolate_pose(sample.stamp);
-    const Sophus::SE3d map_from_local = sample.pose * local.inverse();
-    {
-      std::lock_guard<std::mutex> lock(align_mutex_);
-      map_from_local_ = map_from_local;
-      ground_truth_samples_.clear();
-      map_from_local_locked_.store(true, std::memory_order_release);
-    }
-    const Eigen::Vector3d translation = map_from_local.translation();
-    RCLCPP_INFO(
-      this->get_logger(), "Aligned map -> %s to %s at %.3f s. xyz=(%.2f, %.2f, %.2f)",
-      child_frame_.c_str(), ground_truth_odom_topic_.c_str(), sample.stamp, translation.x(),
-      translation.y(), translation.z());
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Waiting for %.2f m more longitudinal motion before aligning to %s (travelled %.2f m).",
+      align_min_longitudinal_m_ - travelled, ground_truth_odom_topic_.c_str(), travelled);
     return;
   }
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 2000,
-    "Waiting until the IMU trajectory covers a pose from %s.", ground_truth_odom_topic_.c_str());
+
+  const GroundTruthSample & sample = samples[choice.index];
+  const Sophus::SE3d local = imu_processor_->interpolate_pose(sample.stamp);
+  const Sophus::SE3d map_from_local = sample.pose * local.inverse();
+  {
+    std::lock_guard<std::mutex> lock(align_mutex_);
+    map_from_local_ = map_from_local;
+    ground_truth_samples_.clear();
+    map_from_local_locked_.store(true, std::memory_order_release);
+  }
+  const Eigen::Vector3d translation = map_from_local.translation();
+  RCLCPP_INFO(
+    this->get_logger(),
+    "Aligned map -> %s to %s at %.3f s after %.2f m of longitudinal motion. xyz=(%.2f, %.2f, %.2f)",
+    child_frame_.c_str(), ground_truth_odom_topic_.c_str(), sample.stamp,
+    std::abs(choice.longitudinal_m), translation.x(), translation.y(), translation.z());
 }
 
 bool BackOdomNode::map_frame_ready() const
