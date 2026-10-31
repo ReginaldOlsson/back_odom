@@ -183,6 +183,9 @@ LidarMatchParams match_params()
   params.backward_match_stride = 3;
   params.max_correspondence_distance = 2.0;
   params.apply_imu_correction = true;
+  // Production buffers init_scan_count scans before the map exists. These tests insert scan 0
+  // immediately, still at identity rather than the absolute IMU pose.
+  params.init_scan_count = 1;
   // The synthetic scans sit at the same place; insert every accepted scan so the horizon
   // tests can count them.
   params.keyframe_min_translation = 0.0;
@@ -359,8 +362,10 @@ TEST(BackwardMatch, rejected_icp_keeps_the_imu_seed_as_the_lidar_pose)
   LidarImuMatcher matcher(match_params());
   ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
   const double later = imu.latest_stamp() + 0.5;
+  // Beyond the 1 m vehicle gate, so dropping the hard longitudinal clamp cannot pull this seed
+  // back onto the corner.
   imu.reset_state(
-    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(2.0, 0.0, 0.0),
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(3.0, 0.0, 0.0)), Eigen::Vector3d(2.0, 0.0, 0.0),
     later);
   const MatchResult matched = matcher.on_scan(corner_scan(later), imu);
   EXPECT_FALSE(matched.applied);
@@ -439,20 +444,24 @@ TEST(InertialCorrection, curve_keeps_the_tangent_instead_of_the_chord)
   const Sophus::SE3d corrected(Sophus::SO3d::rotZ(yaw), position);
   const Eigen::Vector3d tangent = speed * Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
 
+  const Sophus::SE3d previous;
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, tangent, Eigen::Vector3d::Zero(), dt, 0.1, 0.02,
-    0.5);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, tangent, previous, dt, 0.1, 0.02, 0.5);
 
+  const Eigen::Vector3d exact_body = (previous.inverse() * corrected).log().head<3>() / dt;
+  const Eigen::Vector3d imu_body = corrected.so3().inverse() * tangent;
+  Eigen::Vector3d velocity_body(imu_body.x(), 0.0, imu_body.z());
+  velocity_body.x() = 0.5 * imu_body.x() + 0.5 * exact_body.x();
+  velocity_body.z() = 0.5 * imu_body.z() + 0.5 * exact_body.z();
+  const Eigen::Vector3d expected = corrected.so3() * velocity_body;
   const Eigen::Vector3d forward = corrected.so3() * Eigen::Vector3d::UnitX();
-  const double imu_forward = tangent.dot(forward);
-  const double lidar_forward = position.dot(forward) / dt;
-  const double blended = 0.5 * imu_forward + 0.5 * lidar_forward;
-  const Eigen::Vector3d expected = blended * forward;
+  const double chord_forward = position.dot(forward) / dt;
   EXPECT_NEAR(correction.velocity_world.x(), expected.x(), 1e-6);
   EXPECT_NEAR(correction.velocity_world.y(), expected.y(), 1e-6);
-  EXPECT_GT(correction.velocity_world.y(), 1.5);
-  EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
-  EXPECT_GT(correction.accel_bias_delta.x(), 0.0);
+  EXPECT_NEAR(correction.velocity_world.z(), expected.z(), 1e-6);
+  EXPECT_GT(exact_body.x(), chord_forward);
+  EXPECT_NEAR(exact_body.x(), speed, 1e-6);
+  EXPECT_NEAR(correction.accel_bias_delta.norm(), 0.0, 1e-12);
   EXPECT_NEAR(correction.gyro_bias_delta.norm(), 0.0, 1e-12);
 }
 
@@ -464,8 +473,7 @@ TEST(InertialCorrection, off_heading_velocity_is_pulled_onto_the_matched_forward
   const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(10.0, 0.0, 0.0));
   const Eigen::Vector3d velocity(speed * std::cos(angle), speed * std::sin(angle), 0.0);
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, velocity, Eigen::Vector3d::Zero(), 1.0, 0.1, 0.02,
-    0.5);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, velocity, Sophus::SE3d(), 1.0, 0.1, 0.02, 0.5);
   const double blended = 0.5 * velocity.x() + 0.5 * 10.0;
   EXPECT_NEAR(correction.velocity_world.x(), blended, 1e-9);
   EXPECT_NEAR(correction.velocity_world.y(), 0.0, 1e-12);
@@ -477,8 +485,8 @@ TEST(InertialCorrection, lateral_displacement_does_not_enter_velocity_or_accel_b
 {
   const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(0.0, 1.0, 0.0));
   const InertialCorrection correction = inertial_correction_from_match(
-    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-    1.0, 0.1, 0.02, 0.5);
+    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d::Zero(), Sophus::SE3d(), 1.0, 0.1,
+    0.02, 0.5);
   EXPECT_NEAR(correction.velocity_world.norm(), 0.0, 1e-12);
   EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
 }
@@ -487,40 +495,164 @@ TEST(InertialCorrection, extra_positive_yaw_increases_gyro_bias)
 {
   const Sophus::SE3d vehicle_delta(Sophus::SO3d::rotZ(-0.002), Eigen::Vector3d::Zero());
   const InertialCorrection correction = inertial_correction_from_match(
-    vehicle_delta, Sophus::SO3d(), Sophus::SE3d(), Eigen::Vector3d(1.0, 0.0, 0.0),
-    Eigen::Vector3d::Zero(), 0.2, 0.1, 0.02, 0.5);
-  EXPECT_NEAR(correction.gyro_bias_delta.z(), 0.001, 1e-9);
+    vehicle_delta, Sophus::SO3d(), Sophus::SE3d(), Eigen::Vector3d(1.0, 0.0, 0.0), Sophus::SE3d(),
+    0.1, 0.1, 0.02, 0.5);
+  EXPECT_NEAR(correction.gyro_bias_delta.z(), 0.002, 1e-9);
   EXPECT_NEAR(correction.gyro_bias_delta.x(), 0.0, 1e-12);
   EXPECT_NEAR(correction.gyro_bias_delta.y(), 0.0, 1e-12);
 }
 
-TEST(LidarMatch, yaw_correction_far_from_the_origin_updates_gyro_bias)
+TEST(InertialCorrection, long_interval_gates_bias_but_still_blends_speed)
+{
+  const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(2.0, 0.0, 0.0));
+  const InertialCorrection correction = inertial_correction_from_match(
+    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d(10.0, 0.0, 0.0), Sophus::SE3d(), 0.2,
+    0.1, 0.02, 0.5);
+  EXPECT_NEAR(correction.velocity_world.x(), 0.5 * 10.0 + 0.5 * (2.0 / 0.2), 1e-9);
+  EXPECT_NEAR(correction.gyro_bias_delta.norm(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.accel_bias_delta.norm(), 0.0, 1e-12);
+}
+
+TEST(InertialCorrection, large_translation_gates_bias)
+{
+  const Sophus::SE3d vehicle_delta(Sophus::SO3d(), Eigen::Vector3d(0.31, 0.0, 0.0));
+  const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(1.0, 0.0, 0.0));
+  const InertialCorrection correction = inertial_correction_from_match(
+    vehicle_delta, Sophus::SO3d(), corrected, Eigen::Vector3d::Zero(), Sophus::SE3d(), 0.1, 0.1,
+    0.02, 0.5);
+  EXPECT_NEAR(correction.velocity_world.x(), 0.5 * (1.0 / 0.1), 1e-9);
+  EXPECT_NEAR(correction.gyro_bias_delta.norm(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.accel_bias_delta.norm(), 0.0, 1e-12);
+}
+
+TEST(InertialCorrection, high_yaw_rate_gates_bias)
+{
+  const Sophus::SE3d vehicle_delta(Sophus::SO3d::rotZ(0.02), Eigen::Vector3d::Zero());
+  const InertialCorrection correction = inertial_correction_from_match(
+    vehicle_delta, Sophus::SO3d(), Sophus::SE3d(), Eigen::Vector3d::Zero(), Sophus::SE3d(), 0.1, 0.1,
+    0.02, 0.5);
+  EXPECT_NEAR(correction.gyro_bias_delta.norm(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.accel_bias_delta.norm(), 0.0, 1e-12);
+}
+
+TEST(InertialCorrection, straight_step_updates_only_forward_accel_bias)
+{
+  const Sophus::SE3d corrected(Sophus::SO3d(), Eigen::Vector3d(1.0, 0.4, 0.2));
+  const InertialCorrection correction = inertial_correction_from_match(
+    Sophus::SE3d(), Sophus::SO3d(), corrected, Eigen::Vector3d(2.0, 3.0, 1.0), Sophus::SE3d(), 0.1,
+    0.1, 0.02, 1.0);
+  EXPECT_LT(correction.accel_bias_delta.x(), 0.0);
+  EXPECT_NEAR(correction.accel_bias_delta.y(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.accel_bias_delta.z(), 0.0, 1e-12);
+  EXPECT_NEAR(correction.velocity_world.y(), 0.0, 1e-12);
+}
+
+TEST(LidarMatch, yaw_correction_updates_gyro_bias_at_the_lidar_origin)
 {
   ImuProcessor imu = aligned_imu();
   LidarImuMatcher matcher(match_params());
-  imu.reset_state(
-    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(40.0, 0.0, 0.0)), Eigen::Vector3d::Zero(),
-    imu.latest_stamp());
-  ASSERT_TRUE(matcher.on_scan(corner_scan(imu.latest_stamp()), imu).first_scan);
+  const MatchResult first = matcher.on_scan(corner_scan(imu.latest_stamp()), imu);
+  ASSERT_TRUE(first.first_scan);
+  ASSERT_TRUE(first.initialized_origin);
+  EXPECT_NEAR(first.corrected_pose.translation().norm(), 0.0, 1.0e-9);
+  EXPECT_NEAR(first.corrected_pose.so3().log().norm(), 0.0, 1.0e-9);
 
-  const double later = imu.latest_stamp() + 0.2;
+  const double later = imu.latest_stamp() + 0.12;
   const ProcessorOutput stepped =
     imu.process(ImuSample{later, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()});
   ASSERT_TRUE(stepped.aligned);
-  constexpr double k_yaw = 0.05;
-  imu.reset_state(
-    Sophus::SE3d(Sophus::SO3d::rotZ(k_yaw), Eigen::Vector3d(40.0, 0.0, 0.0)),
-    Eigen::Vector3d::Zero(), later);
+  constexpr double k_yaw = 0.008;
+  imu.reset_state(Sophus::SE3d(Sophus::SO3d::rotZ(k_yaw), Eigen::Vector3d::Zero()), Eigen::Vector3d::Zero(), later);
 
   const MatchResult matched = matcher.on_scan(corner_scan(later), imu);
   ASSERT_TRUE(matched.applied);
-  EXPECT_GT(matched.correction.translation().norm(), 1.0);
-  EXPECT_LT(matched.translation_error, 0.5);
-  EXPECT_NEAR(imu.pose().translation().x(), 40.0, 0.25);
-  EXPECT_NEAR(imu.pose().translation().y(), 0.0, 0.25);
+  EXPECT_LT(matched.translation_error, 0.30);
+  EXPECT_NEAR(imu.pose().translation().norm(), 0.0, 0.25);
   EXPECT_LT(imu.pose().so3().log().norm(), 0.03);
   EXPECT_GT(imu.gyro_bias().z(), 0.0);
   EXPECT_NEAR(imu.accel_bias().y(), 0.0, 1e-9);
+}
+
+TEST(LidarInit, large_imu_attitude_keeps_scan_zero_at_identity)
+{
+  ImuProcessor imu = aligned_imu();
+  const Sophus::SE3d attitude(
+    Sophus::SO3d::rotX(1.2) * Sophus::SO3d::rotY(-0.4), Eigen::Vector3d(4.0, -2.0, 1.0));
+  imu.reset_state(attitude, Eigen::Vector3d::Zero(), imu.latest_stamp());
+
+  LidarMatchParams params = match_params();
+  params.init_scan_count = 2;
+  LidarImuMatcher matcher(params);
+  const MatchResult first = matcher.on_scan(corner_scan(imu.latest_stamp()), imu);
+  ASSERT_TRUE(first.first_scan);
+  EXPECT_TRUE(first.initializing);
+  EXPECT_FALSE(first.initialized_origin);
+  EXPECT_FALSE(matcher.odometry_initialized());
+  EXPECT_FALSE(matcher.has_reference());
+  EXPECT_TRUE(matcher.local_map().empty());
+  EXPECT_NEAR(first.corrected_pose.translation().norm(), 0.0, 1.0e-9);
+  EXPECT_NEAR(first.corrected_pose.so3().log().norm(), 0.0, 1.0e-9);
+  EXPECT_NEAR((attitude.inverse() * imu.pose()).log().norm(), 0.0, 1.0e-6);
+
+  const Sophus::SE3d delta(Sophus::SO3d::rotZ(0.15), Eigen::Vector3d(0.4, -0.1, 0.0));
+  const double later = imu.latest_stamp() + 0.1;
+  ASSERT_TRUE(
+    imu.process(ImuSample{later, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()}).aligned);
+  imu.reset_state(attitude * delta, Eigen::Vector3d::Zero(), later);
+  const ScanAlignment second = matcher.align_scan(corner_scan(later), imu);
+  ASSERT_TRUE(second.ready);
+  EXPECT_NEAR((delta.inverse() * second.predicted).log().norm(), 0.0, 1.0e-6);
+  EXPECT_FALSE(matcher.odometry_initialized());
+}
+
+TEST(LidarInit, bundle_adjustment_holds_the_origin_and_pulls_a_shifted_scan)
+{
+  ImuProcessor imu = aligned_imu();
+  LidarMatchParams params = match_params();
+  params.init_scan_count = 2;
+  // 0.5 m keeps this 0.1 m corner in the stored cloud. The init solve fits planes at twice that.
+  params.voxel_size = 0.5;
+  LidarImuMatcher matcher(params);
+  const auto dense_corner = [](const double stamp) {
+    LidarScan scan;
+    scan.stamp = stamp;
+    for (int i = 0; i <= 40; ++i) {
+      for (int j = 0; j <= 40; ++j) {
+        const double a = 0.1 * static_cast<double>(i);
+        const double b = 0.1 * static_cast<double>(j);
+        scan.points.emplace_back(a, b, 0.0);
+        scan.points.emplace_back(0.0, a, b);
+        scan.points.emplace_back(a, 0.0, b);
+        scan.timestamps.insert(scan.timestamps.end(), 3, stamp);
+      }
+    }
+    return scan;
+  };
+  ASSERT_TRUE(matcher.on_scan(dense_corner(imu.latest_stamp()), imu).first_scan);
+
+  const Sophus::SE3d shift(Sophus::SO3d(), Eigen::Vector3d(0.04, 0.0, 0.0));
+  const double later = imu.latest_stamp() + 0.1;
+  ASSERT_TRUE(
+    imu.process(ImuSample{later, Eigen::Vector3d(0.0, 0.0, -9.81), Eigen::Vector3d::Zero()}).aligned);
+  imu.reset_state(shift, Eigen::Vector3d::Zero(), later);
+  const MatchResult solved = matcher.on_scan(dense_corner(later), imu);
+  ASSERT_TRUE(solved.initialized_origin);
+  EXPECT_TRUE(solved.refined_window);
+  EXPECT_GT(solved.refine_shift, 0.001) << solved.refine_shift;
+  EXPECT_TRUE(matcher.odometry_initialized());
+  EXPECT_TRUE(matcher.has_reference());
+  EXPECT_FALSE(matcher.local_map().empty());
+
+  const std::vector<StampedPose> poses = matcher.visible_scan_poses();
+  ASSERT_EQ(poses.size(), 2U);
+  EXPECT_NEAR(poses.front().pose.translation().norm(), 0.0, 1.0e-6);
+  EXPECT_NEAR(poses.front().pose.so3().log().norm(), 0.0, 1.0e-6);
+  EXPECT_LT(poses.back().pose.translation().x(), 0.035);
+  EXPECT_GT(poses.back().pose.translation().x(), -0.01);
+  EXPECT_NEAR(poses.back().pose.translation().y(), 0.0, 0.03);
+  EXPECT_NEAR(poses.back().pose.translation().z(), 0.0, 0.03);
+  EXPECT_NEAR(
+    (poses.back().pose.inverse() * imu.pose()).log().norm(), 0.0, 1.0e-6);
 }
 
 TEST(ScanWindow, shifted_corner_is_pulled_back_to_the_frozen_map)
@@ -591,7 +723,7 @@ TEST(LocalizationHealth, rejected_scans_degrade_then_diverge)
   for (int step = 0; step < 2; ++step) {
     const double stamp = imu.latest_stamp() + 0.5;
     imu.reset_state(
-      Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
+      Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(3.0, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
       stamp);
     const MatchResult matched = matcher.on_scan(corner_scan(stamp), imu);
     EXPECT_FALSE(matched.applied);
@@ -599,7 +731,7 @@ TEST(LocalizationHealth, rejected_scans_degrade_then_diverge)
   }
   const double stamp = imu.latest_stamp() + 0.5;
   imu.reset_state(
-    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(1.2, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
+    Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(3.0, 0.0, 0.0)), Eigen::Vector3d(40.0, 0.0, 0.0),
     stamp);
   ASSERT_FALSE(matcher.on_scan(corner_scan(stamp), imu).applied);
   EXPECT_EQ(matcher.health(), LocalizationHealth::Diverged);
@@ -806,6 +938,7 @@ TEST(LidarMatch, stage_times_without_coarse_guess)
   params.max_points_per_voxel = 20;
   params.refine_window = true;
   params.refine_min_travel = 2.0;
+  params.init_scan_count = 1;
   params.convergence_criterion = 1.0e-4;
   LidarImuMatcher matcher(params);
   ImuProcessor imu = aligned_imu();
@@ -1028,6 +1161,32 @@ TEST(PlaneIcp, align_to_surface_recovers_a_shifted_corner)
   EXPECT_LT(result.robust_cost, 0.05);
   // correction * guess == pose
   EXPECT_LT(((result.correction * guess).inverse() * result.pose).log().norm(), 1.0e-9);
+}
+
+TEST(PlaneIcp, rear_axle_prior_holds_longitudinal_and_releases_lateral_and_yaw)
+{
+  constexpr double voxel_size = 0.25;
+  kiss_icp::VoxelHashMap map(voxel_size, 1.0e6, 20);
+  const std::vector<Eigen::Vector3d> points = corner_scan(0.0).points;
+  map.AddPoints(points);
+  SurfaceVoxelMap surface;
+  surface.voxel_size = voxel_size;
+  surface.rebuild_from(map);
+  const Sophus::SE3d guess(
+    Sophus::SO3d::exp(Eigen::Vector3d(0.0, 0.0, 0.04)), Eigen::Vector3d(0.20, -0.12, 0.0));
+  PlaneIcpParams params;
+  params.max_iterations = 30;
+  params.convergence_criterion = 1.0e-4;
+  const PlaneIcpResult free_result = align_to_surface(points, map, surface, guess, params);
+  // Above the corner's longitudinal walls, and below the degeneracy cut that would freeze y and yaw.
+  params.longitudinal_prior_weight = 2.0e3;
+  params.rear_axle_z = -1.8;
+  params.rear_axle_y = 0.0;
+  const PlaneIcpResult held = align_to_surface(points, map, surface, guess, params);
+  EXPECT_LT(std::abs(free_result.pose.translation().x()), 0.05);
+  EXPECT_GT(held.pose.translation().x(), free_result.pose.translation().x() + 0.08);
+  EXPECT_LT(std::abs(held.pose.translation().y()), 0.06);
+  EXPECT_LT(std::abs(held.pose.so3().log().z()), 0.025);
 }
 
 TEST(PlaneIcp, deadline_returns_the_partial_pose_not_the_seed)

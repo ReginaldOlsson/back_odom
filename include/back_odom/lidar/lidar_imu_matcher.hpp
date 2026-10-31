@@ -26,6 +26,7 @@
 #include <sophus/se3.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -75,6 +76,9 @@ struct LidarMatchParams
   double refine_min_travel{2.0};
   /// After this many collective passes a scan is trusted and left out of later solves.
   int refine_settle_passes{2};
+  /// Scans buffered before the map exists. Scan 0 is the identity odom frame. The IMU only
+  /// seeds the motion from that scan. 1 inserts it immediately; more than 1 bundle-adjusts first.
+  int init_scan_count{10};
   /// When false, ICP still builds the local map but does not move IMU pose/velocity/biases.
   bool apply_imu_correction{true};
   // Fraction of the vehicle-frame residual turned into a bias step each accepted scan.
@@ -82,9 +86,14 @@ struct LidarMatchParams
   double accel_bias_gain{0.02};
   // How much of the speed comes from the lidar displacement. Direction stays with the IMU.
   double speed_correction_gain{0.5};
-  /// ICP may nudge the IMU step by at most this many metres along the vehicle.
-  /// Lateral shift and yaw stay with the lidar match.
+  /// Retired hard clamp, still declared so existing parameter files load. Forward slip is limited
+  /// by the rear-axle prior inside the ICP normal equations.
   double max_longitudinal_correction{0.15};
+  /// Soft penalty on rear-axle longitudinal slip relative to the ICP seed. 0 disables it.
+  double longitudinal_prior_weight{50.0};
+  /// Rear axle in the sensor frame. Negative z is below the sensor, not the IMU lever arm.
+  double rear_axle_z{-1.8};
+  double rear_axle_y{0.0};
   double max_gyro_bias{0.05};
   double max_accel_bias{1.0};
   /// Mean Mahalanobis D_M^2 threshold (χ² 3-DoF ~95% heuristic). Also the per-point inlier cut.
@@ -168,8 +177,8 @@ struct InertialCorrection
 [[nodiscard]] InertialCorrection inertial_correction_from_match(
   const Sophus::SE3d & vehicle_delta, const Sophus::SO3d & orientation_correction,
   const Sophus::SE3d & corrected_pose, const Eigen::Vector3d & imu_velocity_world,
-  const Eigen::Vector3d & previous_position, double dt, double gyro_bias_gain,
-  double accel_bias_gain, double speed_gain);
+  const Sophus::SE3d & previous_pose, double dt, double gyro_bias_gain, double accel_bias_gain,
+  double speed_gain);
 
 struct MatchResult
 {
@@ -206,6 +215,10 @@ struct MatchResult
   bool partial_used{false};
   /// The ICP seed was the lidar anchor composed with the integrated EKF body twist.
   bool ekf_twist_prior{false};
+  /// This scan is held until the lidar-first window is solved. No map pose is published yet.
+  bool initializing{false};
+  /// This scan committed the odom frame. Scan 0 of that window is the identity.
+  bool initialized_origin{false};
   bool refined_window{false};
   double refine_shift{0.0};
   int refine_scans{0};
@@ -250,6 +263,10 @@ public:
   explicit LidarImuMatcher(const LidarMatchParams & params);
 
   [[nodiscard]] bool has_reference() const;
+  /// False until the first lidar window has been solved and the IMU reseeded onto it.
+  [[nodiscard]] bool odometry_initialized() const;
+  [[nodiscard]] int init_scan_count() const;
+  [[nodiscard]] std::size_t buffered_init_scans() const;
   [[nodiscard]] std::vector<Eigen::Vector3d> local_map() const;
   /// Horizon points in the map frame, with scan id and collective-pass count for RViz.
   [[nodiscard]] std::vector<LocalMapPoint> annotated_local_map() const;
@@ -313,6 +330,8 @@ private:
   void queue_insert(
     const Sophus::SE3d & pose, double stamp, std::vector<Eigen::Vector3d> && points,
     std::vector<float> && intensities);
+  /// Bundle-adjust the buffered window, fix scan 0 at identity, and reseed the IMU.
+  void solve_initialization(ImuProcessor & imu, MatchResult & result);
   void insert_scan(
     const Sophus::SE3d & pose, double stamp, std::vector<Eigen::Vector3d> && points,
     std::vector<float> && intensities, MatchResult & timing);
@@ -341,6 +360,20 @@ private:
     std::vector<float> intensities;
   };
   PendingInsert pending_insert_;
+  struct BufferedInitScan
+  {
+    double stamp{0.0};
+    /// IMU motion from scan 0, then the optimized pose once the window is solved.
+    Sophus::SE3d seed{};
+    std::vector<Eigen::Vector3d> points;
+    std::vector<float> intensities;
+  };
+  std::vector<BufferedInitScan> init_buffer_;
+  bool has_imu_origin_{false};
+  /// Absolute IMU pose at scan 0. Later seeds are imu_origin_.inverse() * imu(tk).
+  Sophus::SE3d imu_origin_{};
+  bool pending_init_ready_{false};
+  std::atomic<bool> odom_initialized_{false};
   struct HorizonScan
   {
     double stamp{0.0};
@@ -366,7 +399,9 @@ private:
   double anchor_stamp_{0.0};
   Sophus::SE3d last_keyframe_pose_{};
   double last_correction_stamp_{0.0};
-  Eigen::Vector3d last_correction_position_{Eigen::Vector3d::Zero()};
+  /// Pose at the previous accepted correction. The SE(3) log from here to the new pose is the
+  /// arc-length body velocity, replacing the chord of the translation alone.
+  Sophus::SE3d last_correction_pose_{};
   Eigen::Vector3d gyro_bias_prior_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d accel_bias_prior_{Eigen::Vector3d::Zero()};
   bool has_bias_prior_{false};

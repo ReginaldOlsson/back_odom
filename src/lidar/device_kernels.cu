@@ -40,9 +40,15 @@ namespace
 {
 
 constexpr int k_threads = 128;
+constexpr int k_warps = k_threads / 32;
 constexpr int k_max_blocks = 1024;
 constexpr double k_sophus_epsilon_sq = 1.0e-20;
 constexpr std::uint64_t k_outside_key = ~0ULL;
+
+// NOTE: LidarImuMatcher::align() checks close_poses(cpu.pose, device->pose) (< 5mm / 5mrad)
+// during device_bakeoff_scan. Keep these two flags matched with align_to_surface() in plane_icp.cpp.
+constexpr bool k_fix_gm_kernel_scale = false;     // Set true when plane_icp.cpp uses denom = kernel2 + r^2
+constexpr bool k_decouple_ground_planar = false;  // Set true when plane_icp.cpp strips ground from [x, y, yaw]
 
 int g_failed = 0;
 
@@ -74,6 +80,12 @@ struct MapCache
   int * offsets{nullptr};
   CudaVoxelPlane * planes{nullptr};
   int plane_capacity{0};
+
+  // Open-addressed power-of-2 hash table: key -> voxel index in [0, unique)
+  std::uint64_t * hash_keys{nullptr};
+  int * hash_vals{nullptr};
+  int hash_capacity{0};
+  std::uint32_t hash_mask{0};
 };
 
 MapCache g_map;
@@ -112,10 +124,11 @@ bool ensure_capacity(T *& pointer, int & capacity, const int needed)
   if (needed <= capacity && pointer != nullptr) {
     return true;
   }
+  const int old_capacity = capacity;
   cudaFree(pointer);
   pointer = nullptr;
   capacity = 0;
-  const int grown = std::max(needed, capacity + capacity / 2);
+  const int grown = std::max(needed, old_capacity + old_capacity / 2);
   if (!check("cudaMalloc", cudaMalloc(&pointer, static_cast<std::size_t>(grown) * sizeof(T)))) {
     return false;
   }
@@ -131,6 +144,8 @@ void release_map()
   cudaFree(g_map.counts);
   cudaFree(g_map.offsets);
   cudaFree(g_map.planes);
+  cudaFree(g_map.hash_keys);
+  cudaFree(g_map.hash_vals);
   g_map = MapCache{};
 }
 
@@ -324,22 +339,54 @@ __global__ void deskew_kernel(
   deskewed[3 * index + 2] = out[2];
 }
 
-__device__ int find_voxel(const std::uint64_t * keys, int count, std::uint64_t key)
+__device__ __forceinline__ std::uint32_t hash_voxel_key(std::uint64_t key, std::uint32_t mask)
 {
-  int low = 0;
-  int high = count;
-  while (low < high) {
-    const int mid = (low + high) >> 1;
-    if (keys[mid] < key) {
-      low = mid + 1;
-    } else {
-      high = mid;
+  key ^= key >> 33;
+  key *= 0xff51afd7ed558ccdULL;
+  key ^= key >> 33;
+  key *= 0xc4ceb9fe1a85ec53ULL;
+  key ^= key >> 33;
+  return static_cast<std::uint32_t>(key) & mask;
+}
+
+__global__ void build_voxel_hash_kernel(
+  const std::uint64_t * __restrict__ unique_keys, int unique_count,
+  std::uint64_t * __restrict__ hash_keys, int * __restrict__ hash_vals, std::uint32_t mask)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= unique_count) {
+    return;
+  }
+  const std::uint64_t key = unique_keys[index];
+  std::uint32_t slot = hash_voxel_key(key, mask);
+  while (true) {
+    const unsigned long long prev = atomicCAS(
+      reinterpret_cast<unsigned long long *>(&hash_keys[slot]),
+      static_cast<unsigned long long>(k_outside_key),
+      static_cast<unsigned long long>(key));
+    if (prev == static_cast<unsigned long long>(k_outside_key)) {
+      hash_vals[slot] = index;
+      return;
     }
+    slot = (slot + 1u) & mask;
   }
-  if (low < count && keys[low] == key) {
-    return low;
+}
+
+__device__ __forceinline__ int find_voxel_hash(
+  const std::uint64_t * __restrict__ hash_keys, const int * __restrict__ hash_vals,
+  std::uint32_t mask, std::uint64_t key)
+{
+  std::uint32_t slot = hash_voxel_key(key, mask);
+  while (true) {
+    const std::uint64_t stored = __ldg(&hash_keys[slot]);
+    if (stored == key) {
+      return __ldg(&hash_vals[slot]);
+    }
+    if (stored == k_outside_key) {
+      return -1;
+    }
+    slot = (slot + 1u) & mask;
   }
-  return -1;
 }
 
 __device__ int upper_index(int row, int col)
@@ -355,41 +402,70 @@ struct Partial
   double cost;
 };
 
-/// Closest map point in the 27-voxel neighbourhood (float ranking), plane from that voxel's
-/// cached normal, residual and Jacobian in double. Same association as align_to_surface.
+__device__ __forceinline__ double warp_reduce_sum(double val)
+{
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xffffffffu, val, offset);
+  }
+  return val;
+}
+
+__device__ __forceinline__ int warp_reduce_sum_int(int val)
+{
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xffffffffu, val, offset);
+  }
+  return val;
+}
+
+struct PoseArg
+{
+  double rotation[9];
+  double translation[3];
+};
+
+/// Closest map point in the 27-voxel neighbourhood using O(1) hash lookup and warp-shuffle reduction.
 __global__ void plane_kernel(
-  const double * frame, int frame_count, const double * rotation, const double * translation,
-  const MapPoint * points, const std::uint64_t * keys, const int * offsets,
-  const CudaVoxelPlane * planes, int unique, double voxel_size, double max_distance,
-  double kernel_scale, Partial * partials)
+  const double * __restrict__ frame, int frame_count, PoseArg pose, const MapPoint * __restrict__ points,
+  const std::uint64_t * __restrict__ hash_keys, const int * __restrict__ hash_vals, std::uint32_t hash_mask,
+  const int * __restrict__ offsets, const CudaVoxelPlane * __restrict__ planes, double inv_voxel_size,
+  double max_distance, double kernel_scale, Partial * __restrict__ out_total)
 {
   Partial local{};
   const double kernel2 = kernel_scale * kernel_scale;
+  const double denom_const = k_fix_gm_kernel_scale ? kernel2 : kernel_scale;
+  const double weight_num = k_fix_gm_kernel_scale ? (kernel2 * kernel2) : kernel2;
   const float max_distance_sq = static_cast<float>(max_distance * max_distance);
+
   for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < frame_count;
        index += blockDim.x * gridDim.x) {
     const double body[3] = {frame[3 * index], frame[3 * index + 1], frame[3 * index + 2]};
     double world[3];
-    mat_vec(rotation, translation, body, world);
+    mat_vec(pose.rotation, pose.translation, body, world);
     const float qx = static_cast<float>(world[0]);
     const float qy = static_cast<float>(world[1]);
     const float qz = static_cast<float>(world[2]);
-    const int base_x = static_cast<int>(floor(world[0] / voxel_size));
-    const int base_y = static_cast<int>(floor(world[1] / voxel_size));
-    const int base_z = static_cast<int>(floor(world[2] / voxel_size));
+    const int base_x = static_cast<int>(floor(world[0] * inv_voxel_size));
+    const int base_y = static_cast<int>(floor(world[1] * inv_voxel_size));
+    const int base_z = static_cast<int>(floor(world[2] * inv_voxel_size));
 
     float best = max_distance_sq;
-    int best_point = -1;
     int best_voxel = -1;
+    double best_x = 0.0;
+    double best_y = 0.0;
+    double best_z = 0.0;
+
     for (int shift = 0; shift < 27; ++shift) {
       const std::uint64_t key = pack_voxel_key(
         base_x + c_shifts[shift][0], base_y + c_shifts[shift][1], base_z + c_shifts[shift][2]);
-      const int found = find_voxel(keys, unique, key);
+      const int found = find_voxel_hash(hash_keys, hash_vals, hash_mask, key);
       if (found < 0) {
         continue;
       }
-      const int begin = offsets[found];
-      const int end = offsets[found + 1];
+      const int begin = __ldg(&offsets[found]);
+      const int end = __ldg(&offsets[found + 1]);
       for (int cursor = begin; cursor < end; ++cursor) {
         const MapPoint point = points[cursor];
         const float dx = point.fx - qx;
@@ -398,8 +474,10 @@ __global__ void plane_kernel(
         const float distance = dx * dx + dy * dy + dz * dz;
         if (distance < best) {
           best = distance;
-          best_point = cursor;
           best_voxel = found;
+          best_x = point.x;
+          best_y = point.y;
+          best_z = point.z;
         }
       }
     }
@@ -407,81 +485,108 @@ __global__ void plane_kernel(
     double residual = max_distance;
     bool usable = false;
     double normal[3] = {0.0, 0.0, 0.0};
-    if (best_point >= 0) {
+    if (best_voxel >= 0) {
       const CudaVoxelPlane plane = planes[best_voxel];
       if (plane.planar != 0) {
-        const MapPoint closest = points[best_point];
         normal[0] = plane.nx;
         normal[1] = plane.ny;
         normal[2] = plane.nz;
-        residual = normal[0] * (world[0] - closest.x) + normal[1] * (world[1] - closest.y) +
-                   normal[2] * (world[2] - closest.z);
+        residual = normal[0] * (world[0] - best_x) + normal[1] * (world[1] - best_y) +
+                   normal[2] * (world[2] - best_z);
         usable = true;
       }
     }
-    const double denom = kernel_scale + residual * residual;
-    local.cost += kernel2 * residual * residual / denom;
+    const double r2 = residual * residual;
+    const double denom = denom_const + r2;
+    local.cost += kernel2 * r2 / denom;
     if (!usable) {
       continue;
     }
     const double normal_body[3] = {
-      rotation[0] * normal[0] + rotation[3] * normal[1] + rotation[6] * normal[2],
-      rotation[1] * normal[0] + rotation[4] * normal[1] + rotation[7] * normal[2],
-      rotation[2] * normal[0] + rotation[5] * normal[1] + rotation[8] * normal[2]};
+      pose.rotation[0] * normal[0] + pose.rotation[3] * normal[1] + pose.rotation[6] * normal[2],
+      pose.rotation[1] * normal[0] + pose.rotation[4] * normal[1] + pose.rotation[7] * normal[2],
+      pose.rotation[2] * normal[0] + pose.rotation[5] * normal[1] + pose.rotation[8] * normal[2]};
+
+    const double planar_scale = (k_decouple_ground_planar && fabs(normal_body[2]) > 0.85) ? 0.0 : 1.0;
+
     const double jacobian[6] = {
-      normal_body[0],
-      normal_body[1],
+      planar_scale * normal_body[0],
+      planar_scale * normal_body[1],
       normal_body[2],
       body[1] * normal_body[2] - body[2] * normal_body[1],
       body[2] * normal_body[0] - body[0] * normal_body[2],
-      body[0] * normal_body[1] - body[1] * normal_body[0]};
-    const double weight = kernel2 / (denom * denom);
+      planar_scale * (body[0] * normal_body[1] - body[1] * normal_body[0])};
+    const double weight = weight_num / (denom * denom);
     ++local.correspondences;
+    #pragma unroll
     for (int row = 0; row < 6; ++row) {
-      local.jtr[row] += jacobian[row] * weight * residual;
+      const double w_j = weight * jacobian[row];
+      local.jtr[row] += w_j * residual;
+      #pragma unroll
       for (int col = row; col < 6; ++col) {
-        local.jtj[upper_index(row, col)] += weight * jacobian[row] * jacobian[col];
+        local.jtj[upper_index(row, col)] += w_j * jacobian[col];
       }
     }
   }
 
-  __shared__ double shared_jtj[k_threads][21];
-  __shared__ double shared_jtr[k_threads][6];
-  __shared__ int shared_count[k_threads];
-  __shared__ double shared_cost[k_threads];
-  const int thread = threadIdx.x;
+  __shared__ double warp_jtj[k_warps][21];
+  __shared__ double warp_jtr[k_warps][6];
+  __shared__ double warp_cost[k_warps];
+  __shared__ int warp_count[k_warps];
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+
+  #pragma unroll
   for (int item = 0; item < 21; ++item) {
-    shared_jtj[thread][item] = local.jtj[item];
+    const double sum = warp_reduce_sum(local.jtj[item]);
+    if (lane == 0) {
+      warp_jtj[warp_id][item] = sum;
+    }
   }
+  #pragma unroll
   for (int item = 0; item < 6; ++item) {
-    shared_jtr[thread][item] = local.jtr[item];
+    const double sum = warp_reduce_sum(local.jtr[item]);
+    if (lane == 0) {
+      warp_jtr[warp_id][item] = sum;
+    }
   }
-  shared_count[thread] = local.correspondences;
-  shared_cost[thread] = local.cost;
+  const double c_sum = warp_reduce_sum(local.cost);
+  const int n_sum = warp_reduce_sum_int(local.correspondences);
+  if (lane == 0) {
+    warp_cost[warp_id] = c_sum;
+    warp_count[warp_id] = n_sum;
+  }
   __syncthreads();
-  for (int stride = k_threads / 2; stride > 0; stride >>= 1) {
-    if (thread < stride) {
-      for (int item = 0; item < 21; ++item) {
-        shared_jtj[thread][item] += shared_jtj[thread + stride][item];
-      }
-      for (int item = 0; item < 6; ++item) {
-        shared_jtr[thread][item] += shared_jtr[thread + stride][item];
-      }
-      shared_count[thread] += shared_count[thread + stride];
-      shared_cost[thread] += shared_cost[thread + stride];
-    }
-    __syncthreads();
-  }
-  if (thread == 0) {
-    Partial & out = partials[blockIdx.x];
+
+  if (threadIdx.x == 0) {
+    #pragma unroll
     for (int item = 0; item < 21; ++item) {
-      out.jtj[item] = shared_jtj[0][item];
+      double total = 0.0;
+      #pragma unroll
+      for (int w = 0; w < k_warps; ++w) {
+        total += warp_jtj[w][item];
+      }
+      atomicAdd(&out_total->jtj[item], total);
     }
+    #pragma unroll
     for (int item = 0; item < 6; ++item) {
-      out.jtr[item] = shared_jtr[0][item];
+      double total = 0.0;
+      #pragma unroll
+      for (int w = 0; w < k_warps; ++w) {
+        total += warp_jtr[w][item];
+      }
+      atomicAdd(&out_total->jtr[item], total);
     }
-    out.correspondences = shared_count[0];
-    out.cost = shared_cost[0];
+    double total_cost = 0.0;
+    int total_count = 0;
+    #pragma unroll
+    for (int w = 0; w < k_warps; ++w) {
+      total_cost += warp_cost[w];
+      total_count += warp_count[w];
+    }
+    atomicAdd(&out_total->cost, total_cost);
+    atomicAdd(&out_total->correspondences, total_count);
   }
 }
 
@@ -684,13 +789,21 @@ bool cuda_upload_map(
   }
   // Persistent buffers sized to the map; all per-point arrays share one capacity.
   if (count > g_map.point_capacity || g_map.points == nullptr) {
-    const int grown = std::max(count + count / 4, g_map.point_capacity);
+    const int grown = std::max(count + count / 4, g_map.point_capacity + g_map.point_capacity / 2);
     CudaVoxelPlane * planes = g_map.planes;
     const int plane_capacity = g_map.plane_capacity;
+    std::uint64_t * hash_keys = g_map.hash_keys;
+    int * hash_vals = g_map.hash_vals;
+    const int hash_capacity = g_map.hash_capacity;
     g_map.planes = nullptr;
+    g_map.hash_keys = nullptr;
+    g_map.hash_vals = nullptr;
     release_map();
     g_map.planes = planes;
     g_map.plane_capacity = plane_capacity;
+    g_map.hash_keys = hash_keys;
+    g_map.hash_vals = hash_vals;
+    g_map.hash_capacity = hash_capacity;
     const std::size_t capacity = static_cast<std::size_t>(grown) + 1;
     if (
       !check("cudaMalloc", cudaMalloc(&g_map.points, capacity * sizeof(MapPoint))) ||
@@ -733,6 +846,47 @@ bool cuda_upload_map(
       return false;
     }
     g_map.unique = unique;
+
+    // Build power-of-2 open-addressed hash table (load factor <= 0.5)
+    int needed_hash = 256;
+    while (needed_hash < unique * 2) {
+      needed_hash <<= 1;
+    }
+    if (needed_hash > g_map.hash_capacity || g_map.hash_keys == nullptr || g_map.hash_vals == nullptr) {
+      cudaFree(g_map.hash_keys);
+      cudaFree(g_map.hash_vals);
+      g_map.hash_keys = nullptr;
+      g_map.hash_vals = nullptr;
+      g_map.hash_capacity = 0;
+      if (
+        !check(
+          "cudaMalloc",
+          cudaMalloc(&g_map.hash_keys, static_cast<std::size_t>(needed_hash) * sizeof(std::uint64_t))) ||
+        !check(
+          "cudaMalloc", cudaMalloc(&g_map.hash_vals, static_cast<std::size_t>(needed_hash) * sizeof(int)))) {
+        release_map();
+        return false;
+      }
+      g_map.hash_capacity = needed_hash;
+    }
+    g_map.hash_mask = static_cast<std::uint32_t>(g_map.hash_capacity - 1);
+    if (!check(
+          "cudaMemset",
+          cudaMemset(
+            g_map.hash_keys, 0xFF, static_cast<std::size_t>(g_map.hash_capacity) * sizeof(std::uint64_t)))) {
+      release_map();
+      return false;
+    }
+    if (unique > 0) {
+      const int hash_blocks = (unique + k_threads - 1) / k_threads;
+      build_voxel_hash_kernel<<<hash_blocks, k_threads>>>(
+        g_map.keys, unique, g_map.hash_keys, g_map.hash_vals, g_map.hash_mask);
+      if (!check("build_voxel_hash_kernel", cudaGetLastError())) {
+        release_map();
+        return false;
+      }
+    }
+
     unique_keys.resize(static_cast<std::size_t>(unique));
     if (!check(
           "cudaMemcpy",
@@ -777,27 +931,25 @@ struct PlaneScratch
   double * frame{nullptr};
   int frame_capacity{0};
   int frame_count{0};
-  Partial * partials{nullptr};
-  double * pose{nullptr};
-  std::vector<Partial> host_partials;
+  Partial * d_total{nullptr};
 };
 
 PlaneScratch g_plane;
 
 bool plane_scratch(const int frame_count)
 {
-  if (g_plane.pose == nullptr) {
-    if (!check("cudaMalloc", cudaMalloc(&g_plane.pose, 12 * sizeof(double))) ||
-        !check("cudaMalloc", cudaMalloc(&g_plane.partials, static_cast<std::size_t>(k_max_blocks) * sizeof(Partial)))) {
+  if (g_plane.d_total == nullptr) {
+    if (!check("cudaMalloc", cudaMalloc(&g_plane.d_total, sizeof(Partial)))) {
       return false;
     }
   }
   if (frame_count > g_plane.frame_capacity) {
+    const int old_capacity = g_plane.frame_capacity;
     cudaFree(g_plane.frame);
     g_plane.frame = nullptr;
     g_plane.frame_capacity = 0;
     g_plane.frame_count = 0;
-    const int grown = frame_count + frame_count / 4;
+    const int grown = std::max(frame_count + frame_count / 4, old_capacity + old_capacity / 2);
     if (!check(
           "cudaMalloc",
           cudaMalloc(&g_plane.frame, static_cast<std::size_t>(grown) * 3 * sizeof(double)))) {
@@ -805,7 +957,7 @@ bool plane_scratch(const int frame_count)
     }
     g_plane.frame_capacity = grown;
   }
-  return g_plane.frame != nullptr && g_plane.partials != nullptr;
+  return g_plane.frame != nullptr && g_plane.d_total != nullptr;
 }
 
 }  // namespace
@@ -823,7 +975,7 @@ bool cuda_plane_system(
   if (g_map.unique <= 0) {
     return true;  // empty map: no correspondences, zero system
   }
-  if (g_map.points == nullptr || g_map.planes == nullptr) {
+  if (g_map.points == nullptr || g_map.planes == nullptr || g_map.hash_keys == nullptr) {
     return false;
   }
   const int blocks = std::max(1, std::min(k_max_blocks, (frame_count + k_threads - 1) / k_threads));
@@ -841,41 +993,34 @@ bool cuda_plane_system(
     }
     g_plane.frame_count = frame_count;
   }
-  double pose[12];
-  std::memcpy(pose, rotation, 9 * sizeof(double));
-  std::memcpy(pose + 9, translation, 3 * sizeof(double));
-  if (!check("cudaMemcpy", cudaMemcpy(g_plane.pose, pose, 12 * sizeof(double), cudaMemcpyHostToDevice))) {
+
+  PoseArg pose_arg;
+  std::memcpy(pose_arg.rotation, rotation, 9 * sizeof(double));
+  std::memcpy(pose_arg.translation, translation, 3 * sizeof(double));
+  if (!check("cudaMemset", cudaMemset(g_plane.d_total, 0, sizeof(Partial)))) {
     return false;
   }
+  const double inv_voxel_size = 1.0 / g_map.voxel_size;
   plane_kernel<<<blocks, k_threads>>>(
-    g_plane.frame, frame_count, g_plane.pose, g_plane.pose + 9, g_map.points, g_map.keys,
-    g_map.offsets, g_map.planes, g_map.unique, g_map.voxel_size, max_distance, kernel_scale,
-    g_plane.partials);
+    g_plane.frame, frame_count, pose_arg, g_map.points, g_map.hash_keys, g_map.hash_vals, g_map.hash_mask,
+    g_map.offsets, g_map.planes, inv_voxel_size, max_distance, kernel_scale, g_plane.d_total);
   if (!check("plane_kernel", cudaGetLastError())) {
     return false;
   }
-  g_plane.host_partials.resize(static_cast<std::size_t>(blocks));
+
+  Partial host_total{};
   if (!check(
-        "cudaMemcpy",
-        cudaMemcpy(
-          g_plane.host_partials.data(), g_plane.partials, static_cast<std::size_t>(blocks) * sizeof(Partial),
-          cudaMemcpyDeviceToHost))) {
+        "cudaMemcpy", cudaMemcpy(&host_total, g_plane.d_total, sizeof(Partial), cudaMemcpyDeviceToHost))) {
     return false;
   }
-  double upper[21] = {};
-  for (const Partial & partial : g_plane.host_partials) {
-    for (int item = 0; item < 21; ++item) {
-      upper[item] += partial.jtj[item];
-    }
-    for (int item = 0; item < 6; ++item) {
-      system.jtr[item] += partial.jtr[item];
-    }
-    system.correspondences += partial.correspondences;
-    system.robust_cost_sum += partial.cost;
+  for (int item = 0; item < 6; ++item) {
+    system.jtr[item] = host_total.jtr[item];
   }
+  system.correspondences = host_total.correspondences;
+  system.robust_cost_sum = host_total.cost;
   for (int row = 0; row < 6; ++row) {
     for (int col = row; col < 6; ++col) {
-      const double value = upper[upper_host(row, col)];
+      const double value = host_total.jtj[upper_host(row, col)];
       system.jtj[row * 6 + col] = value;
       system.jtj[col * 6 + row] = value;
     }

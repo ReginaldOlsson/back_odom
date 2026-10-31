@@ -1,0 +1,65 @@
+<launch>
+  <!-- back_odom + EKF at IMU rate for Boreas bags.
+       Example: ros2 launch back_odom back_odom_ekf.launch.xml use_sim_time:=true
+       Then play the bag with the clock flag enabled.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <arg name="launch_vehicle" default="true" description="Publish Boreas base_link to imu/lidar/applanix. Set false if vehicle.launch.xml is already running."/>
+  <arg name="launch_vehicle_interface" default="false"/>
+  <arg name="sensor_model" default="mcu_sensor_kit"/>
+  <arg name="vehicle_model" default="boreas_vehicle"/>
+  <arg name="imu_topic" default="/os_cloud_node/imu"/>
+  <arg name="pointcloud_topic" default="/os_cloud_node/points"/>
+  <arg name="config_file" default="$(find-pkg-share back_odom)/config/config.param.yaml"/>
+  <arg name="ekf_param_file" default="$(find-pkg-share back_odom)/config/ekf_back_odom.param.yaml"/>
+  <arg name="align_to_ground_truth" default="false"/>
+  <arg name="ground_truth_odom_topic" default="/gt"/>
+  <arg name="publish_kpis" default="true"/>
+
+  <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
+
+ <node pkg="livox_ros_driver2" exec="custommsg_to_pointcloud2" name="livox_to_pointcloud2" />
+
+
+  <!-- base_link -> sensor_kit_base_link -> imu, lidar, applanix -->
+  <include if="$(var launch_vehicle)" file="$(find-pkg-share tier4_vehicle_launch)/launch/vehicle.launch.xml">
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
+    <arg name="launch_vehicle_interface" value="$(var launch_vehicle_interface)"/>
+    <arg name="sensor_model" value="$(var sensor_model)"/>
+    <arg name="vehicle_model" value="$(var vehicle_model)"/>
+  </include>
+
+  <!-- ICP pose + IMU twist. publish_tf is false. The RI-EKF owns map -> odom -> base_link. -->
+  <node pkg="back_odom" exec="back_odom_node" name="back_odom_node" output="screen"
+        ros_args="--log-level back_odom_node:=info">
+    <param from="$(var config_file)"/>
+    <param name="imu_topic" value="$(var imu_topic)"/>
+    <param name="pointcloud_topic" value="$(var pointcloud_topic)"/>
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="align_to_ground_truth" value="$(var align_to_ground_truth)"/>
+    <param name="ground_truth_odom_topic" value="$(var ground_truth_odom_topic)"/>
+  </node>
+
+  <!-- IMU propagates attitude, velocity, and position. The first /back_odom/initialpose
+       copies rotation and position. Later poses correct the full pose, and twist corrects
+       body velocity. back_odom integrates /ekf_twist_with_covariance into the next ICP seed. -->
+  <!-- <include file="$(find-pkg-share autoware_ri_ekf_localizer)/launch/ri_ekf_localizer.launch.xml">
+    <arg name="param_file" value="$(var ekf_param_file)"/>
+    <arg name="input_imu_topic" value="$(var imu_topic)"/>
+    <arg name="input_initial_pose_name" value="/back_odom/initialpose"/>
+    <arg name="input_twist_with_cov_name" value="/back_odom/twist_with_covariance"/>
+    <arg name="input_lidar_odom_topic" value="/back_odom/pose_with_covariance"/>
+  </include> -->
+
+  <!-- <node if="$(var publish_kpis)" pkg="back_odom" exec="kitti_error_node" name="kitti_error_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="ground_truth_topic" value="$(var ground_truth_odom_topic)"/>
+    <param name="estimate_topic" value="/back_odom"/>
+  </node> -->
+  <node if="$(var publish_kpis)" pkg="back_odom" exec="lateral_longitudinal_error_node"
+        name="lateral_longitudinal_error_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="ground_truth_topic" value="$(var ground_truth_odom_topic)"/>
+    <param name="estimate_topic" value="/back_odom"/>
+  </node>
+</launch>

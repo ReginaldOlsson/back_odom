@@ -412,10 +412,14 @@ std::optional<PlaneIcpResult> align_points_on_device(
     upload_frame = false;
     result.correspondences = correspondences;
     result.robust_cost = robust_cost;
-    result.hessian = hessian;
     if (correspondences < k_min_correspondences) {
+      result.hessian = hessian;
       break;
     }
+    add_rear_axle_longitudinal_prior(
+      hessian, gradient, pose, initial_guess, params.longitudinal_prior_weight, params.rear_axle_z,
+      params.rear_axle_y);
+    result.hessian = hessian;
     Vector6d dx = Vector6d::Zero();
     int dropped = 0;
     if (!solve_body_increment(hessian, gradient, dx, dropped)) {

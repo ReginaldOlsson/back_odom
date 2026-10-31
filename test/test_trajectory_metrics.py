@@ -16,6 +16,10 @@ import numpy as np
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 
+from calibrate_imu_lidar_extrinsics import (  # noqa: E402
+    compose_base_from_lidar,
+    rotation_that_levels_normal,
+)
 from trajectory_metrics import (  # noqa: E402
     Trajectory,
     Trajectory3,
@@ -196,9 +200,26 @@ class TrajectoryMetricsTest(unittest.TestCase):
             origin, source = detect_time_origin(root, float(trace.ekf.stamps[0]), float(poses.stamps[0]))
             self.assertEqual(source, "imu_gnss_lidar")
             self.assertAlmostEqual(origin, 1606417090.0, places=3)
-            fallback, fallback_source = detect_time_origin(root, 5.0, float(poses.stamps[0]))
-            self.assertEqual(fallback_source, "lidar_minus_trace")
-            self.assertAlmostEqual(fallback, 1606417095.0, places=3)
+            # A first stamp that is not the first lidar pose stays on the hardware origin.
+            early, early_source = detect_time_origin(root, 5.0, float(poses.stamps[0]))
+            self.assertEqual(early_source, "imu_gnss_lidar")
+            self.assertAlmostEqual(early, 1606417090.0, places=3)
+
+    def test_late_trace_keeps_hardware_time_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            applanix = root / "applanix"
+            applanix.mkdir()
+            t0 = 1606417077.521302
+            lidar0 = t0 + 19.981628
+            (applanix / "imu.csv").write_text(f"GPSTime,angvel_z\n{t0},0.0\n", encoding="utf-8")
+            (applanix / "gps_post_process.csv").write_text(
+                f"GPSTime,easting\n{t0},0.0\n", encoding="utf-8"
+            )
+            origin, source = detect_time_origin(root, 27.966857, lidar0)
+            self.assertEqual(source, "imu_gnss_lidar")
+            self.assertAlmostEqual(origin, t0, places=6)
+            self.assertAlmostEqual(lidar0 - origin, 19.981628, places=6)
 
     def test_interpolate_midpoint(self) -> None:
         rotation = rotation_from_rpy(np.array([0.0, 0.0]), np.array([0.0, 0.0]), np.array([0.0, math.pi / 2]))
@@ -215,6 +236,18 @@ class TrajectoryMetricsTest(unittest.TestCase):
         np.testing.assert_allclose(estimate.xyz[0], np.array([1.0, 0.0, 0.0]), atol=1e-9)
         self.assertAlmostEqual(float(rpy_from_rotation(estimate.rotation)[0, 2]), math.pi / 4.0, places=6)
         self.assertEqual(len(ground_truth), 1)
+
+
+class ImuLidarExtrinsicTests(unittest.TestCase):
+    def test_already_level_normal_stays_identity(self):
+        level = rotation_that_levels_normal(np.array([0.0, 0.0, 1.0]))
+        np.testing.assert_allclose(level, np.eye(3), atol=1e-12)
+
+    def test_level_then_yaw_sends_the_ground_normal_to_up(self):
+        normal = np.array([0.05, -0.02, 0.98])
+        normal = normal / np.linalg.norm(normal)
+        rotation = compose_base_from_lidar(normal, nominal_yaw_deg=-45.0, yaw_residual_deg=1.853)
+        np.testing.assert_allclose(rotation @ normal, np.array([0.0, 0.0, 1.0]), atol=1e-9)
 
 
 def _helix() -> Trajectory3:

@@ -191,6 +191,8 @@ TEST(ImuProcessor, static_window_then_forward_accel)
     output = processor.process(make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, -9.81), gyro_bias));
   }
   EXPECT_TRUE(output.aligned);
+  EXPECT_FALSE(output.dynamic_alignment);
+  EXPECT_NEAR(processor.gyro_bias().x(), 0.01, 1e-9);
   EXPECT_TRUE(output.orientation.matrix().isApprox(Eigen::Matrix3d::Identity(), 1e-8));
   EXPECT_NEAR(output.velocity_world.norm(), 0.0, 1e-9);
 
@@ -252,6 +254,7 @@ TEST(ImuProcessor, full_window_of_motion_stays_unaligned)
 {
   ProcessorParams params;
   params.alignment_sample_count = 5;
+  params.dynamic_alignment = false;
   ImuProcessor processor(params);
   ProcessorOutput output;
   for (int i = 0; i < 5; ++i) {
@@ -259,7 +262,38 @@ TEST(ImuProcessor, full_window_of_motion_stays_unaligned)
       make_sample(0.01 * i, Eigen::Vector3d(0.0, 0.0, 9.81), Eigen::Vector3d(1.0, 0.0, 0.0)));
   }
   EXPECT_FALSE(output.aligned);
+  EXPECT_FALSE(output.dynamic_alignment);
   EXPECT_EQ(output.phase, ProcessorPhase::Collecting);
+}
+
+TEST(ImuProcessor, moving_window_aligns_without_using_gyro_as_bias)
+{
+  ProcessorParams params;
+  params.alignment_sample_count = 5;
+  params.dynamic_alignment = true;
+  params.gravity = 9.81;
+  params.max_dt = 0.1;
+  ImuProcessor processor(params);
+  const Eigen::Vector3d accel(0.0, 0.0, 9.81);
+  const Eigen::Vector3d gyro(1.0, 0.0, 0.0);
+  ProcessorOutput output;
+  for (int i = 0; i < 5; ++i) {
+    output = processor.process(make_sample(0.01 * i, accel, gyro));
+  }
+  ASSERT_TRUE(output.aligned);
+  EXPECT_TRUE(output.dynamic_alignment);
+  EXPECT_EQ(output.phase, ProcessorPhase::Tracking);
+  EXPECT_NEAR(processor.gyro_bias().norm(), 0.0, 1e-12);
+  EXPECT_NEAR(output.velocity_world.norm(), 0.0, 1e-9);
+  EXPECT_NEAR(output.gravity, 9.81, 1e-9);
+  const Sophus::SO3d expected = compute_initial_alignment(std::vector<Eigen::Vector3d>(5, accel));
+  EXPECT_TRUE(output.orientation.matrix().isApprox(expected.matrix(), 1e-8));
+
+  const Sophus::SO3d aligned = output.orientation;
+  output = processor.process(make_sample(0.05, accel, gyro));
+  EXPECT_TRUE(output.aligned);
+  EXPECT_FALSE(output.dynamic_alignment);
+  EXPECT_GT((aligned.inverse() * output.orientation).log().norm(), 1e-3);
 }
 
 TEST(ImuProcessor, trajectory_buffer_keeps_poses_across_a_long_horizon)

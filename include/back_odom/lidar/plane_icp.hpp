@@ -37,7 +37,29 @@ struct PlaneIcpParams
   double kernel_scale{0.5};
   int max_iterations{20};
   double convergence_criterion{1.0e-3};
+  /// Soft penalty on rear-axle longitudinal slip away from the seed. 0 leaves the solve unchanged.
+  double longitudinal_prior_weight{0.0};
+  /// Rear axle in the body frame. z is negative when the axle is below the sensor.
+  double rear_axle_z{-1.8};
+  double rear_axle_y{0.0};
 };
+
+/// Add w * j j^T to H and w (j·ξ) j to J^T r, with j the longitudinal motion of the rear axle.
+/// The eigen solver steps dx = -H^{-1} g, so a positive axle slip pulls the iterate back to the seed.
+inline void add_rear_axle_longitudinal_prior(
+  Eigen::Matrix<double, 6, 6> & hessian, Eigen::Matrix<double, 6, 1> & gradient,
+  const Sophus::SE3d & pose, const Sophus::SE3d & seed, const double weight, const double axle_z,
+  const double axle_y)
+{
+  if (!(weight > 0.0)) {
+    return;
+  }
+  const Eigen::Matrix<double, 6, 1> xi = (seed.inverse() * pose).log();
+  Eigen::Matrix<double, 6, 1> axle_jacobian;
+  axle_jacobian << 1.0, 0.0, 0.0, 0.0, axle_z, -axle_y;
+  hessian.noalias() += weight * axle_jacobian * axle_jacobian.transpose();
+  gradient.noalias() += (weight * axle_jacobian.dot(xi)) * axle_jacobian;
+}
 
 [[nodiscard]] inline double correspondence_distance_for_iteration(
   const PlaneIcpParams & params, const int iteration)

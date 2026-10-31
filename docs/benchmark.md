@@ -69,7 +69,7 @@ ros2 run back_odom eval_trajectory.py \
 
 ## RI-EKF trace (KITTI SE(2) and SE(3))
 
-`ri_ekf_localizer` can write both trajectories, plus the filter residual, into one CSV (`trace_csv_path` in `ekf_back_odom.param.yaml`). Stamps in that file are bag-relative. The evaluator adds the Boreas time origin (the earliest IMU/GNSS/lidar time, the same origin `boreas_cpp` uses) and checks that the first trace sample lands on the first lidar pose.
+`ri_ekf_localizer` can write both trajectories, plus the filter residual, into one CSV (`trace_csv_path` in `ekf_back_odom.param.yaml`). Stamps in that file are bag-relative. The evaluator adds the Boreas bag time origin (the earliest IMU, GNSS, and lidar time, or an earlier exported camera time, the same origin `boreas_cpp` uses). A trace whose first row is later than the first lidar pose stays on that clock.
 
 back_odom rows are held at the EKF rate. The score uses one pose per `pose_applied`, stamped at `stamp - back_odom_age`. The EKF pose is interpolated onto each lidar time.
 

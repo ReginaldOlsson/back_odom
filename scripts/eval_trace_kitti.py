@@ -936,6 +936,14 @@ def main(argv: list[str] | None = None) -> int:
         origin_s, origin_source = detect_time_origin(
             args.sequence, float(trace.ekf.stamps[0]), float(ground_truth.stamps[0])
         )
+        first_trace_s = float(trace.ekf.stamps[0])
+        first_lidar_bag_s = float(ground_truth.stamps[0]) - origin_s
+        if abs(first_trace_s - first_lidar_bag_s) > 1.0e-3:
+            print(
+                "trace starts later than the first lidar pose "
+                f"({first_trace_s:.6f} s vs {first_lidar_bag_s:.6f} s); "
+                "hardware time origin is still used"
+            )
     else:
         origin_s, origin_source = float(args.time_origin), "cli"
 

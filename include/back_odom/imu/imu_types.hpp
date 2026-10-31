@@ -47,6 +47,8 @@ struct ProcessorParams
   std::size_t max_trajectory_poses{20000};
   /// Max |t_imu - t_scan| when pairing a lidar scan to the IMU buffer.
   double max_pair_dt{0.05};
+  /// Align from a full window that is still moving, instead of waiting for a stop.
+  bool dynamic_alignment{true};
 };
 
 enum class ProcessorPhase { Collecting, Tracking };
@@ -70,6 +72,8 @@ struct ProcessorOutput
   Eigen::Vector3d specific_force_body{Eigen::Vector3d::Zero()};
   double gravity{9.81};
   bool speed_clamped{false};
+  /// True only on the sample that finished a moving-window alignment.
+  bool dynamic_alignment{false};
 };
 
 }  // namespace back_odom

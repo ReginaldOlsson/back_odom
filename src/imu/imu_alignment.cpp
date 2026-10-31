@@ -165,4 +165,27 @@ AlignmentResult align_stationary_window(
   return result;
 }
 
+AlignmentResult align_dynamic_window(
+  const std::vector<ImuSample> & samples, const double nominal_gravity)
+{
+  if (samples.empty()) {
+    throw std::invalid_argument("align_dynamic_window requires a non-empty IMU window");
+  }
+  if (!(nominal_gravity > 0.0)) {
+    throw std::invalid_argument("align_dynamic_window requires positive gravity");
+  }
+
+  std::vector<Eigen::Vector3d> linear_accelerations;
+  linear_accelerations.reserve(samples.size());
+  for (const auto & sample : samples) {
+    linear_accelerations.push_back(sample.linear_acceleration);
+  }
+
+  AlignmentResult result;
+  result.orientation = compute_initial_alignment(linear_accelerations);
+  result.gyro_bias.setZero();
+  result.gravity = nominal_gravity;
+  return result;
+}
+
 }  // namespace back_odom

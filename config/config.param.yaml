@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # The RI-EKF publishes map -> odom -> base_link. Leave this false so both nodes do not publish a pose.
-    publish_tf: false
+    publish_tf: true
     # When true, wait for ground_truth_odom_topic and left-multiply published map-frame poses
     # so they match ground truth. The lock waits until the vehicle has moved
     # align_min_longitudinal_m in body x, so the stationary initialization residual is not the
@@ -15,11 +15,15 @@
     # right-handed stand-in (x-back, y-right, z-up). Set this false after re-exporting
     # the bag, or the yaw correction is applied twice and the turn mirrors again.
     imu_left_handed: false
+    negate_linear_acceleration: false
     parent_frame: "map"
     child_frame: "base_link"
     alignment_sample_count: 500
     stationary_gyro_thresh: 0.05
     stationary_accel_dev_thresh: 0.5
+    # A full window that is still moving aligns roll/pitch from the mean specific force
+    # and starts ICP. Gyro bias stays zero until a later scan corrects it.
+    dynamic_alignment: false
     gravity: 9.81
     max_dt: 0.1
     # Keep a long IMU pose history so a slow ICP can still pair a lidar scan to the
@@ -54,8 +58,8 @@
     random_downsample_target: 0
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 250.0
-    crop_lateral: 200.0
+    crop_longitudinal: 150.0
+    crop_lateral: 100.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
@@ -68,7 +72,7 @@
     # rad) may pass even if mean NDT is up to 2*max_ndt_cost, so a slightly-off seed can
     # pull back instead of freezing on the IMU prior. partial_max_step is logging only.
     align_rate_hz: 10.0
-    partial_min_iterations: 5
+    partial_min_iterations: 50
     partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
     # 27-voxel neighbour scan growing past the budget.
@@ -76,6 +80,9 @@
     max_visible_scans: 10
     # Recent scans kept with the lidar pose that inserted them.
     backward_match_stride: 4
+    # First scans define the odom frame. Scan 0 is identity. The IMU only seeds motion between
+    # them, and nothing is published until that window is bundle-adjusted.
+    init_scan_count: 10
     # Off: freezing each scan into the map drew the same building once per pose and stalled the scan callback.
     refine_window: true
     refine_settle_passes: 5
@@ -96,7 +103,7 @@
     # Integrate /ekf_twist_with_covariance from the last lidar pose to this scan and use that
     # body motion as the ICP initial guess. The IMU step is used when the twist does not cover
     # the interval (ekf_twist_max_gap) or the integrated motion exceeds the vehicle limits.
-    use_ekf_twist_prior: true
+    use_ekf_twist_prior: false
     ekf_twist_topic: "/ekf_twist_with_covariance"
     ekf_twist_max_gap: 0.05
     ekf_twist_horizon: 2.0
@@ -104,8 +111,14 @@
     gyro_bias_gain: 0.1
     accel_bias_gain: 0.02
     speed_correction_gain: 0.5
-    # Lidar keeps lateral shift and yaw. Forward motion stays with the IMU inside this band.
+    # Retired hard clamp. Forward slip is limited by the rear-axle prior below. Kept so old
+    # launches still load.
     max_longitudinal_correction: 0.15
+    # Soft longitudinal prior at the rear axle, added to the ICP normal equations.
+    # rear_axle_z is the axle below the sensor, not the 0.13 m IMU offset.
+    longitudinal_prior_weight: 50.0
+    rear_axle_z: -1.8
+    rear_axle_y: 0.0
     max_gyro_bias: 0.05
     max_accel_bias: 1.0
     max_speed: 20.0

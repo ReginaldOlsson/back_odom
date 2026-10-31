@@ -1126,10 +1126,12 @@ def detect_time_origin(
     """Bag time origin in GPS seconds.
 
     Matches boreas_cpp: the minimum of the first IMU, GNSS, and lidar timestamps.
-    The origin is accepted when ``trace_stamp0 + origin`` lands on the first lidar
-    pose. Otherwise the camera stream is included, then the offset that pins the
-    first trace sample to the first lidar pose.
+    ``camera_times.txt`` is included when its first stamp is earlier, the same way
+    an exported camera stream can pull the bag origin back. ``trace_stamp0`` is the
+    first logged bag stamp and does not move this origin: a trace that starts after
+    the vehicle is already moving stays on the hardware clock.
     """
+    del trace_stamp0  # late log start must not retie the clock to the first lidar pose
     sequence_dir = Path(sequence_dir)
     applanix = sequence_dir / "applanix"
     candidates = [float(lidar_stamp0)]
@@ -1140,21 +1142,18 @@ def detect_time_origin(
     if gps_path.exists():
         candidates.append(_stamp_seconds(_first_csv_float(gps_path, "GPSTime")))
     origin = min(candidates)
+    source = "imu_gnss_lidar"
 
-    def aligned(value: float) -> bool:
-        return abs((float(lidar_stamp0) - value) - float(trace_stamp0)) < 1.0e-3
-
-    if aligned(origin):
-        return origin, "imu_gnss_lidar"
     camera_path = applanix / "camera_times.txt"
     if camera_path.exists():
         with camera_path.open(encoding="utf-8") as handle:
             token = handle.readline().strip().split(".", 1)[0]
         if token:
-            origin = min(origin, _stamp_seconds(float(token)))
-            if aligned(origin):
-                return origin, "with_camera"
-    return float(lidar_stamp0) - float(trace_stamp0), "lidar_minus_trace"
+            camera_stamp = _stamp_seconds(float(token))
+            if camera_stamp < origin:
+                origin = camera_stamp
+                source = "with_camera"
+    return float(origin), source
 
 
 def load_boreas_lidar_poses_se3(

@@ -58,6 +58,11 @@ struct AlignmentResult
 [[nodiscard]] AlignmentResult align_stationary_window(
   const std::vector<ImuSample> & samples, double nominal_gravity);
 
+/// Roll/pitch from the mean specific force while the vehicle is moving.
+/// Gyro bias stays zero: the mean rate is the turn, not a bias. Gravity stays nominal.
+[[nodiscard]] AlignmentResult align_dynamic_window(
+  const std::vector<ImuSample> & samples, double nominal_gravity);
+
 }  // namespace back_odom
 
 #endif  // BACK_ODOM__IMU_ALIGNMENT_HPP_

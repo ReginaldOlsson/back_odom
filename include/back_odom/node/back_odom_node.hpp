@@ -195,6 +195,8 @@ private:
   double pose_variance_roll_pitch_{0.01};
   double pose_variance_yaw_{0.01};
   bool imu_left_handed_{false};
+  /// Negate linear acceleration Z after the extrinsic. Alignment treats that axis as down.
+  bool negate_linear_acceleration_{false};
   std::string time_field_;
   bool align_to_ground_truth_{false};
   /// Body-x ground-truth travel required before locking map_from_local_. Zero locks immediately.

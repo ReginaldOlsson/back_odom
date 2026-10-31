@@ -216,6 +216,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
       "EKF variances must stay positive: vx at least 0.1 m/s and position at least 0.05 m");
   }
   imu_left_handed_ = this->declare_parameter<bool>("imu_left_handed", false);
+  negate_linear_acceleration_ =
+    this->declare_parameter<bool>("negate_linear_acceleration", false);
   parent_frame_ = this->declare_parameter<std::string>("parent_frame", "map");
   child_frame_ = this->declare_parameter<std::string>("child_frame", "base_link");
   const int alignment_sample_count = this->declare_parameter<int>("alignment_sample_count", 100);
@@ -223,6 +225,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("stationary_gyro_thresh", 0.05);
   const double stationary_accel_dev_thresh =
     this->declare_parameter<double>("stationary_accel_dev_thresh", 0.5);
+  const bool dynamic_alignment = this->declare_parameter<bool>("dynamic_alignment", true);
   const double gravity = this->declare_parameter<double>("gravity", 9.81);
   const double max_dt = this->declare_parameter<double>("max_dt", 0.1);
   const double imu_trajectory_horizon =
@@ -267,6 +270,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   lidar_params.max_visible_scans = this->declare_parameter<int>("max_visible_scans", 120);
   lidar_params.backward_match_stride = this->declare_parameter<int>("backward_match_stride", 4);
   lidar_params.refine_window = this->declare_parameter<bool>("refine_window", false);
+  lidar_params.init_scan_count = this->declare_parameter<int>("init_scan_count", 10);
   lidar_params.refine_min_travel = this->declare_parameter<double>("refine_min_travel", 2.0);
   lidar_params.refine_settle_passes = this->declare_parameter<int>("refine_settle_passes", 2);
   lidar_params.keyframe_min_translation =
@@ -287,6 +291,10 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     this->declare_parameter<double>("speed_correction_gain", 0.5);
   lidar_params.max_longitudinal_correction =
     this->declare_parameter<double>("max_longitudinal_correction", 0.15);
+  lidar_params.longitudinal_prior_weight =
+    this->declare_parameter<double>("longitudinal_prior_weight", 50.0);
+  lidar_params.rear_axle_z = this->declare_parameter<double>("rear_axle_z", -1.8);
+  lidar_params.rear_axle_y = this->declare_parameter<double>("rear_axle_y", 0.0);
   lidar_params.max_gyro_bias = this->declare_parameter<double>("max_gyro_bias", 0.05);
   lidar_params.max_accel_bias = this->declare_parameter<double>("max_accel_bias", 1.0);
   lidar_params.limits.max_speed = this->declare_parameter<double>("max_speed", 20.0);
@@ -347,6 +355,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   params.alignment_sample_count = alignment_sample_count_;
   params.stationary_gyro_thresh = stationary_gyro_thresh;
   params.stationary_accel_dev_thresh = stationary_accel_dev_thresh;
+  params.dynamic_alignment = dynamic_alignment;
   params.gravity = gravity;
   params.max_dt = max_dt;
   params.max_speed = lidar_params.limits.max_speed;
@@ -430,12 +439,14 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
 
   RCLCPP_INFO(
     this->get_logger(),
-    "BackOdomNode initialized. imu_left_handed=%s device=%s imu=%s cloud=%s qos=%s align_to_gt=%s "
-    "align_min_longitudinal_m=%.2f ekf_twist_prior=%s topic=%s",
-    imu_left_handed_ ? "true" : "false", device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
+    "BackOdomNode initialized. imu_left_handed=%s negate_accel_z=%s device=%s imu=%s cloud=%s qos=%s "
+    "align_to_gt=%s "
+    "align_min_longitudinal_m=%.2f ekf_twist_prior=%s topic=%s init_scans=%d",
+    imu_left_handed_ ? "true" : "false", negate_linear_acceleration_ ? "true" : "false",
+    device_available() ? "cuda" : "cpu", imu_topic_.c_str(),
     pointcloud_topic_.c_str(), pointcloud_reliable_ ? "reliable" : "best_effort",
     align_to_ground_truth_ ? "true" : "false", align_min_longitudinal_m_,
-    use_ekf_twist_prior_ ? "true" : "false", ekf_twist_topic_.c_str());
+    use_ekf_twist_prior_ ? "true" : "false", ekf_twist_topic_.c_str(), lidar_params.init_scan_count);
 }
 
 BackOdomNode::~BackOdomNode()
@@ -511,9 +522,12 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
   if (imu_left_handed_) {
     measured = to_right_handed_imu(measured);
   }
-  const ImuSample sample = transform_imu_sample(
+  ImuSample sample = transform_imu_sample(
     measured, base_from_imu, previous_angular_velocity_, previous_angular_velocity_stamp_,
     has_previous_angular_velocity_);
+  if (negate_linear_acceleration_) {
+    sample.linear_acceleration.z() = -sample.linear_acceleration.z();
+  }
   previous_angular_velocity_ = sample.angular_velocity;
   previous_angular_velocity_stamp_ = sample.stamp;
   has_previous_angular_velocity_ = true;
@@ -546,11 +560,24 @@ void BackOdomNode::callback_imu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
       "IMU window is full but not stationary. Waiting to align.");
   }
   if (!aligned_ && output.aligned) {
-    RCLCPP_INFO(this->get_logger(), "Initial IMU alignment finished. gravity=%.3f", output.gravity);
+    if (output.dynamic_alignment) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Dynamic IMU alignment finished. gravity=%.3f, gyro bias left at zero.", output.gravity);
+    } else {
+      RCLCPP_INFO(
+        this->get_logger(), "Initial IMU alignment finished. gravity=%.3f", output.gravity);
+    }
   }
   aligned_ = output.aligned;
   if (!output.aligned) {
     publish_markers(output, health, stamp);
+    return;
+  }
+  if (!lidar_matcher_->odometry_initialized()) {
+    // The integrator keeps running so the lidar window has a relative prior. The attitude is
+    // not a map pose until the first scans have been solved.
+    publish_twist(output, stamp);
     return;
   }
   if (!map_frame_ready()) {
@@ -784,6 +811,10 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
     reject_streak = lidar_matcher_->reject_streak();
     timeout_streak = lidar_matcher_->timeout_streak();
   }
+  if (matched.initialized_origin) {
+    // The sample taken before the solve still carries the IMU attitude. Publish the lidar frame.
+    prior = corrected;
+  }
   // Map insert is 20-70 ms and does not touch the IMU. Keep the integrator publishing.
   lidar_matcher_->flush_pending_insert(matched);
   scan_poses = lidar_matcher_->visible_scan_poses();
@@ -815,8 +846,10 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
         ekf_twist_topic_.c_str(), ekf_twist_max_gap_);
     }
   }
-  publish_debug_odometry(matched, stamp);
-  publish_scan_poses(scan_poses, stamp);
+  if (lidar_matcher_->odometry_initialized()) {
+    publish_debug_odometry(matched, stamp);
+    publish_scan_poses(scan_poses, stamp);
+  }
   publish_match(matched, prior, corrected, stamp);
   publish_health(health, reject_streak, timeout_streak);
 }
@@ -825,6 +858,13 @@ void BackOdomNode::publish_match(
   const MatchResult & matched, const ProcessorOutput & prior, const ProcessorOutput & corrected,
   const rclcpp::Time & stamp)
 {
+  if (!lidar_matcher_->odometry_initialized()) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Holding map odometry until %d lidar scans initialize the odom frame (%zu collected).",
+      lidar_matcher_->init_scan_count(), lidar_matcher_->buffered_init_scans());
+    return;
+  }
   if (!map_frame_ready()) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000, "Waiting for %s before publishing map -> %s.",
@@ -866,8 +906,8 @@ void BackOdomNode::publish_match(
     }
     return;
   }
-  if (matched.first_scan) {
-    RCLCPP_INFO(this->get_logger(), "Stored the first lidar scan in the local map.");
+  if (matched.initialized_origin) {
+    RCLCPP_INFO(this->get_logger(), "Initialized the odom frame on the first lidar scan.");
   }
   publish_odometry(imu_odom_pub_, prior_map, stamp);
   publish_odometry(odometry_pub_, corrected_map, stamp);
@@ -1120,21 +1160,48 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     return scan;
   }
 
-  const auto read_float = [&cloud](
-                            const sensor_msgs::msg::PointField & field, const std::size_t index) {
-    const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
-    if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
-      float value = 0.0F;
-      std::memcpy(&value, pointer, sizeof(float));
-      return static_cast<double>(value);
-    }
-    if (field.datatype == sensor_msgs::msg::PointField::FLOAT64) {
-      double value = 0.0;
-      std::memcpy(&value, pointer, sizeof(double));
-      return value;
-    }
-    return std::numeric_limits<double>::quiet_NaN();
-  };
+  const auto read_scalar =
+    [&cloud](const sensor_msgs::msg::PointField & field, const std::size_t index) {
+      const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
+      switch (field.datatype) {
+        case sensor_msgs::msg::PointField::FLOAT32: {
+          float value = 0.0F;
+          std::memcpy(&value, pointer, sizeof(float));
+          return static_cast<double>(value);
+        }
+        case sensor_msgs::msg::PointField::FLOAT64: {
+          double value = 0.0;
+          std::memcpy(&value, pointer, sizeof(double));
+          return value;
+        }
+        case sensor_msgs::msg::PointField::UINT8:
+          return static_cast<double>(*pointer);
+        case sensor_msgs::msg::PointField::INT8:
+          return static_cast<double>(*reinterpret_cast<const std::int8_t *>(pointer));
+        case sensor_msgs::msg::PointField::UINT16: {
+          std::uint16_t value = 0;
+          std::memcpy(&value, pointer, sizeof(value));
+          return static_cast<double>(value);
+        }
+        case sensor_msgs::msg::PointField::INT16: {
+          std::int16_t value = 0;
+          std::memcpy(&value, pointer, sizeof(value));
+          return static_cast<double>(value);
+        }
+        case sensor_msgs::msg::PointField::UINT32: {
+          std::uint32_t value = 0;
+          std::memcpy(&value, pointer, sizeof(value));
+          return static_cast<double>(value);
+        }
+        case sensor_msgs::msg::PointField::INT32: {
+          std::int32_t value = 0;
+          std::memcpy(&value, pointer, sizeof(value));
+          return static_cast<double>(value);
+        }
+        default:
+          return std::numeric_limits<double>::quiet_NaN();
+      }
+    };
   const auto read_intensity =
     [&cloud](const sensor_msgs::msg::PointField & field, const std::size_t index) {
       const std::uint8_t * pointer = cloud.data.data() + index * cloud.point_step + field.offset;
@@ -1183,10 +1250,10 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     max_range_ > 0.0 ? max_range_ * max_range_ : std::numeric_limits<double>::infinity();
   double max_abs_time = 0.0;
   for (std::size_t index = 0; index < count; ++index) {
-    const double x = read_float(*x_field, index);
-    const double y = read_float(*y_field, index);
-    const double z = read_float(*z_field, index);
-    const double time = read_float(*time_field, index);
+    const double x = read_scalar(*x_field, index);
+    const double y = read_scalar(*y_field, index);
+    const double z = read_scalar(*z_field, index);
+    const double time = read_scalar(*time_field, index);
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(time)) {
       continue;
     }
@@ -1198,6 +1265,17 @@ LidarScan BackOdomNode::scan_from_cloud(const sensor_msgs::msg::PointCloud2 & cl
     scan.timestamps.push_back(time);
     scan.intensities.push_back(have_intensity ? read_intensity(*intensity_field, index) : 0.0F);
     max_abs_time = std::max(max_abs_time, std::abs(time));
+  }
+  const bool integer_time = time_field->datatype != sensor_msgs::msg::PointField::FLOAT32 &&
+                            time_field->datatype != sensor_msgs::msg::PointField::FLOAT64;
+  if (integer_time && max_abs_time >= 1000.0) {
+    // Ouster `t` is uint32 nanoseconds from the scan start. Smaller integer columns are
+    // microseconds. Either way the result is a second offset from the cloud header.
+    const double scale = max_abs_time >= 1.0e6 ? 1.0e-9 : 1.0e-6;
+    for (double & time : scan.timestamps) {
+      time *= scale;
+    }
+    max_abs_time *= scale;
   }
   const double header = scan.stamp;
   bool near_header = true;

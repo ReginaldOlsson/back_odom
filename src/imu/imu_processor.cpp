@@ -72,13 +72,21 @@ ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
   output.angular_velocity_body = sample.angular_velocity;
   output.gravity = params_.gravity;
 
-  if (
-    window_.size() != params_.alignment_sample_count ||
-    !is_stationary(window_, params_.stationary_gyro_thresh, params_.stationary_accel_dev_thresh)) {
+  const bool window_full = window_.size() == params_.alignment_sample_count;
+  const bool stationary =
+    window_full &&
+    is_stationary(window_, params_.stationary_gyro_thresh, params_.stationary_accel_dev_thresh);
+  if (!window_full || (!stationary && !params_.dynamic_alignment)) {
     return output;
   }
 
-  const AlignmentResult alignment = align_stationary_window(window_, params_.gravity);
+  AlignmentResult alignment;
+  try {
+    alignment = stationary ? align_stationary_window(window_, params_.gravity)
+                           : align_dynamic_window(window_, params_.gravity);
+  } catch (const std::invalid_argument &) {
+    return output;
+  }
   dead_reckoning_.emplace(alignment.gravity);
   dead_reckoning_->set_initial_orientation(alignment.orientation);
   dead_reckoning_->set_gyro_bias(alignment.gyro_bias);
@@ -87,6 +95,7 @@ ProcessorOutput ImuProcessor::process_collecting(const ImuSample & sample)
   previous_stamp_ = sample.stamp;
 
   output = make_tracking_output(sample);
+  output.dynamic_alignment = !stationary;
   output.sample_count = params_.alignment_sample_count;
   record_pose(sample.stamp);
   return output;

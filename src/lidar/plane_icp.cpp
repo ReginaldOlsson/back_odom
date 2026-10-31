@@ -194,15 +194,19 @@ PlaneIcpResult align_to_surface(
       result.timed_out = true;
       break;
     }
-    const Accumulation system = build_system(
+    Accumulation system = build_system(
       source, map, surface, pose, correspondence_distance_for_iteration(params, iteration),
       params.kernel_scale);
     result.correspondences = system.correspondences;
     result.robust_cost = system.cost * inverse_count;
-    result.hessian = system.jtj;
     if (system.correspondences < k_min_correspondences) {
+      result.hessian = system.jtj;
       break;
     }
+    add_rear_axle_longitudinal_prior(
+      system.jtj, system.jtr, pose, initial_guess, params.longitudinal_prior_weight,
+      params.rear_axle_z, params.rear_axle_y);
+    result.hessian = system.jtj;
     Vector6d dx = Vector6d::Zero();
     int dropped = 0;
     if (!solve_increment(system.jtj, system.jtr, dx, dropped)) {
