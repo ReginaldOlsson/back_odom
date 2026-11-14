@@ -50,8 +50,8 @@
     random_downsample_target: 0
     # Full length and width of the ICP cloud, centered on the vehicle.
     # 20 x 20 keeps ±10 m. The scan list uses the same box.
-    crop_longitudinal: 250.0
-    crop_lateral: 200.0
+    crop_longitudinal: 100.0
+    crop_lateral: 100.0
     max_correspondence_distance: 2.0
     kernel_scale: 0.5
     # 1 mm step is below the voxel/normal noise floor; 20 iterations is plenty with the
@@ -63,7 +63,7 @@
     # A timeout with >= partial_min_iterations is still scored; a small step (≤0.25 m / 0.05
     # rad) may pass even if mean NDT is up to 2*max_ndt_cost, so a slightly-off seed can
     # pull back instead of freezing on the IMU prior. partial_max_step is logging only.
-    align_rate_hz: 10.0
+    align_rate_hz: 7.0
     partial_min_iterations: 3
     partial_max_step: 0.05
     # Points per 0.5 m voxel. 20 keeps the map dense enough for plane fits without the
