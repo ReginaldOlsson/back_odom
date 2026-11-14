@@ -39,6 +39,11 @@ constexpr double k_max_step_rotation = 0.2;
 constexpr double k_degeneracy_ratio = 1.0e-3;
 constexpr double k_damping = 1.0e-6;
 
+double elapsed_ms(const std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
 
@@ -182,11 +187,14 @@ bool solve_body_increment(const Matrix6d & hessian_in, const Vector6d & gradient
 }
 
 /// Upload points once per map epoch, then attach the cached normals per unique voxel.
-bool upload_map(const kiss_icp::VoxelHashMap & map, const SurfaceVoxelMap & surface, const std::uint64_t epoch)
+bool upload_map(
+  const kiss_icp::VoxelHashMap & map, const SurfaceVoxelMap & surface, const std::uint64_t epoch,
+  CudaTiming * const timing)
 {
   if (cuda_map_current(&map, epoch, map.voxel_size_)) {
     return true;
   }
+  const auto pack_start = std::chrono::steady_clock::now();
   std::vector<double> xyz;
   std::vector<std::uint64_t> keys;
   const std::size_t per_voxel = static_cast<std::size_t>(std::max(1U, map.max_points_per_voxel_));
@@ -201,11 +209,16 @@ bool upload_map(const kiss_icp::VoxelHashMap & map, const SurfaceVoxelMap & surf
       keys.push_back(key);
     }
   }
+  if (timing != nullptr) {
+    timing->host_pack_ms += elapsed_ms(pack_start);
+  }
   std::vector<std::uint64_t> unique_keys;
   if (!cuda_upload_map(
-        &map, epoch, map.voxel_size_, xyz.data(), keys.data(), static_cast<int>(keys.size()), unique_keys)) {
+        &map, epoch, map.voxel_size_, xyz.data(), keys.data(), static_cast<int>(keys.size()), unique_keys,
+        timing)) {
     return false;
   }
+  const auto plane_pack_start = std::chrono::steady_clock::now();
   std::vector<CudaVoxelPlane> planes(unique_keys.size());
   for (std::size_t index = 0; index < unique_keys.size(); ++index) {
     int x = 0;
@@ -221,19 +234,23 @@ bool upload_map(const kiss_icp::VoxelHashMap & map, const SurfaceVoxelMap & surf
       plane.planar = 1;
     }
   }
-  return cuda_upload_planes(planes.data(), static_cast<int>(planes.size()));
+  if (timing != nullptr) {
+    timing->host_pack_ms += elapsed_ms(plane_pack_start);
+  }
+  return cuda_upload_planes(planes.data(), static_cast<int>(planes.size()), timing);
 }
 
 bool plane_at(
   const double * xyz, const int count, const bool upload_frame, const Sophus::SE3d & pose,
   const double max_distance, const double kernel_scale, Matrix6d & hessian, Vector6d & gradient,
-  int & correspondences, double & robust_cost)
+  int & correspondences, double & robust_cost, CudaTiming * const timing)
 {
   double rotation[9];
   double translation[3];
   store_pose(pose, rotation, translation);
   CudaPlaneSystem system;
-  if (!cuda_plane_system(xyz, count, rotation, translation, max_distance, kernel_scale, upload_frame, system)) {
+  if (!cuda_plane_system(
+        xyz, count, rotation, translation, max_distance, kernel_scale, upload_frame, system, timing)) {
     return false;
   }
   for (int row = 0; row < 6; ++row) {
@@ -266,8 +283,10 @@ std::optional<DeviceScanClouds> device_downsample_scan(
       (!intensities.empty() && intensities.size() != points.size())) {
     return std::nullopt;
   }
-  const auto started = std::chrono::steady_clock::now();
+  const auto pack_start = std::chrono::steady_clock::now();
   const DeskewUpload upload = pack_deskew(points, timestamps, trajectory, body_from_lidar);
+  CudaTiming gpu;
+  gpu.host_pack_ms = elapsed_ms(pack_start);
   std::vector<double> fine_xyz;
   std::vector<int> fine_index;
   std::vector<double> coarse_xyz;
@@ -276,14 +295,14 @@ std::optional<DeviceScanClouds> device_downsample_scan(
         static_cast<int>(upload.segments.size()), trajectory.front().stamp, trajectory.back().stamp,
         upload.front_rotation, upload.front_translation, upload.back_rotation, upload.back_translation,
         upload.end_rotation, upload.end_translation, upload.body_rotation, upload.body_translation,
-        half_longitudinal, half_lateral, fine_voxel, coarse_voxel, fine_xyz, fine_index, coarse_xyz) ||
+        half_longitudinal, half_lateral, fine_voxel, coarse_voxel, fine_xyz, fine_index, coarse_xyz,
+        &gpu) ||
       fine_xyz.size() != fine_index.size() * 3 || coarse_xyz.size() % 3 != 0) {
     return std::nullopt;
   }
   DeviceScanClouds clouds;
-  clouds.deskew_ms =
-    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-  const auto voxel_started = std::chrono::steady_clock::now();
+  clouds.gpu = gpu;
+  const auto unpack_start = std::chrono::steady_clock::now();
   clouds.map_points.resize(fine_index.size());
   clouds.map_intensities.resize(intensities.empty() ? 0 : fine_index.size());
   for (std::size_t index = 0; index < fine_index.size(); ++index) {
@@ -302,8 +321,10 @@ std::optional<DeviceScanClouds> device_downsample_scan(
     clouds.source[index] =
       Eigen::Vector3d(coarse_xyz[3 * index], coarse_xyz[3 * index + 1], coarse_xyz[3 * index + 2]);
   }
-  clouds.voxel_ms =
-    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voxel_started).count();
+  clouds.unpack_ms = elapsed_ms(unpack_start) + gpu.host_unpack_ms;
+  clouds.pack_ms = gpu.host_pack_ms;
+  clouds.deskew_ms = clouds.pack_ms + gpu.deskew_kernel_ms;
+  clouds.voxel_ms = gpu.voxel_kernel_ms + clouds.unpack_ms;
   return clouds;
 }
 
@@ -366,7 +387,8 @@ std::optional<std::vector<Eigen::Vector3d>> device_voxel_downsample(
 std::optional<PlaneIcpResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, const std::uint64_t map_epoch, const Sophus::SE3d & initial_guess,
-  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * const deadline)
+  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * const deadline,
+  CudaTiming * const timing)
 {
   if (!cuda_available() || frame.empty() || map.Empty() || !(params.kernel_scale > 0.0) ||
       params.max_iterations < 1) {
@@ -381,14 +403,18 @@ std::optional<PlaneIcpResult> align_points_on_device(
     result.timed_out = true;
     return result;
   }
-  if (!upload_map(map, surface, map_epoch)) {
+  if (!upload_map(map, surface, map_epoch, timing)) {
     return std::nullopt;
   }
+  const auto pack_start = std::chrono::steady_clock::now();
   std::vector<double> xyz(frame.size() * 3);
   for (std::size_t index = 0; index < frame.size(); ++index) {
     xyz[3 * index] = frame[index].x();
     xyz[3 * index + 1] = frame[index].y();
     xyz[3 * index + 2] = frame[index].z();
+  }
+  if (timing != nullptr) {
+    timing->host_pack_ms += elapsed_ms(pack_start);
   }
   const int count = static_cast<int>(frame.size());
   Sophus::SE3d pose = initial_guess;
@@ -406,7 +432,7 @@ std::optional<PlaneIcpResult> align_points_on_device(
     if (!plane_at(
           xyz.data(), count, upload_frame, pose,
           correspondence_distance_for_iteration(params, iteration), params.kernel_scale, hessian,
-          gradient, correspondences, robust_cost)) {
+          gradient, correspondences, robust_cost, timing)) {
       return std::nullopt;
     }
     upload_frame = false;

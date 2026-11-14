@@ -16,6 +16,7 @@
 #define BACK_ODOM__DEVICE_ACCEL_HPP_
 
 #include "back_odom/imu/imu_types.hpp"
+#include "back_odom/lidar/device_kernels.hpp"
 #include "back_odom/lidar/ndt_health.hpp"
 #include "back_odom/lidar/plane_icp.hpp"
 
@@ -41,8 +42,13 @@ struct DeviceScanClouds
   std::vector<float> map_intensities;
   /// Coarser cloud used as the registration source.
   std::vector<Eigen::Vector3d> source;
+  /// Host pack plus the deskew kernel. Copies are reported on `gpu`.
   double deskew_ms{0.0};
+  /// Voxel kernels plus host unpack of the downsampled clouds.
   double voxel_ms{0.0};
+  CudaTiming gpu{};
+  double pack_ms{0.0};
+  double unpack_ms{0.0};
 };
 
 /// Upload the raw scan once, deskew, crop and build both voxel levels on the device, and copy
@@ -71,7 +77,8 @@ struct DeviceScanClouds
 [[nodiscard]] std::optional<PlaneIcpResult> align_points_on_device(
   const std::vector<Eigen::Vector3d> & frame, const kiss_icp::VoxelHashMap & map,
   const SurfaceVoxelMap & surface, std::uint64_t map_epoch, const Sophus::SE3d & initial_guess,
-  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * deadline = nullptr);
+  const PlaneIcpParams & params, const std::chrono::steady_clock::time_point * deadline = nullptr,
+  CudaTiming * timing = nullptr);
 
 }  // namespace back_odom
 

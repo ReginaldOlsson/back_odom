@@ -25,6 +25,7 @@
 #include <back_odom/msg/icp_debug.hpp>
 #include <back_odom/msg/pose_refine.hpp>
 #include <back_odom/msg/scan_stages.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
@@ -100,6 +101,7 @@ private:
   std::condition_variable imu_cv_;
   std::unique_ptr<ImuProcessor> imu_processor_;
   std::unique_ptr<LidarImuMatcher> lidar_matcher_;
+  LidarMatchParams lidar_params_{};
 
   /// Single-slot scan mailbox.
   std::mutex scan_mutex_;
@@ -130,6 +132,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr scan_pose_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr health_pub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lidar_debug_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr lidar_debug_path_pub_;
   rclcpp::Publisher<back_odom::msg::ScanStages>::SharedPtr scan_stages_pub_;

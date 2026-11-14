@@ -168,6 +168,26 @@ double elapsed_ms(const std::chrono::steady_clock::time_point start)
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+void add_gpu_timing(MatchResult & timing, const CudaTiming & gpu)
+{
+  timing.gpu_h2d_ms += gpu.h2d_ms;
+  timing.gpu_kernel_ms += gpu.kernel_ms;
+  timing.gpu_d2h_ms += gpu.d2h_ms;
+  timing.gpu_pack_ms += gpu.host_pack_ms;
+  timing.gpu_unpack_ms += gpu.host_unpack_ms;
+}
+
+void add_front_stage(MatchResult & timing, const DeviceScanClouds & device)
+{
+  timing.deskew_ms += device.deskew_ms;
+  timing.voxel_ms += device.voxel_ms;
+  timing.gpu_h2d_ms += device.gpu.h2d_ms;
+  timing.gpu_kernel_ms += device.gpu.kernel_ms;
+  timing.gpu_d2h_ms += device.gpu.d2h_ms;
+  timing.gpu_pack_ms += device.pack_ms;
+  timing.gpu_unpack_ms += device.unpack_ms;
+}
+
 bool close_poses(const Sophus::SE3d & left, const Sophus::SE3d & right)
 {
   const Sophus::SE3d delta = left.inverse() * right;
@@ -520,10 +540,12 @@ void LidarImuMatcher::rebuild_surface()
   ++map_epoch_;
 }
 
-void LidarImuMatcher::cull_local_map(const Sophus::SE3d & pose)
+void LidarImuMatcher::cull_local_map(const Sophus::SE3d & pose, double & kiss_ms)
 {
   const Sophus::SE3d world_to_sensor = pose.inverse();
+  const auto kiss_start = std::chrono::steady_clock::now();
   map_.RemovePointsOutsideBox(world_to_sensor, half_longitudinal_, half_lateral_);
+  kiss_ms += elapsed_ms(kiss_start);
   surface_.cull_outside_box(world_to_sensor, half_longitudinal_, half_lateral_);
   if (++culls_since_prune_ >= k_prune_every_culls) {
     culls_since_prune_ = 0;
@@ -585,16 +607,21 @@ void LidarImuMatcher::insert_scan(
   }
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
+    double kiss_ms = 0.0;
+    const auto add_start = std::chrono::steady_clock::now();
     map_.AddPoints(world);
+    kiss_ms += elapsed_ms(add_start);
     // RemovePointsOutsideBox walks the whole map; a few keyframes of slack past the crop box
     // costs nothing, so cull on distance rather than every insert.
     if (
       !has_cull_pose_ ||
       (last_cull_pose_.inverse() * pose).translation().norm() >= k_cull_every_metres) {
-      cull_local_map(pose);
+      cull_local_map(pose, kiss_ms);
       last_cull_pose_ = pose;
       has_cull_pose_ = true;
     }
+    timing.kiss_map_ms += kiss_ms;
+    timing.inserted_points = static_cast<int>(points.size());
     surface_.update_voxels(map_, touched);
     ++map_epoch_;
     record_horizon_scan(pose, stamp, std::move(points), std::move(intensities));
@@ -620,7 +647,9 @@ ScanAlignment LidarImuMatcher::align_scan(
     return alignment;
   }
   ++scan_count_;
+  result.raw_points = static_cast<int>(scan.points.size());
   PreparedClouds clouds = prepare_scan(scan, imu.trajectory(), result);
+  result.source_points = static_cast<int>(clouds.source.size());
   if (clouds.source.empty()) {
     result.skipped = true;
     result.skip_reason = "deskew/crop/voxel left no source points";
@@ -696,6 +725,7 @@ ScanAlignment LidarImuMatcher::align_scan(
   result.align_timed_out = candidate.timed_out;
   result.partial_used = candidate.partial_used;
   result.iterations = candidate.iterations;
+  result.last_step = candidate.last_step;
   alignment.ready = true;
   return alignment;
 }
@@ -806,7 +836,15 @@ MatchResult LidarImuMatcher::on_scan(
 {
   MatchResult result = commit_scan(align_scan(scan, imu, body_twists), imu);
   flush_pending_insert(result);
+  fill_map_counts(result);
   return result;
+}
+
+void LidarImuMatcher::fill_map_counts(MatchResult & result) const
+{
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  result.map_voxels = static_cast<int>(map_.map_.size());
+  result.surface_voxels = static_cast<int>(surface_.voxels.size());
 }
 
 MatchResult LidarImuMatcher::on_imu(ImuProcessor & /*imu*/)
@@ -904,7 +942,7 @@ MatchCandidate LidarImuMatcher::score_alignment(
   candidate.present = true;
   const bool recovering = health_.health != LocalizationHealth::Healthy;
   const auto align_start = std::chrono::steady_clock::now();
-  const PlaneIcpResult icp = align(source, guess, params_.max_correspondence_distance, deadline);
+  const PlaneIcpResult icp = align(source, guess, params_.max_correspondence_distance, deadline, timing);
   timing.align_ms += elapsed_ms(align_start);
 
   candidate.iterations = icp.iterations;
@@ -915,6 +953,14 @@ MatchCandidate LidarImuMatcher::score_alignment(
   candidate.degenerate_axes = icp.degenerate_axes;
   candidate.saturated = icp.saturated;
   candidate.timed_out = icp.timed_out;
+  if (icp.iterations > 0.0) {
+    const Sophus::SE3d guess_delta = guess.inverse() * icp.pose;
+    timing.guess_distance_m = guess_delta.translation().norm();
+    timing.guess_rotation_rad = guess_delta.so3().log().norm();
+    timing.guess_dx_m = guess_delta.translation().x();
+    timing.guess_dy_m = guess_delta.translation().y();
+    timing.guess_dz_m = guess_delta.translation().z();
+  }
   const bool have_solve =
     icp.iterations + 0.5 >= static_cast<double>(params_.partial_min_iterations);
   if (icp.timed_out) {
@@ -934,7 +980,10 @@ MatchCandidate LidarImuMatcher::score_alignment(
   const NdtScore ndt_seed =
     recovering ? ndt_score(source, guess, surface_, params_.max_ndt_cost, params_.min_ndt_correspondences)
                : NdtScore{};
-  timing.cost_ms += elapsed_ms(cost_start);
+  const double ndt_elapsed = elapsed_ms(cost_start);
+  timing.cost_ms += ndt_elapsed;
+  timing.ndt_ms += ndt_elapsed;
+  timing.ndt_valid_hits = ndt.valid_hits;
   candidate.ndt_cost = ndt.mean_cost;
   candidate.ndt_inlier_fraction = ndt.inlier_fraction;
 
@@ -949,6 +998,7 @@ MatchCandidate LidarImuMatcher::score_alignment(
     candidate.pose = guess;
     candidate.ndt_cost = ndt_seed.mean_cost;
     candidate.ndt_inlier_fraction = ndt_seed.inlier_fraction;
+    timing.ndt_valid_hits = ndt_seed.valid_hits;
     candidate.passes = false;
     return candidate;
   }
@@ -994,7 +1044,9 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
     } else {
       map_cloud = voxel_downsample_with_intensity(cropped.points, cropped.intensities, fine_voxel);
     }
+    const auto kiss_start = std::chrono::steady_clock::now();
     out.source = kiss_icp::VoxelDownsample(map_cloud.points, coarse_voxel);
+    timing.kiss_downsample_ms += elapsed_ms(kiss_start);
     out.map_points = std::move(map_cloud.points);
     out.map_intensities = std::move(map_cloud.intensities);
     return std::make_pair(deskew_ms, elapsed_ms(voxel_start));
@@ -1022,11 +1074,22 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
     const double device_ms = elapsed_ms(device_start);
     PreparedClouds cpu;
     const auto [cpu_deskew_ms, cpu_voxel_ms] = cpu_prepare(cpu);
+    timing.front_bakeoff = true;
+    timing.front_bakeoff_device_ms = device_ms;
+    timing.front_bakeoff_cpu_ms = cpu_deskew_ms + cpu_voxel_ms;
     device_front_use_ = device.has_value() &&
                         similar_size(device->map_points.size(), cpu.map_points.size(), 0.02) &&
                         similar_size(device->source.size(), cpu.source.size(), 0.05) &&
                         device_ms < 0.8 * (cpu_deskew_ms + cpu_voxel_ms);
+    if (device.has_value()) {
+      timing.gpu_h2d_ms += device->gpu.h2d_ms;
+      timing.gpu_kernel_ms += device->gpu.kernel_ms;
+      timing.gpu_d2h_ms += device->gpu.d2h_ms;
+      timing.gpu_pack_ms += device->pack_ms;
+      timing.gpu_unpack_ms += device->unpack_ms;
+    }
     if (device_front_use_) {
+      timing.front_on_device = true;
       timing.deskew_ms += device->deskew_ms;
       timing.voxel_ms += device->voxel_ms;
       return PreparedClouds{
@@ -1038,8 +1101,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
   }
   if (device_ok && device_front_use_) {
     if (std::optional<DeviceScanClouds> device = device_prepare()) {
-      timing.deskew_ms += device->deskew_ms;
-      timing.voxel_ms += device->voxel_ms;
+      timing.front_on_device = true;
+      add_front_stage(timing, *device);
       return PreparedClouds{
         std::move(device->map_points), std::move(device->map_intensities), std::move(device->source)};
     }
@@ -1054,7 +1117,8 @@ LidarImuMatcher::PreparedClouds LidarImuMatcher::prepare_scan(
 
 PlaneIcpResult LidarImuMatcher::align(
   const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
-  const double max_correspondence_distance, const std::chrono::steady_clock::time_point * const deadline)
+  const double max_correspondence_distance, const std::chrono::steady_clock::time_point * const deadline,
+  MatchResult & timing)
 {
   PlaneIcpParams icp_params;
   icp_params.max_correspondence_distance = max_correspondence_distance;
@@ -1067,6 +1131,7 @@ PlaneIcpResult LidarImuMatcher::align(
   icp_params.kernel_scale = params_.kernel_scale;
   icp_params.max_iterations = params_.max_iterations;
   icp_params.convergence_criterion = params_.convergence_criterion;
+  timing.coarse_iterations = icp_params.coarse_iterations;
 
   const bool device_ok = params_.device_bakeoff_scan > 0 && device_available() &&
                          scan.size() >= static_cast<std::size_t>(k_min_device_points) && !map_.Empty();
@@ -1085,21 +1150,34 @@ PlaneIcpResult LidarImuMatcher::align(
     bakeoff.max_iterations = std::min(icp_params.max_iterations, k_bakeoff_max_iterations);
     device_align_decided_ = true;
     device_align_decided_at_ = scan_count_;
+    CudaTiming gpu;
     const auto device_start = std::chrono::steady_clock::now();
     const std::optional<PlaneIcpResult> device =
-      align_points_on_device(scan, map_, surface_, map_epoch_, guess, bakeoff, deadline);
+      align_points_on_device(scan, map_, surface_, map_epoch_, guess, bakeoff, deadline, &gpu);
     const double device_ms = elapsed_ms(device_start);
     const auto cpu_start = std::chrono::steady_clock::now();
     const PlaneIcpResult cpu = align_to_surface(scan, map_, surface_, guess, bakeoff, deadline);
     const double cpu_ms = elapsed_ms(cpu_start);
+    timing.align_bakeoff = true;
+    timing.align_bakeoff_device_ms = device_ms;
+    timing.align_bakeoff_cpu_ms = cpu_ms;
+    add_gpu_timing(timing, gpu);
     device_align_use_ = device.has_value() && close_poses(cpu.pose, device->pose) && device_ms < 0.8 * cpu_ms;
-    return device_align_use_ ? *device : cpu;
-  }
-  if (device_align_use_) {
-    if (const std::optional<PlaneIcpResult> device =
-          align_points_on_device(scan, map_, surface_, map_epoch_, guess, icp_params, deadline)) {
+    if (device_align_use_) {
+      timing.align_on_device = true;
       return *device;
     }
+    return cpu;
+  }
+  if (device_align_use_) {
+    CudaTiming gpu;
+    if (const std::optional<PlaneIcpResult> device = align_points_on_device(
+          scan, map_, surface_, map_epoch_, guess, icp_params, deadline, &gpu)) {
+      add_gpu_timing(timing, gpu);
+      timing.align_on_device = true;
+      return *device;
+    }
+    add_gpu_timing(timing, gpu);
     device_align_use_ = false;
   }
   return align_to_surface(scan, map_, surface_, guess, icp_params, deadline);

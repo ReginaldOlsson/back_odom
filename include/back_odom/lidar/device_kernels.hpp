@@ -75,6 +75,30 @@ struct CudaPlaneSystem
   int point_count{0};
 };
 
+/// Split of one device call. Kernel time is the sum of the deskew and voxel kernel fields when
+/// those ran; plane and map-sort kernels add only to `kernel_ms`.
+struct CudaTiming
+{
+  double h2d_ms{0.0};
+  double kernel_ms{0.0};
+  double d2h_ms{0.0};
+  double deskew_kernel_ms{0.0};
+  double voxel_kernel_ms{0.0};
+  double host_pack_ms{0.0};
+  double host_unpack_ms{0.0};
+
+  void add(const CudaTiming & other)
+  {
+    h2d_ms += other.h2d_ms;
+    kernel_ms += other.kernel_ms;
+    d2h_ms += other.d2h_ms;
+    deskew_kernel_ms += other.deskew_kernel_ms;
+    voxel_kernel_ms += other.voxel_kernel_ms;
+    host_pack_ms += other.host_pack_ms;
+    host_unpack_ms += other.host_unpack_ms;
+  }
+};
+
 [[nodiscard]] bool cuda_available();
 
 [[nodiscard]] bool cuda_map_current(const void * owner, std::uint64_t epoch, double voxel_size);
@@ -83,15 +107,18 @@ struct CudaPlaneSystem
 /// there. `unique_keys` receives the sorted unique keys so the host can attach normals.
 [[nodiscard]] bool cuda_upload_map(
   const void * owner, std::uint64_t epoch, double voxel_size, const double * xyz,
-  const std::uint64_t * keys, int count, std::vector<std::uint64_t> & unique_keys);
+  const std::uint64_t * keys, int count, std::vector<std::uint64_t> & unique_keys,
+  CudaTiming * timing = nullptr);
 
 /// Attach one plane per unique key (same order as returned by cuda_upload_map).
-[[nodiscard]] bool cuda_upload_planes(const CudaVoxelPlane * planes, int unique_count);
+[[nodiscard]] bool cuda_upload_planes(
+  const CudaVoxelPlane * planes, int unique_count, CudaTiming * timing = nullptr);
 
 /// One Gauss-Newton system. Neighbour ranking in float, residual/Jacobian/accumulation in double.
 [[nodiscard]] bool cuda_plane_system(
   const double * frame_xyz, int frame_count, const double rotation[9], const double translation[3],
-  double max_distance, double kernel_scale, bool upload_frame, CudaPlaneSystem & system);
+  double max_distance, double kernel_scale, bool upload_frame, CudaPlaneSystem & system,
+  CudaTiming * timing = nullptr);
 
 /// Deskew, crop, then build the fine and coarse voxel levels on the device. Fine points come
 /// back with their original input index (for intensity lookup); coarse points come back as xyz.
@@ -103,7 +130,7 @@ struct CudaPlaneSystem
   const double end_inverse_translation[3], const double body_rotation[9],
   const double body_translation[3], double half_longitudinal, double half_lateral,
   double fine_voxel, double coarse_voxel, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz);
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz, CudaTiming * timing = nullptr);
 
 [[nodiscard]] bool cuda_deskew(
   const double * points_xyz, const double * stamps, int count, const CudaSegment * segments,

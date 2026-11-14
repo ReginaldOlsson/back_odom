@@ -187,6 +187,12 @@ struct MatchResult
   /// Vehicle-frame residual used for the gate and the bias update.
   double translation_error{0.0};
   double rotation_error{0.0};
+  /// Warm-start guess to the raw ICP pose, before the longitudinal clamp. Body frame.
+  double guess_distance_m{0.0};
+  double guess_rotation_rad{0.0};
+  double guess_dx_m{0.0};
+  double guess_dy_m{0.0};
+  double guess_dz_m{0.0};
   double iterations{0.0};
   Eigen::Vector3d gyro_bias{Eigen::Vector3d::Zero()};
   Eigen::Vector3d accel_bias{Eigen::Vector3d::Zero()};
@@ -214,8 +220,37 @@ struct MatchResult
   double voxel_ms{0.0};
   double align_ms{0.0};
   double cost_ms{0.0};
+  /// Same interval as `cost_ms`: the NDT score pass.
+  double ndt_ms{0.0};
   double refine_ms{0.0};
   double map_ms{0.0};
+  double cloud_parse_ms{0.0};
+  double imu_wait_ms{0.0};
+  double pipeline_ms{0.0};
+  double gpu_h2d_ms{0.0};
+  double gpu_kernel_ms{0.0};
+  double gpu_d2h_ms{0.0};
+  double gpu_pack_ms{0.0};
+  double gpu_unpack_ms{0.0};
+  double kiss_downsample_ms{0.0};
+  double kiss_map_ms{0.0};
+  /// Wall time of a front-end bake-off, zero when that scan did not compare devices.
+  double front_bakeoff_device_ms{0.0};
+  double front_bakeoff_cpu_ms{0.0};
+  double align_bakeoff_device_ms{0.0};
+  double align_bakeoff_cpu_ms{0.0};
+  double last_step{0.0};
+  int ndt_valid_hits{0};
+  int coarse_iterations{0};
+  int raw_points{0};
+  int source_points{0};
+  int inserted_points{0};
+  int map_voxels{0};
+  int surface_voxels{0};
+  bool front_on_device{false};
+  bool align_on_device{false};
+  bool front_bakeoff{false};
+  bool align_bakeoff{false};
 };
 
 struct LocalMapPoint
@@ -274,6 +309,8 @@ public:
   [[nodiscard]] MatchResult commit_scan(ScanAlignment && alignment, ImuProcessor & imu);
   /// Write a queued keyframe into the local map. Safe to call without holding the IMU lock.
   void flush_pending_insert(MatchResult & timing);
+  /// Copy kiss_icp voxel-map sizes onto `result`. Safe to call without the IMU lock.
+  void fill_map_counts(MatchResult & result) const;
   /// align_scan, commit_scan, then flush_pending_insert.
   [[nodiscard]] MatchResult on_scan(
     const LidarScan & scan, ImuProcessor & imu,
@@ -299,7 +336,8 @@ private:
     bool update_bias, const std::optional<Eigen::Vector3d> & velocity_override);
   [[nodiscard]] PlaneIcpResult align(
     const std::vector<Eigen::Vector3d> & scan, const Sophus::SE3d & guess,
-    double max_correspondence_distance, const std::chrono::steady_clock::time_point * deadline);
+    double max_correspondence_distance, const std::chrono::steady_clock::time_point * deadline,
+    MatchResult & timing);
   void hold_to_imu_prior(ImuProcessor & imu, const Sophus::SE3d & predicted, double scan_end);
   [[nodiscard]] PreparedClouds prepare_scan(
     const LidarScan & scan, const std::vector<StampedPose> & trajectory, MatchResult & timing);
@@ -321,7 +359,7 @@ private:
     std::vector<float> && intensities);
   bool refine_window_if_due(MatchResult & result, Sophus::SE3d & newest_pose);
   void rebuild_from_horizon(const Sophus::SE3d & cull_pose);
-  void cull_local_map(const Sophus::SE3d & pose);
+  void cull_local_map(const Sophus::SE3d & pose, double & kiss_ms);
   void rebuild_surface();
 
   Sophus::SE3d body_from_lidar_{};

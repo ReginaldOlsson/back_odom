@@ -14,6 +14,8 @@
 
 #include "back_odom/node/back_odom_node.hpp"
 
+#include "back_odom/node/scan_diagnostics.hpp"
+
 #include "back_odom/imu/imu_alignment.hpp"
 #include "back_odom/lidar/device_accel.hpp"
 
@@ -351,6 +353,7 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
   params.max_pair_dt = imu_max_pair_dt_;
   imu_processor_ = std::make_unique<ImuProcessor>(params);
   lidar_matcher_ = std::make_unique<LidarImuMatcher>(lidar_params);
+  lidar_params_ = lidar_params;
 
   // Deep IMU queue: a 200 Hz stream must survive a scan callback or TF stall without dropping
   // samples, since a dropped sample becomes an integration hole (dt > max_dt).
@@ -401,6 +404,8 @@ BackOdomNode::BackOdomNode(const rclcpp::NodeOptions & options) : Node("back_odo
     "back_odom/map", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
   health_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
     "back_odom/health", rclcpp::QoS(10));
+  diagnostics_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    "/diagnostics", rclcpp::QoS(10));
   lidar_debug_pub_ =
     this->create_publisher<nav_msgs::msg::Odometry>("back_odom/debug/lidar", rclcpp::QoS(10));
   lidar_debug_path_pub_ =
@@ -673,7 +678,11 @@ void BackOdomNode::worker_loop()
 
 void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg)
 {
+  const auto pipeline_start = std::chrono::steady_clock::now();
   LidarScan scan = scan_from_cloud(*msg);
+  const double cloud_parse_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - pipeline_start)
+                                   .count();
   const rclcpp::Time cloud_stamp(msg->header.stamp);
   if (scan.points.empty()) {
     RCLCPP_WARN_THROTTLE(
@@ -693,6 +702,7 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
 
   // Wait (bounded) until the IMU has integrated past the end of the sweep, then snapshot the
   // integrator so ICP can run without holding up the IMU thread.
+  const auto wait_start = std::chrono::steady_clock::now();
   std::optional<ImuProcessor> snapshot;
   const auto wall_deadline = std::chrono::steady_clock::now() +
                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -747,6 +757,8 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
       }
     }
   }
+  const double imu_wait_ms =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
   if (!snapshot) {
     note_skipped_scan(stamp);
     return;
@@ -781,6 +793,12 @@ void BackOdomNode::process_cloud(const sensor_msgs::msg::PointCloud2::ConstShare
   }
   // Map insert is 20-70 ms and does not touch the IMU. Keep the integrator publishing.
   lidar_matcher_->flush_pending_insert(matched);
+  lidar_matcher_->fill_map_counts(matched);
+  matched.cloud_parse_ms = cloud_parse_ms;
+  matched.imu_wait_ms = imu_wait_ms;
+  matched.pipeline_ms =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pipeline_start)
+      .count();
   scan_poses = lidar_matcher_->visible_scan_poses();
   scans_processed_.fetch_add(1, std::memory_order_relaxed);
   publish_pipeline_debug(matched, stamp);
@@ -876,58 +894,18 @@ void BackOdomNode::publish_match(
 void BackOdomNode::publish_health(
   const LocalizationHealth health, const int reject_streak, const int timeout_streak)
 {
-  diagnostic_msgs::msg::DiagnosticStatus status;
-  status.name = "back_odom";
-  status.hardware_id = "back_odom";
-  status.message = health_name(health);
-  if (health == LocalizationHealth::Healthy) {
-    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-  } else if (health == LocalizationHealth::Degraded) {
-    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-  } else {
-    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-  }
-  const auto add_value = [&status](const std::string & key, const std::string & value) {
-    diagnostic_msgs::msg::KeyValue entry;
-    entry.key = key;
-    entry.value = value;
-    status.values.push_back(entry);
-  };
-  add_value("reject_streak", std::to_string(reject_streak));
-  add_value("timeout_streak", std::to_string(timeout_streak));
+  MatchResult match;
   {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     if (has_last_match_) {
-      const MatchResult & last = last_match_;
-      add_value("lidar_cost", last.has_lidar_debug ? std::to_string(last.lidar_cost) : "none");
-      add_value(
-        "ndt_cost", last.has_lidar_debug && std::isfinite(last.ndt_cost)
-                      ? std::to_string(last.ndt_cost)
-                      : "none");
-      add_value(
-        "ndt_inlier_fraction", std::isfinite(last.ndt_inlier_fraction)
-                                 ? std::to_string(last.ndt_inlier_fraction)
-                                 : "none");
-      add_value("inlier_ratio", std::to_string(last.inlier_ratio));
-      add_value("correspondences", std::to_string(last.correspondences));
-      add_value("degenerate_axes", std::to_string(last.degenerate_axes));
-      add_value("lidar_passed", last.lidar_passed ? "true" : "false");
-      add_value("saturated", last.saturated ? "true" : "false");
-      add_value("align_timed_out", last.align_timed_out ? "true" : "false");
-      add_value("partial_used", last.partial_used ? "true" : "false");
-      add_value("ekf_twist_prior", last.ekf_twist_prior ? "true" : "false");
-      add_value("inserted_scan", last.inserted_scan ? "true" : "false");
-      add_value("iterations", std::to_string(last.iterations));
-      add_value("deskew_ms", std::to_string(last.deskew_ms));
-      add_value("voxel_ms", std::to_string(last.voxel_ms));
-      add_value("align_ms", std::to_string(last.align_ms));
-      add_value("cost_ms", std::to_string(last.cost_ms));
-      add_value("map_ms", std::to_string(last.map_ms));
-      add_value("translation_error_m", std::to_string(last.translation_error));
-      add_value("rotation_error_rad", std::to_string(last.rotation_error));
+      match = last_match_;
     }
   }
-  health_pub_->publish(status);
+  diagnostic_msgs::msg::DiagnosticArray array;
+  array.header.stamp = this->now();
+  array.status = scan_diagnostic_statuses(match, lidar_params_, health, reject_streak, timeout_streak);
+  diagnostics_pub_->publish(array);
+  health_pub_->publish(flatten_diagnostics(array.status));
 }
 
 void BackOdomNode::note_skipped_scan(const rclcpp::Time & stamp)

@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -104,6 +105,128 @@ bool check(const char * what, cudaError_t status)
   }
   cuda_fail(what, status);
   return false;
+}
+
+struct CudaClock
+{
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  bool live{false};
+
+  void begin()
+  {
+    if (!live) {
+      live = cudaEventCreate(&start) == cudaSuccess && cudaEventCreate(&stop) == cudaSuccess;
+    }
+    if (live) {
+      cudaEventRecord(start);
+    }
+  }
+
+  /// Synchronize the stop event. A missing event clock does not fail the caller.
+  bool end(double & milliseconds)
+  {
+    milliseconds = 0.0;
+    if (!live) {
+      return true;
+    }
+    if (cudaEventRecord(stop) != cudaSuccess || cudaEventSynchronize(stop) != cudaSuccess) {
+      return false;
+    }
+    float elapsed = 0.0F;
+    if (cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+      return false;
+    }
+    milliseconds = static_cast<double>(elapsed);
+    return true;
+  }
+};
+
+CudaClock & cuda_clock()
+{
+  static CudaClock clock;
+  return clock;
+}
+
+class EventSpan
+{
+public:
+  EventSpan() { cuda_clock().begin(); }
+
+  bool finish()
+  {
+    if (!open_) {
+      return ok_;
+    }
+    open_ = false;
+    ok_ = cuda_clock().end(ms_);
+    return ok_;
+  }
+
+  [[nodiscard]] double milliseconds() const { return ms_; }
+
+  ~EventSpan() { finish(); }
+
+private:
+  bool open_{true};
+  bool ok_{true};
+  double ms_{0.0};
+};
+
+void add_h2d(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->h2d_ms += milliseconds;
+  }
+}
+
+void add_d2h(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->d2h_ms += milliseconds;
+  }
+}
+
+void add_kernel(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->kernel_ms += milliseconds;
+  }
+}
+
+void add_deskew_kernel(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->deskew_kernel_ms += milliseconds;
+    timing->kernel_ms += milliseconds;
+  }
+}
+
+void add_voxel_kernel(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->voxel_kernel_ms += milliseconds;
+    timing->kernel_ms += milliseconds;
+  }
+}
+
+void add_host_pack(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->host_pack_ms += milliseconds;
+  }
+}
+
+void add_host_unpack(CudaTiming * const timing, const double milliseconds)
+{
+  if (timing != nullptr) {
+    timing->host_unpack_ms += milliseconds;
+  }
+}
+
+double host_elapsed_ms(const std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 template <typename T>
@@ -656,7 +779,8 @@ bool cuda_map_current(const void * owner, const std::uint64_t epoch, const doubl
 
 bool cuda_upload_map(
   const void * owner, const std::uint64_t epoch, const double voxel_size, const double * xyz,
-  const std::uint64_t * keys, const int count, std::vector<std::uint64_t> & unique_keys)
+  const std::uint64_t * keys, const int count, std::vector<std::uint64_t> & unique_keys,
+  CudaTiming * const timing)
 {
   unique_keys.clear();
   if (!cuda_available()) {
@@ -670,6 +794,7 @@ bool cuda_upload_map(
     g_map.unique = 0;
     return true;
   }
+  const auto pack_start = std::chrono::steady_clock::now();
   std::vector<MapPoint> host(static_cast<std::size_t>(count));
   for (int index = 0; index < count; ++index) {
     MapPoint & point = host[static_cast<std::size_t>(index)];
@@ -682,6 +807,7 @@ bool cuda_upload_map(
     point.fz = static_cast<float>(point.z);
     point.pad = 0.0F;
   }
+  add_host_pack(timing, host_elapsed_ms(pack_start));
   // Persistent buffers sized to the map; all per-point arrays share one capacity.
   if (count > g_map.point_capacity || g_map.points == nullptr) {
     const int grown = std::max(count + count / 4, g_map.point_capacity);
@@ -707,13 +833,19 @@ bool cuda_upload_map(
   g_map.epoch = epoch;
   g_map.voxel_size = voxel_size;
   g_map.count = count;
-  if (!check(
-        "cudaMemcpy",
-        cudaMemcpy(
-          g_map.points, host.data(), static_cast<std::size_t>(count) * sizeof(MapPoint),
-          cudaMemcpyHostToDevice))) {
-    release_map();
-    return false;
+  {
+    EventSpan span;
+    const bool copied = check(
+      "cudaMemcpy",
+      cudaMemcpy(
+        g_map.points, host.data(), static_cast<std::size_t>(count) * sizeof(MapPoint),
+        cudaMemcpyHostToDevice));
+    const bool finished = span.finish();
+    add_h2d(timing, span.milliseconds());
+    if (!copied || !finished) {
+      release_map();
+      return false;
+    }
   }
   try {
     thrust::device_ptr<MapPoint> points(g_map.points);
@@ -721,26 +853,48 @@ bool cuda_upload_map(
     thrust::device_ptr<std::uint64_t> keys_out(g_map.keys);
     thrust::device_ptr<int> counts(g_map.counts);
     thrust::device_ptr<int> offsets(g_map.offsets);
-    thrust::stable_sort(thrust::device, points, points + count, ByKey{});
-    thrust::transform(thrust::device, points, points + count, all_keys, KeyOf{});
-    const auto ends = thrust::reduce_by_key(
-      thrust::device, all_keys, all_keys + count, thrust::constant_iterator<int>(1), keys_out, counts);
-    const int unique = static_cast<int>(ends.first - keys_out);
-    thrust::exclusive_scan(thrust::device, counts, counts + unique, offsets);
-    // offsets[unique] = count
-    if (!check("cudaMemcpy", cudaMemcpy(g_map.offsets + unique, &count, sizeof(int), cudaMemcpyHostToDevice))) {
-      release_map();
-      return false;
+    int unique = 0;
+    {
+      EventSpan span;
+      thrust::stable_sort(thrust::device, points, points + count, ByKey{});
+      thrust::transform(thrust::device, points, points + count, all_keys, KeyOf{});
+      const auto ends = thrust::reduce_by_key(
+        thrust::device, all_keys, all_keys + count, thrust::constant_iterator<int>(1), keys_out, counts);
+      unique = static_cast<int>(ends.first - keys_out);
+      thrust::exclusive_scan(thrust::device, counts, counts + unique, offsets);
+      const bool finished = span.finish();
+      add_kernel(timing, span.milliseconds());
+      if (!finished) {
+        release_map();
+        return false;
+      }
+    }
+    {
+      EventSpan span;
+      const bool copied =
+        check("cudaMemcpy", cudaMemcpy(g_map.offsets + unique, &count, sizeof(int), cudaMemcpyHostToDevice));
+      const bool finished = span.finish();
+      add_h2d(timing, span.milliseconds());
+      if (!copied || !finished) {
+        release_map();
+        return false;
+      }
     }
     g_map.unique = unique;
     unique_keys.resize(static_cast<std::size_t>(unique));
-    if (!check(
-          "cudaMemcpy",
-          cudaMemcpy(
-            unique_keys.data(), g_map.keys, static_cast<std::size_t>(unique) * sizeof(std::uint64_t),
-            cudaMemcpyDeviceToHost))) {
-      release_map();
-      return false;
+    {
+      EventSpan span;
+      const bool copied = check(
+        "cudaMemcpy",
+        cudaMemcpy(
+          unique_keys.data(), g_map.keys, static_cast<std::size_t>(unique) * sizeof(std::uint64_t),
+          cudaMemcpyDeviceToHost));
+      const bool finished = span.finish();
+      add_d2h(timing, span.milliseconds());
+      if (!copied || !finished) {
+        release_map();
+        return false;
+      }
     }
   } catch (const std::exception & error) {
     std::fprintf(stderr, "back_odom CUDA disabled after map sort: %s\n", error.what());
@@ -751,7 +905,7 @@ bool cuda_upload_map(
   return true;
 }
 
-bool cuda_upload_planes(const CudaVoxelPlane * planes, const int unique_count)
+bool cuda_upload_planes(const CudaVoxelPlane * planes, const int unique_count, CudaTiming * const timing)
 {
   if (!cuda_available() || unique_count != g_map.unique) {
     return false;
@@ -762,11 +916,15 @@ bool cuda_upload_planes(const CudaVoxelPlane * planes, const int unique_count)
   if (!ensure_capacity(g_map.planes, g_map.plane_capacity, unique_count)) {
     return false;
   }
-  return check(
+  EventSpan span;
+  const bool copied = check(
     "cudaMemcpy",
     cudaMemcpy(
       g_map.planes, planes, static_cast<std::size_t>(unique_count) * sizeof(CudaVoxelPlane),
       cudaMemcpyHostToDevice));
+  const bool finished = span.finish();
+  add_h2d(timing, span.milliseconds());
+  return copied && finished;
 }
 
 namespace
@@ -813,7 +971,7 @@ bool plane_scratch(const int frame_count)
 bool cuda_plane_system(
   const double * frame_xyz, const int frame_count, const double rotation[9],
   const double translation[3], const double max_distance, const double kernel_scale,
-  const bool upload_frame, CudaPlaneSystem & system)
+  const bool upload_frame, CudaPlaneSystem & system, CudaTiming * const timing)
 {
   system = CudaPlaneSystem{};
   system.point_count = frame_count;
@@ -831,11 +989,15 @@ bool cuda_plane_system(
     return false;
   }
   if (upload_frame || g_plane.frame_count != frame_count) {
-    if (!check(
-          "cudaMemcpy",
-          cudaMemcpy(
-            g_plane.frame, frame_xyz, static_cast<std::size_t>(frame_count) * 3 * sizeof(double),
-            cudaMemcpyHostToDevice))) {
+    EventSpan span;
+    const bool copied = check(
+      "cudaMemcpy",
+      cudaMemcpy(
+        g_plane.frame, frame_xyz, static_cast<std::size_t>(frame_count) * 3 * sizeof(double),
+        cudaMemcpyHostToDevice));
+    const bool finished = span.finish();
+    add_h2d(timing, span.milliseconds());
+    if (!copied || !finished) {
       g_plane.frame_count = 0;
       return false;
     }
@@ -844,24 +1006,44 @@ bool cuda_plane_system(
   double pose[12];
   std::memcpy(pose, rotation, 9 * sizeof(double));
   std::memcpy(pose + 9, translation, 3 * sizeof(double));
-  if (!check("cudaMemcpy", cudaMemcpy(g_plane.pose, pose, 12 * sizeof(double), cudaMemcpyHostToDevice))) {
-    return false;
+  {
+    EventSpan span;
+    const bool copied =
+      check("cudaMemcpy", cudaMemcpy(g_plane.pose, pose, 12 * sizeof(double), cudaMemcpyHostToDevice));
+    const bool finished = span.finish();
+    add_h2d(timing, span.milliseconds());
+    if (!copied || !finished) {
+      return false;
+    }
   }
-  plane_kernel<<<blocks, k_threads>>>(
-    g_plane.frame, frame_count, g_plane.pose, g_plane.pose + 9, g_map.points, g_map.keys,
-    g_map.offsets, g_map.planes, g_map.unique, g_map.voxel_size, max_distance, kernel_scale,
-    g_plane.partials);
-  if (!check("plane_kernel", cudaGetLastError())) {
-    return false;
+  {
+    EventSpan span;
+    plane_kernel<<<blocks, k_threads>>>(
+      g_plane.frame, frame_count, g_plane.pose, g_plane.pose + 9, g_map.points, g_map.keys,
+      g_map.offsets, g_map.planes, g_map.unique, g_map.voxel_size, max_distance, kernel_scale,
+      g_plane.partials);
+    const bool launched = check("plane_kernel", cudaGetLastError());
+    const bool finished = span.finish();
+    add_kernel(timing, span.milliseconds());
+    if (!launched || !finished) {
+      return false;
+    }
   }
   g_plane.host_partials.resize(static_cast<std::size_t>(blocks));
-  if (!check(
-        "cudaMemcpy",
-        cudaMemcpy(
-          g_plane.host_partials.data(), g_plane.partials, static_cast<std::size_t>(blocks) * sizeof(Partial),
-          cudaMemcpyDeviceToHost))) {
-    return false;
+  {
+    EventSpan span;
+    const bool copied = check(
+      "cudaMemcpy",
+      cudaMemcpy(
+        g_plane.host_partials.data(), g_plane.partials, static_cast<std::size_t>(blocks) * sizeof(Partial),
+        cudaMemcpyDeviceToHost));
+    const bool finished = span.finish();
+    add_d2h(timing, span.milliseconds());
+    if (!copied || !finished) {
+      return false;
+    }
   }
+  const auto unpack_start = std::chrono::steady_clock::now();
   double upper[21] = {};
   for (const Partial & partial : g_plane.host_partials) {
     for (int item = 0; item < 21; ++item) {
@@ -880,6 +1062,7 @@ bool cuda_plane_system(
       system.jtj[col * 6 + row] = value;
     }
   }
+  add_host_unpack(timing, host_elapsed_ms(unpack_start));
   return true;
 }
 
@@ -954,7 +1137,7 @@ bool cuda_front_downsample(
   const double end_inverse_translation[3], const double body_rotation[9],
   const double body_translation[3], const double half_longitudinal, const double half_lateral,
   const double fine_voxel, const double coarse_voxel, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz, CudaTiming * const timing)
 {
   fine_xyz.clear();
   fine_index.clear();
@@ -973,59 +1156,92 @@ bool cuda_front_downsample(
   double * back = g_front.pose + 12;
   double * end_inverse = g_front.pose + 24;
   double * body = g_front.pose + 36;
-  const bool copied =
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        g_front.raw, points_xyz, static_cast<std::size_t>(count) * 3 * sizeof(double),
-        cudaMemcpyHostToDevice)) &&
-    check(
-      "cudaMemcpy",
-      cudaMemcpy(
-        g_front.stamps, stamps, static_cast<std::size_t>(count) * sizeof(double), cudaMemcpyHostToDevice)) &&
-    upload_pose(front_rotation, front_translation, front) &&
-    upload_pose(back_rotation, back_translation, back) &&
-    upload_pose(end_inverse_rotation, end_inverse_translation, end_inverse) &&
-    upload_pose(body_rotation, body_translation, body) &&
-    (segment_count <= 0 ||
-     check(
-       "cudaMemcpy",
-       cudaMemcpy(
-         g_front.segments, segments, static_cast<std::size_t>(segment_count) * sizeof(CudaSegment),
-         cudaMemcpyHostToDevice)));
+  bool copied = false;
+  {
+    EventSpan span;
+    copied =
+      check(
+        "cudaMemcpy",
+        cudaMemcpy(
+          g_front.raw, points_xyz, static_cast<std::size_t>(count) * 3 * sizeof(double),
+          cudaMemcpyHostToDevice)) &&
+      check(
+        "cudaMemcpy",
+        cudaMemcpy(
+          g_front.stamps, stamps, static_cast<std::size_t>(count) * sizeof(double),
+          cudaMemcpyHostToDevice)) &&
+      upload_pose(front_rotation, front_translation, front) &&
+      upload_pose(back_rotation, back_translation, back) &&
+      upload_pose(end_inverse_rotation, end_inverse_translation, end_inverse) &&
+      upload_pose(body_rotation, body_translation, body) &&
+      (segment_count <= 0 ||
+       check(
+         "cudaMemcpy",
+         cudaMemcpy(
+           g_front.segments, segments, static_cast<std::size_t>(segment_count) * sizeof(CudaSegment),
+           cudaMemcpyHostToDevice)));
+    const bool finished = span.finish();
+    add_h2d(timing, span.milliseconds());
+    copied = copied && finished;
+  }
   if (!copied) {
     return false;
   }
   const int blocks = (count + k_threads - 1) / k_threads;
-  deskew_kernel<<<blocks, k_threads>>>(
-    g_front.raw, g_front.stamps, count, g_front.segments, segment_count, front_stamp, back_stamp, front,
-    front + 9, back, back + 9, end_inverse, end_inverse + 9, body, body + 9, g_front.deskewed);
-  tag_front_kernel<<<blocks, k_threads>>>(
-    g_front.deskewed, count, fine_voxel, half_longitudinal, half_lateral, g_front.tagged);
-  if (!check("front_kernels", cudaGetLastError())) {
-    return false;
+  {
+    EventSpan span;
+    deskew_kernel<<<blocks, k_threads>>>(
+      g_front.raw, g_front.stamps, count, g_front.segments, segment_count, front_stamp, back_stamp,
+      front, front + 9, back, back + 9, end_inverse, end_inverse + 9, body, body + 9, g_front.deskewed);
+    const bool launched = check("deskew_kernel", cudaGetLastError());
+    const bool finished = span.finish();
+    add_deskew_kernel(timing, span.milliseconds());
+    if (!launched || !finished) {
+      return false;
+    }
   }
   try {
     thrust::device_ptr<FrontPoint> tagged(g_front.tagged);
     thrust::device_ptr<FrontPoint> coarse(g_front.coarse);
-    // Fine level: stable sort keeps the first input point per voxel, like kiss VoxelDownsample.
-    thrust::stable_sort(thrust::device, tagged, tagged + count, ByFrontKey{});
-    const auto fine_end = thrust::unique(thrust::device, tagged, tagged + count, SameFrontKey{});
-    int fine_count = static_cast<int>(fine_end - tagged);
+    int fine_count = 0;
+    {
+      EventSpan span;
+      tag_front_kernel<<<blocks, k_threads>>>(
+        g_front.deskewed, count, fine_voxel, half_longitudinal, half_lateral, g_front.tagged);
+      const bool launched = check("front_kernels", cudaGetLastError());
+      if (!launched) {
+        return false;
+      }
+      // Fine level: stable sort keeps the first input point per voxel, like kiss VoxelDownsample.
+      thrust::stable_sort(thrust::device, tagged, tagged + count, ByFrontKey{});
+      const auto fine_end = thrust::unique(thrust::device, tagged, tagged + count, SameFrontKey{});
+      fine_count = static_cast<int>(fine_end - tagged);
+      const bool finished = span.finish();
+      add_voxel_kernel(timing, span.milliseconds());
+      if (!finished) {
+        return false;
+      }
+    }
     // Points outside the box share k_outside_key, which sorts last; one survivor is left.
     std::vector<FrontPoint> host(static_cast<std::size_t>(std::max(fine_count, 0)));
-    if (fine_count > 0 &&
-        !check(
-          "cudaMemcpy",
-          cudaMemcpy(
-            host.data(), g_front.tagged, static_cast<std::size_t>(fine_count) * sizeof(FrontPoint),
-            cudaMemcpyDeviceToHost))) {
-      return false;
+    if (fine_count > 0) {
+      EventSpan span;
+      const bool downloaded = check(
+        "cudaMemcpy",
+        cudaMemcpy(
+          host.data(), g_front.tagged, static_cast<std::size_t>(fine_count) * sizeof(FrontPoint),
+          cudaMemcpyDeviceToHost));
+      const bool finished = span.finish();
+      add_d2h(timing, span.milliseconds());
+      if (!downloaded || !finished) {
+        return false;
+      }
     }
     if (!host.empty() && host.back().key == k_outside_key) {
       host.pop_back();
       --fine_count;
     }
+    const auto unpack_start = std::chrono::steady_clock::now();
     fine_xyz.reserve(host.size() * 3);
     fine_index.reserve(host.size());
     for (const FrontPoint & point : host) {
@@ -1034,33 +1250,51 @@ bool cuda_front_downsample(
       fine_xyz.push_back(point.z);
       fine_index.push_back(point.index);
     }
+    add_host_unpack(timing, host_elapsed_ms(unpack_start));
     if (fine_count <= 0) {
       return true;
     }
     // Coarse level from the fine survivors.
     const int coarse_blocks = (fine_count + k_threads - 1) / k_threads;
-    retag_kernel<<<coarse_blocks, k_threads>>>(g_front.tagged, fine_count, coarse_voxel, g_front.coarse);
-    if (!check("retag_kernel", cudaGetLastError())) {
-      return false;
+    int coarse_count = 0;
+    {
+      EventSpan span;
+      retag_kernel<<<coarse_blocks, k_threads>>>(g_front.tagged, fine_count, coarse_voxel, g_front.coarse);
+      const bool launched = check("retag_kernel", cudaGetLastError());
+      if (!launched) {
+        return false;
+      }
+      thrust::stable_sort(thrust::device, coarse, coarse + fine_count, ByFrontKey{});
+      const auto coarse_end = thrust::unique(thrust::device, coarse, coarse + fine_count, SameFrontKey{});
+      coarse_count = static_cast<int>(coarse_end - coarse);
+      const bool finished = span.finish();
+      add_voxel_kernel(timing, span.milliseconds());
+      if (!finished) {
+        return false;
+      }
     }
-    thrust::stable_sort(thrust::device, coarse, coarse + fine_count, ByFrontKey{});
-    const auto coarse_end = thrust::unique(thrust::device, coarse, coarse + fine_count, SameFrontKey{});
-    const int coarse_count = static_cast<int>(coarse_end - coarse);
     std::vector<FrontPoint> coarse_host(static_cast<std::size_t>(std::max(coarse_count, 0)));
-    if (coarse_count > 0 &&
-        !check(
-          "cudaMemcpy",
-          cudaMemcpy(
-            coarse_host.data(), g_front.coarse, static_cast<std::size_t>(coarse_count) * sizeof(FrontPoint),
-            cudaMemcpyDeviceToHost))) {
-      return false;
+    if (coarse_count > 0) {
+      EventSpan span;
+      const bool downloaded = check(
+        "cudaMemcpy",
+        cudaMemcpy(
+          coarse_host.data(), g_front.coarse,
+          static_cast<std::size_t>(coarse_count) * sizeof(FrontPoint), cudaMemcpyDeviceToHost));
+      const bool finished = span.finish();
+      add_d2h(timing, span.milliseconds());
+      if (!downloaded || !finished) {
+        return false;
+      }
     }
+    const auto coarse_unpack = std::chrono::steady_clock::now();
     coarse_xyz.reserve(coarse_host.size() * 3);
     for (const FrontPoint & point : coarse_host) {
       coarse_xyz.push_back(point.x);
       coarse_xyz.push_back(point.y);
       coarse_xyz.push_back(point.z);
     }
+    add_host_unpack(timing, host_elapsed_ms(coarse_unpack));
   } catch (const std::exception & error) {
     std::fprintf(stderr, "back_odom CUDA disabled after front downsample: %s\n", error.what());
     g_failed = 1;

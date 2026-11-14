@@ -29,20 +29,20 @@ bool cuda_map_current(const void *, std::uint64_t, double)
 
 bool cuda_upload_map(
   const void *, std::uint64_t, double, const double *, const std::uint64_t *, int,
-  std::vector<std::uint64_t> & unique_keys)
+  std::vector<std::uint64_t> & unique_keys, CudaTiming *)
 {
   unique_keys.clear();
   return false;
 }
 
-bool cuda_upload_planes(const CudaVoxelPlane *, int)
+bool cuda_upload_planes(const CudaVoxelPlane *, int, CudaTiming *)
 {
   return false;
 }
 
 bool cuda_plane_system(
   const double *, int frame_count, const double[9], const double[3], double, double, bool,
-  CudaPlaneSystem & system)
+  CudaPlaneSystem & system, CudaTiming *)
 {
   system = CudaPlaneSystem{};
   system.point_count = frame_count;
@@ -53,7 +53,7 @@ bool cuda_front_downsample(
   const double *, const double *, int, const CudaSegment *, int, double, double, const double[9],
   const double[3], const double[9], const double[3], const double[9], const double[3], const double[9],
   const double[3], double, double, double, double, std::vector<double> & fine_xyz,
-  std::vector<int> & fine_index, std::vector<double> & coarse_xyz)
+  std::vector<int> & fine_index, std::vector<double> & coarse_xyz, CudaTiming *)
 {
   fine_xyz.clear();
   fine_index.clear();
